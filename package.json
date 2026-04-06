@@ -1,0 +1,17 @@
+{
+  "name": "cone-of-silence",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "gen:keys": "bun run scripts/gen-keys.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@xmtp/agent-sdk": "^2.3.0"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.11",
+    "typescript": "^6.0.2"
+  }
+}
