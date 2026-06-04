@@ -1,0 +1,11 @@
+name = "cone-rendezvous"
+main = "src/index.ts"
+compatibility_date = "2026-06-03"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "RendezvousRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RendezvousRoom"]

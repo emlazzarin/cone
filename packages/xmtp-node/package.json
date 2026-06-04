@@ -1,0 +1,15 @@
+{
+  "name": "@cone/xmtp-node",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@cone/core": "workspace:*"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  }
+}

@@ -1,17 +1,36 @@
 {
   "compilerOptions": {
-    "strict": true,
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "rootDir": "src",
-    "outDir": "dist",
+    "allowSyntheticDefaultImports": true,
+    "baseUrl": ".",
     "declaration": true,
-    "lib": ["ES2022"],
-    "types": ["bun-types"],
-    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
+    "lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
     "noUncheckedIndexedAccess": true,
-    "verbatimModuleSyntax": true
+    "paths": {
+      "@cone/core": ["packages/core/src/index.ts"],
+      "@cone/cli": ["packages/cli/src/index.ts"],
+      "@cone/xmtp-browser": ["packages/xmtp-browser/src/index.ts"],
+      "@cone/xmtp-node": ["packages/xmtp-node/src/index.ts"]
+    },
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2023",
+    "types": ["bun-types", "@cloudflare/workers-types", "vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.d.ts"]
+  "include": [
+    "apps/**/*.ts",
+    "apps/**/*.tsx",
+    "examples/**/*.ts",
+    "packages/**/*.ts",
+    "packages/**/*.tsx"
+  ]
 }

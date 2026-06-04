@@ -1,0 +1,17 @@
+{
+  "name": "Cone of Silence",
+  "short_name": "Cone",
+  "description": "XMTP messaging from a portable Cone secret key.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f2e8",
+  "theme_color": "#103b36",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

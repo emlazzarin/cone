@@ -4,6 +4,19 @@
 .claude/
 .cursor/
 
+# local secrets
+
+.env
+.env.*
+!.env.example
+.cone/
+xmtp-*.db3*
+
 # node
 
 node_modules/
+
+# build output
+
+dist/
+apps/**/dist/

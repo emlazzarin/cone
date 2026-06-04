@@ -1,0 +1,17 @@
+{
+  "name": "@cone/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cone/core": "workspace:*",
+    "@cone/xmtp-browser": "workspace:*"
+  },
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 0.0.0.0",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "bun test",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  }
+}

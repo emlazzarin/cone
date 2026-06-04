@@ -1,0 +1,15 @@
+{
+  "name": "@cone/rendezvous",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cone/core": "workspace:*"
+  },
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "dev": "wrangler dev",
+    "test": "bun test",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  }
+}

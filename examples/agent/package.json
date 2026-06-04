@@ -1,0 +1,14 @@
+{
+  "name": "@cone/example-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cone/core": "workspace:*",
+    "@cone/xmtp-node": "workspace:*"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  }
+}
