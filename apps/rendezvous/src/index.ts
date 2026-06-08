@@ -13,9 +13,13 @@ interface ExchangeBody {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    if (request.method === 'OPTIONS') {
+      return cors(new Response(null, { status: 204 }));
+    }
+
     const url = new URL(request.url);
     if (request.method !== 'POST' || url.pathname !== '/v1/exchange') {
-      return json({ error: 'not found' }, 404);
+      return cors(json({ error: 'not found' }, 404));
     }
 
     let body: ExchangeBody;
@@ -23,15 +27,16 @@ export default {
       body = await request.json();
       validateExchangeBody(body);
     } catch (error) {
-      return json({ error: error instanceof Error ? error.message : 'invalid request' }, 400);
+      return cors(json({ error: error instanceof Error ? error.message : 'invalid request' }, 400));
     }
 
     const id = env.ROOMS.idFromName(body.code);
-    return env.ROOMS.get(id).fetch('https://room.local/exchange', {
+    const response = await env.ROOMS.get(id).fetch('https://room.local/exchange', {
       body: JSON.stringify(body),
       headers: { 'content-type': 'application/json' },
       method: 'POST',
     });
+    return cors(response);
   },
 };
 
@@ -112,5 +117,18 @@ function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     headers: { 'content-type': 'application/json' },
     status,
+  });
+}
+
+function cors(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set('access-control-allow-origin', '*');
+  headers.set('access-control-allow-methods', 'POST, OPTIONS');
+  headers.set('access-control-allow-headers', 'content-type');
+  headers.set('access-control-max-age', '86400');
+  return new Response(response.body, {
+    headers,
+    status: response.status,
+    statusText: response.statusText,
   });
 }

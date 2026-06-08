@@ -29,6 +29,8 @@ describe('ConeClient', () => {
     const sent = await client.sendText('Alice Renamed', 'hello');
     expect(sent.messageId).toBe('sent-1');
     expect(adapter.sent[0]).toEqual({ inboxId: 'inbox-alice', text: 'hello' });
+    expect((await client.listMessages())[0]?.text).toBe('hello');
+    expect((await client.listMessages())[0]?.direction).toBe('outbound');
   });
 
   test('rejects sends to unreachable identities', async () => {
@@ -60,6 +62,8 @@ describe('ConeClient', () => {
 
     expect(events).toHaveLength(1);
     expect((await client.listContacts()).some((contact) => contact.source === 'inbound' && contact.inboxId === 'inbox-inbound')).toBe(true);
+    expect((await client.listMessages('dm-inbound'))[0]?.text).toBe('hi');
+    expect((await client.listMessages('dm-inbound'))[0]?.direction).toBe('inbound');
 
     const backup = await client.exportBackup();
     const restored = new MemoryStore();
@@ -67,6 +71,30 @@ describe('ConeClient', () => {
     await restoredClient.importBackup(backup);
 
     expect((await restoredClient.listContacts()).some((contact) => contact.inboxId === 'inbox-inbound')).toBe(true);
+  });
+
+  test('classifies Cone protocol envelopes as control messages', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+
+    await client.streamMessages(() => {});
+    await adapter.emit({
+      conversationId: 'dm-control',
+      json: {
+        type: 'cos.pair.confirm.v1',
+        inboxId: 'inbox-peer',
+        codeAcceptedAt: new Date().toISOString(),
+      },
+      messageId: 'msg-control',
+      raw: {},
+      senderInboxId: 'inbox-peer',
+      sentAt: new Date().toISOString(),
+      text: JSON.stringify({ type: 'cos.pair.confirm.v1' }),
+    });
+
+    const [message] = await client.listMessages('dm-control');
+    expect(message?.kind).toBe('control');
+    expect(message?.json).toMatchObject({ type: 'cos.pair.confirm.v1' });
   });
 });
 

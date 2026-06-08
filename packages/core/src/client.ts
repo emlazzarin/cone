@@ -5,6 +5,7 @@ import type {
   ConeClient,
   ConeConversation,
   ConeIdentity,
+  ConeMessage,
   Contact,
   CreateConeClientOptions,
   IdentityRef,
@@ -126,6 +127,29 @@ class ConeClientImpl implements ConeClient {
         title: contact?.name ?? conversation.title,
       };
     });
+  }
+
+  async listMessages(conversationId?: string): Promise<ConeMessage[]> {
+    const [identity, messages] = await Promise.all([
+      this.identity(),
+      this.options.store.listMessages(conversationId),
+    ]);
+
+    return Promise.all(messages.map(async (message) => {
+      const payload = await decryptJson<unknown>(this.options.account.coneStorageKey, message.encryptedPayload);
+      const kind = message.kind === 'json' && isConeControlEnvelope(payload) ? 'control' : message.kind;
+      return {
+        conversationId: message.conversationId,
+        direction: message.senderInboxId === identity.inboxId ? 'outbound' as const : 'inbound' as const,
+        json: typeof payload === 'string' ? undefined : payload,
+        kind,
+        messageId: message.messageId,
+        recipientInboxId: message.recipientInboxId,
+        senderInboxId: message.senderInboxId,
+        sentAt: message.sentAt,
+        text: typeof payload === 'string' ? payload : undefined,
+      };
+    }));
   }
 
   listContacts(): Promise<Contact[]> {
@@ -304,7 +328,7 @@ class ConeClientImpl implements ConeClient {
   }
 
   private async persistInbound(message: IncomingMessage): Promise<void> {
-    const kind = message.json === undefined ? 'text' : 'json';
+    const kind = message.json === undefined ? 'text' : isConeControlEnvelope(message.json) ? 'control' : 'json';
     await this.options.store.putMessage({
       messageId: message.messageId,
       conversationId: message.conversationId,
@@ -326,6 +350,17 @@ class ConeClientImpl implements ConeClient {
   private nowIso(): string {
     return this.now().toISOString();
   }
+}
+
+function isConeControlEnvelope(value: unknown): boolean {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'type' in value &&
+    typeof value.type === 'string' &&
+    value.type.startsWith('cos.') &&
+    value.type !== 'cos.app.json.v1'
+  );
 }
 
 function contactToResolved(contact: Contact): ResolvedIdentity {

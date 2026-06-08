@@ -1,67 +1,64 @@
-import { hexToBytes, type ConeConversation, type DerivedAccount, type IdentityRef, type IncomingMessage, type MessageHandler, type ResolvedIdentity, type SentMessage, type Unsubscribe, type XmtpAdapter, type XmtpEnv } from '@cone/core';
+import { Client, IdentifierKind, type ClientOptions, type DecodedMessage, type Dm, type Identifier, type XmtpEnv as SdkXmtpEnv } from '@xmtp/browser-sdk';
+import { hexToBytes, isEvmAddress, type ConeConversation, type DerivedAccount, type IdentityRef, type IncomingMessage, type MessageHandler, type ResolvedIdentity, type SentMessage, type Unsubscribe, type XmtpAdapter, type XmtpEnv } from '@cone/core';
 import { privateKeyToAccount } from 'viem/accounts';
 
 export { IndexedDbStore } from './store';
 
 export interface BrowserXmtpAdapterOptions {
   account: DerivedAccount;
+  dbPath?: string;
+}
+
+export function browserAccountNamespace(account: DerivedAccount): string {
+  const address = privateKeyToAccount(account.walletPrivateKey).address.toLowerCase();
+  return `cone-${account.env}-${account.accountId}-${address}`;
 }
 
 export async function createBrowserXmtpAdapter(options: BrowserXmtpAdapterOptions): Promise<XmtpAdapter> {
-  const sdk = await import('@xmtp/browser-sdk');
-  const client = await createClient(sdk, options);
-  return new BrowserXmtpAdapter(client, options.account.env);
+  const { address, client } = await createClient(options);
+  return new BrowserXmtpAdapter(client, options.account.env, address);
 }
 
 class BrowserXmtpAdapter implements XmtpAdapter {
   constructor(
-    private readonly client: BrowserClientLike,
+    private readonly client: Client<unknown>,
     private readonly env: XmtpEnv,
+    private readonly address: string,
   ) {}
 
   identity() {
     return Promise.resolve({
       inboxId: String(this.client.inboxId),
-      address: typeof this.client.address === 'string' ? this.client.address : undefined,
+      address: this.address,
       env: this.env,
     });
   }
 
   async resolveIdentity(ref: IdentityRef): Promise<ResolvedIdentity | null> {
     if (typeof ref === 'string') {
+      if (isEvmAddress(ref)) {
+        return this.resolveIdentity({ address: ref });
+      }
       return { inboxId: ref, source: 'inboxId' };
     }
     if (ref.inboxId) {
       return { inboxId: ref.inboxId, address: ref.address, source: 'inboxId' };
     }
     if (ref.address) {
-      const inboxId = await findInboxIdForAddress(this.client, ref.address);
+      const inboxId = await this.client.fetchInboxIdByIdentifier(evmIdentifier(ref.address));
       return inboxId ? { inboxId, address: ref.address, source: 'address' } : null;
     }
     return null;
   }
 
   async canMessage(identity: ResolvedIdentity): Promise<boolean> {
-    if (typeof this.client.canMessage !== 'function') {
-      return true;
-    }
     if (!identity.address) {
       return true;
     }
 
-    try {
-      const result = await this.client.canMessage([{ identifier: identity.address.toLowerCase(), identifierKind: 'Ethereum' }]);
-      if (typeof result === 'boolean') {
-        return result;
-      }
-      if (result && typeof result === 'object') {
-        return Boolean((result as Record<string, unknown>)[identity.address.toLowerCase()] ?? true);
-      }
-    } catch {
-      return false;
-    }
-
-    return true;
+    const address = identity.address.toLowerCase();
+    const result = await this.client.canMessage([evmIdentifier(address)]);
+    return result.get(address) === true;
   }
 
   async sendText(identity: ResolvedIdentity, text: string): Promise<SentMessage> {
@@ -75,58 +72,34 @@ class BrowserXmtpAdapter implements XmtpAdapter {
   }
 
   async streamMessages(handler: MessageHandler): Promise<Unsubscribe> {
-    const conversations = this.client.conversations;
-    if (!conversations || typeof conversations.streamAllMessages !== 'function') {
-      throw new Error('XMTP client does not support message streaming');
-    }
-
-    const stream = await conversations.streamAllMessages({
+    await this.client.conversations.syncAll();
+    const stream = await this.client.conversations.streamAllMessages({
       onValue: (message: unknown) => {
         void handler(toIncomingMessage(message));
       },
       onError: (error: unknown) => {
         console.error(error);
       },
-    }) as StreamLike;
+    });
 
-    const returnStream = stream.return;
-    if (typeof returnStream === 'function') {
-      return () => {
-        void returnStream.call(stream);
-      };
-    }
-    const unsubscribe = stream.unsubscribe;
-    if (typeof unsubscribe === 'function') {
-      return () => {
-        void unsubscribe.call(stream);
-      };
-    }
-    return () => undefined;
+    return () => {
+      void stream.return();
+    };
   }
 
   async listConversations(): Promise<ConeConversation[]> {
-    const conversations = this.client.conversations;
-    if (!conversations) {
-      return [];
-    }
+    await this.client.conversations.syncAll();
+    const raw = await this.client.conversations.listDms();
 
-    const raw = typeof conversations.listDms === 'function'
-      ? await conversations.listDms()
-      : typeof conversations.list === 'function'
-        ? await conversations.list()
-        : [];
-
-    return (Array.isArray(raw) ? raw : []).map((conversation: ConversationLike) => {
-      const peerInboxId = String(
-        conversation.peerInboxId ?? conversation.dmPeerInboxId ?? conversation.memberInboxIds?.[0] ?? 'unknown',
-      );
+    return Promise.all(raw.map(async (conversation) => {
+      const peerInboxId = await conversation.peerInboxId();
       return {
-        conversationId: String(conversation.id ?? conversation.topic ?? `dm:${peerInboxId}`),
+        conversationId: conversation.id,
         peerInboxId,
         title: peerInboxId,
-        updatedAt: typeof conversation.updatedAt === 'string' ? conversation.updatedAt : undefined,
+        updatedAt: conversation.createdAt?.toISOString(),
       };
-    });
+    }));
   }
 
   async exportArchive(key: Uint8Array): Promise<Uint8Array> {
@@ -142,76 +115,55 @@ class BrowserXmtpAdapter implements XmtpAdapter {
     }
     await this.client.importArchive(data, key);
   }
+
+  close(): Promise<void> {
+    this.client.close();
+    return Promise.resolve();
+  }
 }
 
-async function createClient(sdk: Record<string, unknown>, options: BrowserXmtpAdapterOptions): Promise<BrowserClientLike> {
-  const Client = sdk.Client as { create?: (signer: unknown, options: Record<string, unknown>) => Promise<BrowserClientLike> };
-  if (!Client?.create) {
-    throw new Error('@xmtp/browser-sdk Client.create is unavailable');
-  }
-
+async function createClient(options: BrowserXmtpAdapterOptions): Promise<{ address: string; client: Client<unknown> }> {
   const account = privateKeyToAccount(options.account.walletPrivateKey);
-  const IdentifierKind = (sdk.IdentifierKind as Record<string, string> | undefined) ?? { Ethereum: 'Ethereum' };
+  const address = account.address.toLowerCase();
   const signer = {
-    type: 'EOA',
-    getIdentifier: () => ({
-      identifier: account.address.toLowerCase(),
-      identifierKind: IdentifierKind.Ethereum ?? 'Ethereum',
-    }),
+    type: 'EOA' as const,
+    getIdentifier: () => evmIdentifier(address),
     signMessage: async (message: string) => hexToBytes(await account.signMessage({ message })),
   };
 
-  return Client.create(signer, {
-    env: options.account.env,
-  });
+  const clientOptions: ClientOptions = {
+    dbEncryptionKey: hexToBytes(options.account.xmtpDbEncryptionKey),
+    dbPath: options.dbPath ?? `${browserAccountNamespace(options.account)}.db3`,
+    env: options.account.env as SdkXmtpEnv,
+  };
+  const client = await Client.create(signer, clientOptions);
+
+  return { address, client };
 }
 
-async function findInboxIdForAddress(client: BrowserClientLike, address: string): Promise<string | null> {
-  if (typeof client.findInboxIdFromAddress === 'function') {
-    return (await client.findInboxIdFromAddress(address.toLowerCase())) ?? null;
-  }
-  if (typeof client.findInboxIdFromIdentity === 'function') {
-    return (await client.findInboxIdFromIdentity({
-      identifier: address.toLowerCase(),
-      identifierKind: 'Ethereum',
-    })) ?? null;
-  }
-  return null;
+function evmIdentifier(address: string): Identifier {
+  return {
+    identifier: address.toLowerCase(),
+    identifierKind: IdentifierKind.Ethereum,
+  };
 }
 
-async function findOrCreateDm(client: BrowserClientLike, identity: ResolvedIdentity): Promise<ConversationLike> {
-  const conversations = client.conversations;
-  if (!conversations) {
-    throw new Error('XMTP client does not expose conversations');
+async function findOrCreateDm(client: Client<unknown>, identity: ResolvedIdentity): Promise<Dm<unknown>> {
+  if (identity.address) {
+    const identifier = evmIdentifier(identity.address);
+    const existing = await client.conversations.fetchDmByIdentifier(identifier);
+    return existing ?? await client.conversations.createDmWithIdentifier(identifier);
   }
 
-  if (identity.address && typeof conversations.getDmByIdentifier === 'function') {
-    return await conversations.getDmByIdentifier({ identifier: identity.address.toLowerCase(), identifierKind: 'Ethereum' }) as ConversationLike;
-  }
-  if (identity.address && typeof conversations.newDmWithIdentifier === 'function') {
-    return await conversations.newDmWithIdentifier({ identifier: identity.address.toLowerCase(), identifierKind: 'Ethereum' }) as ConversationLike;
-  }
-  if (typeof conversations.createDm === 'function') {
-    return await conversations.createDm(identity.inboxId) as ConversationLike;
-  }
-  if (typeof conversations.findOrCreateDm === 'function') {
-    return await conversations.findOrCreateDm(identity.inboxId) as ConversationLike;
-  }
-  throw new Error('XMTP client cannot create DMs');
+  return await client.conversations.getDmByInboxId(identity.inboxId) ?? await client.conversations.createDm(identity.inboxId);
 }
 
-async function sendConversationText(conversation: ConversationLike, text: string): Promise<string> {
-  if (typeof conversation.sendText === 'function') {
-    return String(await conversation.sendText(text));
-  }
-  if (typeof conversation.send === 'function') {
-    return String(await conversation.send(text));
-  }
-  throw new Error('XMTP conversation cannot send text');
+async function sendConversationText(conversation: Dm<unknown>, text: string): Promise<string> {
+  return conversation.sendText(text);
 }
 
-function toIncomingMessage(message: unknown): IncomingMessage {
-  const record = (message ?? {}) as Record<string, unknown>;
+function toIncomingMessage(message: DecodedMessage | unknown): IncomingMessage {
+  const record = message as Partial<DecodedMessage> & Record<string, unknown>;
   const content = record.content;
   let json: unknown;
   if (typeof content === 'string') {
@@ -230,7 +182,7 @@ function toIncomingMessage(message: unknown): IncomingMessage {
     conversationId: String(record.conversationId ?? record.topic ?? 'unknown'),
     senderInboxId: String(record.senderInboxId ?? record.sender ?? 'unknown'),
     senderAddress: typeof record.senderAddress === 'string' ? record.senderAddress : undefined,
-    sentAt: nsToIso(record.sentAtNs) ?? new Date().toISOString(),
+    sentAt: record.sentAt instanceof Date ? record.sentAt.toISOString() : nsToIso(record.sentAtNs) ?? new Date().toISOString(),
     text: typeof content === 'string' ? content : undefined,
     json,
     raw: message,
@@ -246,30 +198,3 @@ function nsToIso(value: unknown): string | null {
   }
   return null;
 }
-
-type BrowserClientLike = {
-  address?: string;
-  inboxId?: string;
-  conversations?: Record<string, (...args: unknown[]) => unknown>;
-  canMessage?: (value: unknown) => Promise<unknown>;
-  createArchive?: (key: Uint8Array) => Promise<Uint8Array>;
-  importArchive?: (data: Uint8Array, key: Uint8Array) => Promise<void>;
-  findInboxIdFromAddress?: (address: string) => Promise<string | undefined>;
-  findInboxIdFromIdentity?: (identity: { identifier: string; identifierKind: string }) => Promise<string | undefined>;
-};
-
-type StreamLike = {
-  return?: () => unknown;
-  unsubscribe?: () => unknown;
-};
-
-type ConversationLike = Record<string, unknown> & {
-  id?: string;
-  topic?: string;
-  peerInboxId?: string;
-  dmPeerInboxId?: string;
-  memberInboxIds?: string[];
-  updatedAt?: string;
-  sendText?: (text: string) => Promise<unknown>;
-  send?: (text: string) => Promise<unknown>;
-};

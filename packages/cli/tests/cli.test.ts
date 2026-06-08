@@ -161,6 +161,10 @@ class MockClient implements ConeClient {
     return Promise.resolve([]);
   }
 
+  listMessages() {
+    return Promise.resolve([]);
+  }
+
   listContacts(): Promise<Contact[]> {
     return Promise.resolve(this.contacts);
   }

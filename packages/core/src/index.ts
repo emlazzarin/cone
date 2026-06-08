@@ -47,6 +47,7 @@ export type {
   ConeClient,
   ConeConversation,
   ConeIdentity,
+  ConeMessage,
   ConeStore,
   ConeStoreSnapshot,
   Contact,

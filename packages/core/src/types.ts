@@ -76,6 +76,18 @@ export interface StoredMessage {
   encryptedPayload: EncryptedJson;
 }
 
+export interface ConeMessage {
+  messageId: string;
+  conversationId: string;
+  senderInboxId: string;
+  recipientInboxId?: string;
+  sentAt: string;
+  kind: StoredMessage['kind'];
+  direction: 'inbound' | 'outbound';
+  text?: string;
+  json?: unknown;
+}
+
 export interface SentMessage {
   messageId: string;
   conversationId?: string;
@@ -177,6 +189,7 @@ export interface ConeClient {
   sendJson(to: IdentityRef, value: unknown): Promise<SentMessage>;
   streamMessages(handler: MessageHandler): Promise<Unsubscribe>;
   listConversations(): Promise<ConeConversation[]>;
+  listMessages(conversationId?: string): Promise<ConeMessage[]>;
   listContacts(): Promise<Contact[]>;
   saveContact(input: SaveContactInput): Promise<Contact>;
   deleteContact(contactId: string): Promise<void>;
