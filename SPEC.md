@@ -19,11 +19,11 @@ Cone of Silence is a Bun-first TypeScript product with a static PWA and a CLI/li
 
 Cone resolves identities through the configured XMTP adapter. v1 supports inbox IDs and EVM addresses. Address-book names are local aliases that resolve to canonical inbox IDs. Before sending, Cone asks the adapter whether the resolved identity is messageable.
 
-## CLI Identity Selection
+## CLI Account And State
 
-The CLI supports `--id <localId>` and `COS_ID` as local selectors for config and state. An id is not a network username and is not part of XMTP identity. The cryptographic account is still determined by the `SECRET KEY`.
+The CLI has no local selector. The cryptographic account is determined by the `SECRET KEY`, with the default derived account label currently fixed to `main`.
 
-When `COS_HOME` is set, id-scoped config and state are stored under that directory for local tests and agent runs. Exact `COS_STATE_PATH` and `COS_CONFIG_PATH` overrides still take precedence.
+By default, the CLI uses one remembered secret and one local state database. `COS_HOME` can isolate config and state under a directory for tests and concurrent agent runs. Exact `COS_STATE_PATH` and `COS_CONFIG_PATH` overrides still take precedence.
 
 CLI output is JSON by default for agent use. `--plain` switches supported commands to human-readable output.
 
@@ -31,7 +31,7 @@ CLI output is JSON by default for agent use. `--plain` switches supported comman
 
 Handshake-code pairing is ephemeral and opt-in. Two participants enter the same high-entropy code. Each posts an encrypted offer to the rendezvous service. Once both offers exist, clients decrypt locally, confirm over XMTP, and save each other as contacts. The rendezvous service caps rooms at two participants and expires offers after 10 minutes.
 
-`pair join --name <name>` sends a proposed contact name to the peer. If `--name` is omitted, the CLI uses `--id` as the proposed name. This is only a local address-book suggestion for the recipient, not a globally registered alias.
+`pair join --share-name <name>` sends an optional peer-visible proposed contact name. `pair join --save-as <contactName>` saves the peer under a local contact name. Cone never sends local state selectors as identity hints.
 
 ## Persistence
 
@@ -41,4 +41,4 @@ The CLI uses `bun:sqlite`. Message payloads are encrypted before persistence. Th
 
 Tests cover deterministic key derivation, secret validation, contact behavior, encrypted storage, pairing encryption, wrong-code failures, room capacity, CLI command behavior, and adapter contracts with mocks.
 
-`bun run test:live:xmtp` runs a live XMTP dev-network integration: start/reuse rendezvous, create two id-scoped CLI accounts, pair them, send both directions, and verify received message IDs and sender inbox IDs.
+`bun run test:live:xmtp` runs a live XMTP dev-network integration: start/reuse rendezvous, create two isolated CLI homes, pair them, send both directions, and verify received message IDs and sender inbox IDs.

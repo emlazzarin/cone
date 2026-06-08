@@ -58,23 +58,25 @@ bun run packages/cli/src/bin.ts keygen
 
 ```sh
 cos keygen
-cos --id alice login --secret-stdin --remember
-cos --id alice whoami
-cos --id alice send --to <inboxId|address|contactName> --text "hello"
-cos --id alice listen
+cos login --secret-stdin --remember
+cos whoami
+cos send --to <inboxId|address|contactName> --text "hello"
+cos listen
 cos contacts list
 cos contacts add --name <name> --identity <inboxId|address>
 cos pair new
-cos --id alice pair join <code>
+cos pair join <code> [--share-name <name>] [--save-as <contactName>]
 cos backup export --out backup.cos
 cos backup import --in backup.cos
 ```
 
 The CLI reads `COS_SECRET_KEY`, `cos login --secret-stdin --remember`, or command-level `--secret-stdin`.
 
-`--id <localId>` selects local config and state. It is not a global username. If `--name` is omitted during pairing, the CLI id is used as the proposed contact name for the peer.
+The `SECRET_KEY` determines the XMTP account/inbox. The CLI stores one remembered secret and one local state database by default. Use `COS_HOME` or exact `COS_STATE_PATH`/`COS_CONFIG_PATH` overrides only when you need isolated local state for tests or multiple concurrent agent processes.
 
-Set `COS_HOME=./.cone` to keep id-scoped config and state in a local ignored directory while testing. Use `--plain` for human-readable output; JSON is the default for agent-friendly structured output.
+Pairing names are explicit. `--share-name` proposes a peer-visible contact name during pairing. `--save-as` saves the peer under a local contact name. Contact names are local aliases and are not global usernames.
+
+Set `COS_HOME=./.cone` to keep config and state in a local ignored directory while testing. Use `--plain` for human-readable output; JSON is the default for agent-friendly structured output.
 
 ## Secret Keys
 
@@ -118,4 +120,4 @@ Run a full local integration against the XMTP dev network:
 bun run test:live:xmtp
 ```
 
-The script starts the rendezvous worker if needed, creates two local ids, pairs them, sends messages both directions, verifies the received message IDs, and writes state under `.cone/live-runs/`.
+The script starts the rendezvous worker if needed, creates two isolated local CLI homes, pairs them, sends messages both directions, verifies the received message IDs, and writes state under `.cone/live-runs/`.

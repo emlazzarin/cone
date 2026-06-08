@@ -13,7 +13,7 @@ import {
 import { createNodeXmtpAdapter } from '@cone/xmtp-node';
 
 import { loadSecretKey, readConfig, writeConfig } from './config';
-import { defaultConfigPath, defaultRendezvousUrl, defaultStatePath, normalizeCliId } from './paths';
+import { defaultConfigPath, defaultRendezvousUrl, defaultStatePath } from './paths';
 import { HttpRendezvousClient } from './rendezvous';
 import { BunSQLiteStore } from './store';
 
@@ -27,12 +27,12 @@ export interface CliIo {
 }
 
 export interface CliDeps {
-  createClient?: (secret: SecretKey, options?: { env?: XmtpEnv; id?: string }) => Promise<ConeClient>;
+  createClient?: (secret: SecretKey, options?: { env?: XmtpEnv }) => Promise<ConeClient>;
 }
 
-export async function createCliClient(secret: SecretKey, options: { env?: XmtpEnv; id?: string; xmtp?: XmtpAdapter } = {}): Promise<ConeClient> {
+export async function createCliClient(secret: SecretKey, options: { env?: XmtpEnv; xmtp?: XmtpAdapter } = {}): Promise<ConeClient> {
   const account = deriveAccount(secret, { env: options.env ?? readEnv() });
-  const statePath = defaultStatePath(options.id);
+  const statePath = defaultStatePath();
   const store = new BunSQLiteStore(statePath);
   const xmtp = options.xmtp ?? await createNodeXmtpAdapter({ account, dbPath: `${statePath}.xmtp.db3` });
   return createConeClient({
@@ -62,18 +62,16 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
       }
       case 'login': {
         const secret = parseSecretKey(await readSecretInput(context.args, io));
-        const configPath = defaultConfigPath(context.id);
+        const configPath = defaultConfigPath();
         if (context.args.includes('--remember')) {
           writeConfig({ ...readConfig(configPath), secretKey: secret }, configPath);
           writeValue(io, context, {
-            id: context.id ?? 'default',
             ok: true,
             path: configPath,
             remembered: true,
-          }, (value) => `Secret key saved for id "${value.id}" at ${value.path}.\n`);
+          }, (value) => `Secret key saved at ${value.path}.\n`);
         } else {
           writeValue(io, context, {
-            id: context.id ?? 'default',
             ok: true,
             remembered: false,
           }, () => 'Secret key is valid. Use COS_SECRET_KEY or pass --remember to persist it.\n');
@@ -257,15 +255,28 @@ async function handlePair(args: string[], io: CliIo, context: CliContext, client
   if (command === 'join') {
     const code = args[1];
     if (!code) {
-      throw new Error('usage: cos pair join <code>');
+      throw new Error('usage: cos pair join <code> [--share-name <name>] [--save-as <contactName>]');
     }
-    const name = optionalOption(args, '--name') ?? context.id;
-    const result = await client.pairWithCode(code, { proposedName: name });
+    if (args.includes('--name')) {
+      throw new Error('pair join uses --share-name for the peer-visible name or --save-as for your local contact name');
+    }
+    const shareName = optionalOption(args, '--share-name');
+    const saveAs = optionalOption(args, '--save-as');
+    const result = await client.pairWithCode(code, { proposedName: shareName });
+    const contact = saveAs
+      ? await client.saveContact({
+          address: result.contact.address,
+          inboxId: result.contact.inboxId,
+          name: saveAs,
+          source: 'paired',
+        })
+      : result.contact;
     const cliResult = {
       ...result,
+      contact,
       next: {
-        send: `cos${context.id ? ` --id ${context.id}` : ''} send --to ${JSON.stringify(result.contact.name)} --text "hello"`,
-        listen: `cos${context.id ? ` --id ${context.id}` : ''} listen`,
+        send: `cos send --to ${JSON.stringify(contact.name)} --text "hello"`,
+        listen: 'cos listen',
       },
     };
     writeValue(io, context, cliResult, (value) => {
@@ -300,9 +311,9 @@ async function handleBackup(args: string[], io: CliIo, context: CliContext, clie
 async function loadClient(context: CliContext, io: CliIo, deps: CliDeps): Promise<ConeClient> {
   const secret = context.args.includes('--secret-stdin')
     ? parseSecretKey(await io.stdinText())
-    : loadSecretKey(defaultConfigPath(context.id));
+    : loadSecretKey(defaultConfigPath());
   const env = optionalOption(context.args, '--env') as XmtpEnv | undefined;
-  return deps.createClient ? deps.createClient(secret, { env, id: context.id }) : createCliClient(secret, { env, id: context.id });
+  return deps.createClient ? deps.createClient(secret, { env }) : createCliClient(secret, { env });
 }
 
 async function readSecretInput(args: string[], io: CliIo): Promise<string> {
@@ -329,26 +340,16 @@ type OutputMode = 'json' | 'plain';
 
 interface CliContext {
   args: string[];
-  id?: string;
   output: OutputMode;
 }
 
 function parseCliArgs(args: string[]): CliContext {
   const rest: string[] = [];
-  let id = normalizeCliId(process.env.COS_ID);
   let output: OutputMode = process.env.COS_OUTPUT === 'plain' ? 'plain' : 'json';
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (!arg) {
-      continue;
-    }
-    if (arg === '--id') {
-      id = normalizeCliId(args[index + 1]);
-      if (!id) {
-        throw new Error('missing required option: --id');
-      }
-      index += 1;
       continue;
     }
     if (arg === '--json') {
@@ -362,7 +363,7 @@ function parseCliArgs(args: string[]): CliContext {
     rest.push(arg);
   }
 
-  return { args: rest, id, output };
+  return { args: rest, output };
 }
 
 function readEnv(): XmtpEnv {
@@ -386,16 +387,16 @@ function defaultIo(): CliIo {
 function helpText(): string {
   return `Usage:
   cos keygen
-  cos [--id <localId>] [--json|--plain] login --secret-stdin [--remember]
-  cos [--id <localId>] [--json|--plain] whoami [--env dev|production|local]
-  cos [--id <localId>] [--json|--plain] send --to <inboxId|address|contactName> --text "..."
-  cos [--id <localId>] [--json|--plain] listen [--once] [--timeout-ms <ms>]
+  cos [--json|--plain] login --secret-stdin [--remember]
+  cos [--json|--plain] whoami [--env dev|production|local]
+  cos [--json|--plain] send --to <inboxId|address|contactName> --text "..."
+  cos [--json|--plain] listen [--once] [--timeout-ms <ms>]
   cos contacts list
   cos contacts add --name <name> --identity <inboxId|address>
   cos contacts rename <contactId> <name>
   cos contacts delete <contactId>
-  cos [--id <localId>] pair new
-  cos [--id <localId>] pair join <code> [--name <name>]
+  cos pair new
+  cos pair join <code> [--share-name <name>] [--save-as <contactName>]
   cos conversations
   cos backup export --out backup.cos
   cos backup import --in backup.cos

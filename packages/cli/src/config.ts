@@ -33,5 +33,10 @@ export function loadSecretKey(configPath = defaultConfigPath()): SecretKey {
     return parseSecretKey(config.secretKey);
   }
 
-  throw new Error('missing secret key; set COS_SECRET_KEY or run cos --id <localId> login --secret-stdin --remember');
+  throw new Error([
+    'missing secret key',
+    'Provide one with COS_SECRET_KEY, pass --secret-stdin for this command, or save one locally with:',
+    '  cos login --secret-stdin --remember',
+    'The SECRET_KEY determines the XMTP account/inbox.',
+  ].join('\n'));
 }

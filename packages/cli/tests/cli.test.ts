@@ -15,13 +15,13 @@ describe('CLI', () => {
   test('send command resolves client from stdin secret and sends text', async () => {
     const io = makeIo(generateSecretKey());
     const client = new MockClient();
-    let receivedOptions: { env?: XmtpEnv; id?: string } | undefined;
+    let receivedOptions: { env?: XmtpEnv } | undefined;
 
     const exitCode = await runCli(
-      ['--id', 'alice', 'send', '--secret-stdin', '--to', 'Alice', '--text', 'hello'],
+      ['send', '--secret-stdin', '--to', 'Alice', '--text', 'hello'],
       io,
       {
-        createClient: async (_secret: SecretKey, options?: { env?: XmtpEnv; id?: string }) => {
+        createClient: async (_secret: SecretKey, options?: { env?: XmtpEnv }) => {
           receivedOptions = options;
           return client;
         },
@@ -30,7 +30,7 @@ describe('CLI', () => {
 
     expect(exitCode).toBe(0);
     expect(client.sent).toEqual([{ to: 'Alice', text: 'hello' }]);
-    expect(receivedOptions?.id).toBe('alice');
+    expect(receivedOptions).toEqual({ env: undefined });
   });
 
   test('contacts commands list and add contacts through the client', async () => {
@@ -48,22 +48,40 @@ describe('CLI', () => {
     expect(client.contacts[0]?.name).toBe('Alice');
   });
 
-  test('pair join defaults proposed name from local id and prints next steps', async () => {
+  test('pair join does not send a peer-visible name implicitly', async () => {
     const io = makeIo(generateSecretKey());
     const client = new MockClient();
 
     expect(
       await runCli(
-        ['--id', 'charlie', 'pair', 'join', 'shared-code', '--secret-stdin'],
+        ['pair', 'join', 'shared-code', '--secret-stdin'],
         io,
         { createClient: async () => client },
       ),
     ).toBe(0);
 
-    expect(client.pairRequests[0]).toEqual({ code: 'shared-code', proposedName: 'charlie' });
+    expect(client.pairRequests[0]).toEqual({ code: 'shared-code', proposedName: undefined });
     const output = JSON.parse(io.out.join('')) as { next?: { send?: string }; contact?: { name?: string } };
     expect(output.contact?.name).toBe('Dana');
-    expect(output.next?.send).toContain('--id charlie');
+    expect(output.next?.send).toBe('cos send --to "Dana" --text "hello"');
+  });
+
+  test('pair join supports explicit share and local contact names', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+
+    expect(
+      await runCli(
+        ['pair', 'join', 'shared-code', '--secret-stdin', '--share-name', 'Charlie CLI', '--save-as', 'Dana Laptop'],
+        io,
+        { createClient: async () => client },
+      ),
+    ).toBe(0);
+
+    expect(client.pairRequests[0]).toEqual({ code: 'shared-code', proposedName: 'Charlie CLI' });
+    const output = JSON.parse(io.out.join('')) as { next?: { send?: string }; contact?: { name?: string } };
+    expect(output.contact?.name).toBe('Dana Laptop');
+    expect(output.next?.send).toBe('cos send --to "Dana Laptop" --text "hello"');
   });
 
   test('listen --once waits for one message before exiting', async () => {

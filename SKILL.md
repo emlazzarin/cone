@@ -31,18 +31,18 @@ Use it for this process:
 export COS_SECRET_KEY='cos_sk_v1_...'
 ```
 
-Or remember it locally under a local id:
+Or remember it locally for the CLI:
 
 ```sh
-printf '%s' "$COS_SECRET_KEY" | bun run packages/cli/src/bin.ts --id agent-a login --secret-stdin --remember
+printf '%s' "$COS_SECRET_KEY" | bun run packages/cli/src/bin.ts login --secret-stdin --remember
 ```
 
-`--id` is a local selector for config and state. It is not a global username. Contact names are local aliases.
+The `SECRET_KEY` determines the XMTP account/inbox. Contact names are local aliases.
 
 ## Identity
 
 ```sh
-bun run packages/cli/src/bin.ts --id agent-a whoami
+bun run packages/cli/src/bin.ts whoami
 ```
 
 The output includes the XMTP `inboxId` and EVM address.
@@ -52,20 +52,20 @@ The output includes the XMTP `inboxId` and EVM address.
 Send to an inbox ID, EVM address, or saved contact name:
 
 ```sh
-bun run packages/cli/src/bin.ts --id agent-a send --to <identity> --text "hello"
+bun run packages/cli/src/bin.ts send --to <identity> --text "hello"
 ```
 
 Listen for inbound messages:
 
 ```sh
-bun run packages/cli/src/bin.ts --id agent-a listen
+bun run packages/cli/src/bin.ts listen
 ```
 
 ## Contacts
 
 ```sh
-bun run packages/cli/src/bin.ts --id agent-a contacts list
-bun run packages/cli/src/bin.ts --id agent-a contacts add --name Alice --identity <inboxId-or-address>
+bun run packages/cli/src/bin.ts contacts list
+bun run packages/cli/src/bin.ts contacts add --name Alice --identity <inboxId-or-address>
 ```
 
 Contact names are local aliases only.
@@ -81,7 +81,7 @@ bun run packages/cli/src/bin.ts pair new
 Join with a code:
 
 ```sh
-bun run packages/cli/src/bin.ts --id agent-a pair join <code>
+bun run packages/cli/src/bin.ts pair join <code> --share-name "Agent A" --save-as "Peer"
 ```
 
-Both sides must opt in during the short pairing window. If `--name` is omitted, the CLI id is proposed as the peer's contact name. The rendezvous service never relays application messages.
+Both sides must opt in during the short pairing window. `--share-name` is the optional peer-visible name you propose. `--save-as` is the local contact name for the peer. The rendezvous service never relays application messages.

@@ -18,7 +18,6 @@ interface CommandResult {
 
 const baseEnv = {
   ...process.env,
-  COS_HOME: runDir,
   COS_OUTPUT: 'json',
   COS_RENDEZVOUS_URL: rendezvousUrl,
   XMTP_ENV: process.env.XMTP_ENV ?? 'dev',
@@ -44,21 +43,21 @@ try {
   const aliceSecret = generateSecretKey();
   const bobSecret = generateSecretKey();
 
-  await assertCommand(['--id', 'alice', 'login', '--secret-stdin', '--remember'], { stdin: aliceSecret });
-  await assertCommand(['--id', 'bob', 'login', '--secret-stdin', '--remember'], { stdin: bobSecret });
+  await assertCommand(['login', '--secret-stdin', '--remember'], { actor: 'alice', stdin: aliceSecret });
+  await assertCommand(['login', '--secret-stdin', '--remember'], { actor: 'bob', stdin: bobSecret });
 
-  const aliceIdentity = JSON.parse((await assertCommand(['--id', 'alice', 'whoami'])).stdout) as { inboxId: string };
-  const bobIdentity = JSON.parse((await assertCommand(['--id', 'bob', 'whoami'])).stdout) as { inboxId: string };
+  const aliceIdentity = JSON.parse((await assertCommand(['whoami'], { actor: 'alice' })).stdout) as { inboxId: string };
+  const bobIdentity = JSON.parse((await assertCommand(['whoami'], { actor: 'bob' })).stdout) as { inboxId: string };
 
   const code = JSON.parse((await assertCommand(['pair', 'new'])).stdout) as { code: string };
   await Promise.all([
-    assertCommand(['--id', 'alice', 'pair', 'join', code.code]),
-    assertCommand(['--id', 'bob', 'pair', 'join', code.code]),
+    assertCommand(['pair', 'join', code.code, '--share-name', 'alice', '--save-as', 'bob'], { actor: 'alice' }),
+    assertCommand(['pair', 'join', code.code, '--share-name', 'bob', '--save-as', 'alice'], { actor: 'bob' }),
   ]);
 
-  const bobListen = runCommand(['--id', 'bob', 'listen', '--once', '--timeout-ms', '120000']);
+  const bobListen = runCommand(['listen', '--once', '--timeout-ms', '120000'], { actor: 'bob' });
   await sleep(5_000);
-  const sentToBob = JSON.parse((await assertCommand(['--id', 'alice', 'send', '--to', 'bob', '--text', 'live alice to bob'])).stdout) as {
+  const sentToBob = JSON.parse((await assertCommand(['send', '--to', 'bob', '--text', 'live alice to bob'], { actor: 'alice' })).stdout) as {
     messageId: string;
   };
   const bobReceived = parseJsonLine((await assertResult(await bobListen)).stdout) as { messageId: string; senderInboxId: string; text: string };
@@ -66,9 +65,9 @@ try {
   assertEqual(bobReceived.senderInboxId, aliceIdentity.inboxId, 'Bob saw the wrong sender inbox');
   assertEqual(bobReceived.text, 'live alice to bob', 'Bob received the wrong text');
 
-  const aliceListen = runCommand(['--id', 'alice', 'listen', '--once', '--timeout-ms', '120000']);
+  const aliceListen = runCommand(['listen', '--once', '--timeout-ms', '120000'], { actor: 'alice' });
   await sleep(5_000);
-  const sentToAlice = JSON.parse((await assertCommand(['--id', 'bob', 'send', '--to', 'alice', '--text', 'live bob to alice'])).stdout) as {
+  const sentToAlice = JSON.parse((await assertCommand(['send', '--to', 'alice', '--text', 'live bob to alice'], { actor: 'bob' })).stdout) as {
     messageId: string;
   };
   const aliceReceived = parseJsonLine((await assertResult(await aliceListen)).stdout) as { messageId: string; senderInboxId: string; text: string };
@@ -87,10 +86,10 @@ try {
   rendezvous?.kill();
 }
 
-async function runCommand(args: string[], options: { stdin?: string } = {}): Promise<CommandResult> {
+async function runCommand(args: string[], options: { actor?: string; stdin?: string } = {}): Promise<CommandResult> {
   const proc = Bun.spawn([...cli, ...args], {
     cwd: root,
-    env: baseEnv,
+    env: commandEnv(options.actor),
     stderr: 'pipe',
     stdin: options.stdin ? 'pipe' : 'ignore',
     stdout: 'pipe',
@@ -107,8 +106,18 @@ async function runCommand(args: string[], options: { stdin?: string } = {}): Pro
   return { code, stderr, stdout };
 }
 
-async function assertCommand(args: string[], options: { stdin?: string } = {}): Promise<CommandResult> {
+async function assertCommand(args: string[], options: { actor?: string; stdin?: string } = {}): Promise<CommandResult> {
   return assertResult(await runCommand(args, options));
+}
+
+function commandEnv(actor?: string): Record<string, string | undefined> {
+  if (!actor) {
+    return baseEnv;
+  }
+  return {
+    ...baseEnv,
+    COS_HOME: join(runDir, actor),
+  };
 }
 
 async function assertResult(result: CommandResult): Promise<CommandResult> {
