@@ -3,9 +3,13 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import {
   createConeClient,
   deriveAccount,
+  formatConeMessageLine,
+  formatConnectionStatus,
   generateSecretKey,
   HttpRendezvousClient,
+  isVisibleChatMessage,
   parseSecretKey,
+  type ConeConnectionStatus,
   type ConeClient,
   type ConeConversation,
   type ConeIdentity,
@@ -16,12 +20,21 @@ import {
 import { browserAccountNamespace, createBrowserXmtpAdapter, IndexedDbStore } from '@cone/xmtp-browser';
 
 type View = 'inbox' | 'contacts' | 'pair' | 'backup' | 'settings';
+type ChatMode = 'select' | 'talk';
 
 interface SessionState {
   accountId: string;
   client: ConeClient;
   env: XmtpEnv;
   identity: ConeIdentity;
+}
+
+interface TargetSuggestion {
+  conversationId?: string;
+  kind: 'contact' | 'conversation';
+  label: string;
+  meta: string;
+  value: string;
 }
 
 const DEFAULT_RENDEZVOUS_URL = import.meta.env.VITE_COS_RENDEZVOUS_URL ?? 'http://localhost:8787';
@@ -34,6 +47,7 @@ export function App() {
   const [conversations, setConversations] = useState<ConeConversation[]>([]);
   const [messages, setMessages] = useState<ConeMessage[]>([]);
   const [view, setView] = useState<View>('inbox');
+  const [chatMode, setChatMode] = useState<ChatMode>('select');
   const [selectedConversationId, setSelectedConversationId] = useState<string>('');
   const [to, setTo] = useState('');
   const [text, setText] = useState('');
@@ -47,8 +61,10 @@ export function App() {
   const [rendezvousUrl, setRendezvousUrl] = useState(DEFAULT_RENDEZVOUS_URL);
   const [status, setStatus] = useState('Paste a Cone secret key or generate one.');
   const [busy, setBusy] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<ConeConnectionStatus>('connecting');
   const [sessionStartedAt, setSessionStartedAt] = useState<Date | null>(null);
   const secretRef = useRef<HTMLTextAreaElement>(null);
+  const toRef = useRef<HTMLInputElement>(null);
   const messageRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -58,19 +74,28 @@ export function App() {
     let unsubscribe: (() => void | Promise<void>) | undefined;
 
     async function start() {
+      setConnectionStatus('catching-up');
       await refresh(currentSession.client, selectedConversationId);
       unsubscribe = await currentSession.client.streamMessages(async (message) => {
         if (cancelled) return;
+        setConnectionStatus('live');
         await refresh(currentSession.client, selectedConversationId || message.conversationId);
         if (!selectedConversationId) {
           setSelectedConversationId(message.conversationId);
         }
       });
+      setConnectionStatus('live');
     }
 
-    void start().catch((error) => setStatus(errorMessage(error)));
+    void start().catch((error) => {
+      setConnectionStatus('offline');
+      setStatus(errorMessage(error));
+    });
     const timer = window.setInterval(() => {
-      void refresh(session.client, selectedConversationId).catch((error) => setStatus(errorMessage(error)));
+      void refresh(session.client, selectedConversationId).catch((error) => {
+        setConnectionStatus('stale');
+        setStatus(errorMessage(error));
+      });
     }, 8_000);
 
     return () => {
@@ -93,6 +118,9 @@ export function App() {
         if (viewForKey) {
           event.preventDefault();
           setView(viewForKey);
+          if (viewForKey === 'inbox') {
+            setChatMode('select');
+          }
           return;
         }
       }
@@ -102,6 +130,26 @@ export function App() {
         if (key === 'l') {
           event.preventDefault();
           void lock();
+          return;
+        }
+        if (view === 'inbox' && key === 'n') {
+          event.preventDefault();
+          beginNewMessage();
+          return;
+        }
+        if (view === 'inbox' && (key === 'j' || event.key === 'ArrowDown')) {
+          event.preventDefault();
+          moveConversation(1);
+          return;
+        }
+        if (view === 'inbox' && (key === 'k' || event.key === 'ArrowUp')) {
+          event.preventDefault();
+          moveConversation(-1);
+          return;
+        }
+        if (view === 'inbox' && event.key === 'Enter') {
+          event.preventDefault();
+          enterTalkMode();
           return;
         }
         if (view === 'pair' && key === 'c') {
@@ -116,12 +164,20 @@ export function App() {
         }
       }
 
+      if (session && view === 'inbox' && event.key === 'Escape' && isEditableTarget(event.target)) {
+        event.preventDefault();
+        setChatMode('select');
+        (event.target as HTMLElement).blur();
+        return;
+      }
+
       if (event.key === '/' && !session) {
         event.preventDefault();
         secretRef.current?.focus();
       } else if (event.key === '/' && !isEditableTarget(event.target)) {
         event.preventDefault();
         setView('inbox');
+        setChatMode('talk');
         window.requestAnimationFrame(() => messageRef.current?.focus());
       }
     }
@@ -158,12 +214,13 @@ export function App() {
       const identity = await cone.identity();
       setSession({ accountId: account.accountId, client: cone, env, identity });
       setSessionStartedAt(new Date());
+      setConnectionStatus('connecting');
       setSecretInput('');
       setPairPeerName('');
       setPairShareName('');
-      setStatus('Unlocked. Secret key was not saved by the app.');
+      setStatus('Unlocked for this browser session. Keep your secret key saved outside the app.');
       await refresh(cone);
-      window.requestAnimationFrame(() => messageRef.current?.focus());
+      setChatMode('select');
     }, 'Unlocking XMTP account...');
   }
 
@@ -189,6 +246,7 @@ export function App() {
       setText('');
       if (sent.conversationId) {
         setSelectedConversationId(sent.conversationId);
+        setChatMode('talk');
         await refresh(session.client, sent.conversationId);
       } else {
         await refresh(session.client);
@@ -217,7 +275,6 @@ export function App() {
         address: contact.address,
         inboxId: contact.inboxId,
         name: editingName,
-        notes: contact.notes,
         source: contact.source,
       });
       setEditingContactId('');
@@ -259,6 +316,7 @@ export function App() {
         : result.contact;
       setTo(contact.name);
       setView('inbox');
+      setChatMode('talk');
       setStatus(`Paired with ${contact.name}. You can message them now.`);
       await refresh(session.client);
       window.requestAnimationFrame(() => messageRef.current?.focus());
@@ -296,11 +354,61 @@ export function App() {
     setConversations([]);
     setMessages([]);
     setSessionStartedAt(null);
+    setConnectionStatus('connecting');
     setSelectedConversationId('');
     setTo('');
     setText('');
+    setChatMode('select');
     setStatus('Locked. Secret key is only in memory.');
     window.requestAnimationFrame(() => secretRef.current?.focus());
+  }
+
+  function beginNewMessage() {
+    setView('inbox');
+    setSelectedConversationId('');
+    setMessages([]);
+    setTo('');
+    setChatMode('talk');
+    window.requestAnimationFrame(() => toRef.current?.focus());
+  }
+
+  function selectConversation(conversation: ConeConversation | null) {
+    if (!session) return;
+    if (!conversation) {
+      setSelectedConversationId('');
+      setMessages([]);
+      setTo('');
+      setChatMode('select');
+      return;
+    }
+    setSelectedConversationId(conversation.conversationId);
+    setTo(conversation.title);
+    setChatMode('select');
+    void refresh(session.client, conversation.conversationId);
+  }
+
+  function moveConversation(delta: 1 | -1) {
+    if (conversations.length === 0) {
+      beginNewMessage();
+      return;
+    }
+    const selectedIndex = selectedConversationId
+      ? conversations.findIndex((conversation) => conversation.conversationId === selectedConversationId)
+      : -1;
+    const virtualIndex = selectedIndex + 1;
+    const nextVirtualIndex = clamp(virtualIndex + delta, 0, conversations.length);
+    selectConversation(nextVirtualIndex === 0 ? null : conversations[nextVirtualIndex - 1] ?? null);
+  }
+
+  function enterTalkMode() {
+    setChatMode('talk');
+    window.requestAnimationFrame(() => {
+      if (!to.trim()) {
+        toRef.current?.focus();
+      } else {
+        messageRef.current?.focus();
+      }
+    });
   }
 
   if (!session) {
@@ -317,7 +425,11 @@ export function App() {
           <div class="login-grid">
             <div class="login-copy">
               <p class="prompt-line">[cos] XMTP account unlock</p>
-              <h1>Cone of Silence</h1>
+              <h1>
+                <span>Cone</span>
+                <span>of</span>
+                <span>Silence</span>
+              </h1>
               <p class="terminal-copy">Paste a portable Cone secret key. The raw secret is only held in memory for this browser session.</p>
               <div class="help-grid" aria-label="Login hotkeys">
                 <span><kbd>/</kbd> focus secret</span>
@@ -377,19 +489,24 @@ export function App() {
 
   const activeConversation = conversations.find((conversation) => conversation.conversationId === selectedConversationId);
   const visibleMessages = messages.filter(isVisibleChatMessage);
-  const channelTitle = activeConversation ? `#${activeConversation.title}` : '#new-message';
-  const busyLabel = busy ? 'BUSY' : 'READY';
+  const channelTitle = activeConversation ? activeConversation.title : 'new message';
+  const surfaceTitle = viewLabel(view);
+  const xmtpLabel = formatConnectionStatus(connectionStatus).toUpperCase().replaceAll(' ', '-');
   const logTime = sessionStartedAt ?? new Date();
+  const targetSuggestions = buildTargetSuggestions(to, contacts, conversations);
+  const modeLabel = view === 'inbox' ? `CHAT:${chatMode.toUpperCase()}` : '';
+  const localStats = `${conversations.length} chats / ${contacts.filter((contact) => contact.source !== 'self').length} contacts`;
 
   return (
     <main class="irc-shell">
       <section class="window app-window" aria-label="Cone IRC client">
         <header class="topbar">
           <span class="status-cell brand-cell">CONE@{session.env}:{session.accountId}</span>
-          <span class="status-cell">{channelTitle}</span>
-          <span class="status-cell connection-cell">XMTP:UNLOCKED</span>
-          <span class="status-cell key-cell">KEY:MEMORY-ONLY</span>
-          <span class={`status-cell ${busy ? 'state-warn' : 'state-ok'}`}>{busyLabel}</span>
+          <span class="status-cell">INBOX:{shortId(session.identity.inboxId)}</span>
+          <span class="status-cell">{surfaceTitle}</span>
+          {modeLabel && <span class="status-cell mode-cell">{modeLabel}</span>}
+          <span class={`status-cell connection-cell ${connectionClass(connectionStatus)}`}>XMTP:{xmtpLabel}</span>
+          <span class="status-cell">{localStats}</span>
           <span class="status-message">{status}</span>
           <button data-kbd-focus="true" type="button" class="lock-button" aria-keyshortcuts="L" onClick={() => void lock()}>
             [L] LOCK
@@ -398,38 +515,39 @@ export function App() {
 
         <nav class="modebar" aria-label="Primary views">
           <button data-kbd-focus="true" aria-current={view === 'inbox' ? 'page' : undefined} aria-keyshortcuts="Control+1" class={view === 'inbox' ? 'active' : ''} onClick={() => setView('inbox')}>
-            [<kbd>C-1</kbd>] CHAT
+            <kbd>C-1</kbd> CHAT
           </button>
           <button data-kbd-focus="true" aria-current={view === 'contacts' ? 'page' : undefined} aria-keyshortcuts="Control+2" class={view === 'contacts' ? 'active' : ''} onClick={() => setView('contacts')}>
-            [<kbd>C-2</kbd>] USERS
+            <kbd>C-2</kbd> CONTACTS
           </button>
           <button data-kbd-focus="true" aria-current={view === 'pair' ? 'page' : undefined} aria-keyshortcuts="Control+3" class={view === 'pair' ? 'active' : ''} onClick={() => setView('pair')}>
-            [<kbd>C-3</kbd>] PAIR
+            <kbd>C-3</kbd> PAIR
           </button>
           <button data-kbd-focus="true" aria-current={view === 'backup' ? 'page' : undefined} aria-keyshortcuts="Control+4" class={view === 'backup' ? 'active' : ''} onClick={() => setView('backup')}>
-            [<kbd>C-4</kbd>] VAULT
+            <kbd>C-4</kbd> BACKUP
           </button>
           <button data-kbd-focus="true" aria-current={view === 'settings' ? 'page' : undefined} aria-keyshortcuts="Control+," class={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>
-            [<kbd>C-,</kbd>] CONFIG
+            <kbd>C-,</kbd> CONFIG
           </button>
         </nav>
 
         {view === 'inbox' && (
           <div class="irc-grid">
             <aside class="channel-pane" aria-label="Channels and conversations">
-              <div class="pane-title">channels</div>
+              <div class="pane-title">
+                <span>switchboard</span>
+                <small><kbd>j/k</kbd> select</small>
+              </div>
               <button
                 data-kbd-focus="true"
                 aria-current={!selectedConversationId ? 'true' : undefined}
                 class={!selectedConversationId ? 'channel active' : 'channel'}
                 onClick={() => {
-                  setSelectedConversationId('');
-                  setTo('');
-                  void refresh(session.client);
+                  beginNewMessage();
                 }}
               >
-                <span>#NEW-MESSAGE</span>
-                <small>+ compose</small>
+                <span>+ NEW MESSAGE</span>
+                <small><kbd>N</kbd></small>
               </button>
               {conversations.map((conversation) => (
                 <button
@@ -438,75 +556,104 @@ export function App() {
                   class={selectedConversationId === conversation.conversationId ? 'channel active' : 'channel'}
                   key={conversation.conversationId}
                   onClick={() => {
-                    setSelectedConversationId(conversation.conversationId);
-                    setTo(conversation.title);
-                    void refresh(session.client, conversation.conversationId);
-                    window.requestAnimationFrame(() => messageRef.current?.focus());
+                    selectConversation(conversation);
                   }}
                 >
-                  <span>#{conversation.title}</span>
+                  <span>{conversation.title}</span>
                   <small>{shortId(conversation.peerInboxId)}</small>
                 </button>
               ))}
-              {conversations.length === 0 && <p class="empty">~ no channels / pair or send</p>}
-              <button data-kbd-focus="true" type="button" class="line-button" onClick={() => void refresh()}>
-                ~ refresh
-              </button>
+              {conversations.length === 0 && <p class="empty">no chats yet<br />pair or send first</p>}
             </aside>
 
             <section class="transcript-pane" aria-label="Message transcript">
               <div class="pane-title">
-                <span>{channelTitle}</span>
+                <span>{activeConversation ? channelTitle : 'new message'}</span>
                 <span class="dim">{activeConversation ? shortId(activeConversation.peerInboxId) : 'contact / inbox / address'}</span>
               </div>
               <div class="transcript" role="log" aria-live="polite" aria-relevant="additions text">
-                <div class="topic-line">
-                  <span>topic</span>
-                  <p>{activeConversation ? `/dm ${activeConversation.title}` : '/msg <contact|inbox|address> | /pair <code>'}</p>
-                </div>
                 {visibleMessages.length === 0 && (
                   <div class="system-log" aria-label="Empty channel instructions">
                     <p class="system-line"><time>{formatClock(logTime)}</time><span>*</span><em>system joined local session</em></p>
                     <p class="system-line"><time>{formatClock(logTime)}</time><span>***</span><em>no visible messages</em></p>
-                    <p class="system-line"><time>{formatClock(logTime)}</time><span>-</span><em>/msg &lt;contact|inbox|address&gt; then [ENTER]</em></p>
-                    <p class="system-line"><time>{formatClock(logTime)}</time><span>-</span><em>[C-3] opens code pairing</em></p>
+                    <p class="system-line"><time>{formatClock(logTime)}</time><span>hint</span><em>{activeConversation ? 'Press Enter to write. Esc returns to selection.' : 'Press N, type a contact or inbox ID, then write below.'}</em></p>
                   </div>
                 )}
-                {visibleMessages.map((message) => (
-                  <article class={`message-line ${message.direction}`} key={message.messageId}>
-                    <time>{formatTime(message.sentAt)}</time>
-                    <span class="nick">{message.direction === 'outbound' ? 'me' : activeConversation?.title ?? shortId(message.senderInboxId)}</span>
-                    <p>{message.text ?? JSON.stringify(message.json)}</p>
-                  </article>
-                ))}
+                {visibleMessages.map((message) => {
+                  const sender = message.direction === 'outbound' ? 'me' : activeConversation?.title ?? shortId(message.senderInboxId);
+                  return (
+                    <article class={`message-line ${message.direction}`} key={message.messageId}>
+                      <p>{formatConeMessageLine(message, sender)}</p>
+                    </article>
+                  );
+                })}
               </div>
-              <form class="command-bar" onSubmit={(event) => {
+              <form class={`composer ${chatMode === 'talk' ? 'is-talking' : 'is-selecting'}`} onSubmit={(event) => {
                 event.preventDefault();
                 void sendMessage();
               }}>
-                <label>
-                  <span>to</span>
-                  <input data-kbd-focus="true" value={to} onInput={(event) => setTo(event.currentTarget.value)} placeholder="contact, inbox ID, or EVM address" />
+                <label class="to-field">
+                  <span>To <small>type for matches, click a suggestion</small></span>
+                  <input
+                    ref={toRef}
+                    data-kbd-focus="true"
+                    value={to}
+                    onFocus={() => setChatMode('talk')}
+                    onInput={(event) => setTo(event.currentTarget.value)}
+                    placeholder="contact, inbox ID, or EVM address"
+                  />
+                  {targetSuggestions.length > 0 && (
+                    <div class="suggestion-rail" aria-label="Target suggestions">
+                      {targetSuggestions.map((suggestion) => (
+                        <button
+                          data-kbd-focus="true"
+                          type="button"
+                          key={`${suggestion.kind}:${suggestion.value}`}
+                          onClick={() => {
+                            setTo(suggestion.value);
+                            if (suggestion.conversationId) {
+                              const conversation = conversations.find((candidate) => candidate.conversationId === suggestion.conversationId);
+                              if (conversation) {
+                                selectConversation(conversation);
+                              }
+                            }
+                            setChatMode('talk');
+                            window.requestAnimationFrame(() => messageRef.current?.focus());
+                          }}
+                        >
+                          {suggestion.label}
+                          <small>{suggestion.meta}</small>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </label>
                 <label class="command-input">
-                    <span><kbd>/</kbd> message <small>[ENTER] sends / [S-ENTER] newline</small></span>
+                  <span>Message <small><kbd>Enter</kbd> send <kbd>Shift+Enter</kbd> newline <kbd>Esc</kbd> select</small></span>
                   <textarea
                     ref={messageRef}
                     data-kbd-focus="true"
                     value={text}
+                    onFocus={() => setChatMode('talk')}
                     onInput={(event) => setText(event.currentTarget.value)}
                     onKeyDown={(event) => {
+                      if (event.key === 'Escape') {
+                        event.preventDefault();
+                        setChatMode('select');
+                        event.currentTarget.blur();
+                        return;
+                      }
                       if (event.key === 'Enter' && !event.shiftKey) {
                         event.preventDefault();
                         void sendMessage();
                       }
                     }}
-                    rows={2}
-                    placeholder="/msg ..."
+                    rows={4}
+                    placeholder="Type a message..."
                   />
                 </label>
                 <button data-kbd-focus="true" type="submit" disabled={busy || !to.trim() || !text.trim()}>
-                  send <kbd>ENTER</kbd>
+                  transmit <kbd>ENTER</kbd>
                 </button>
               </form>
             </section>
@@ -516,7 +663,16 @@ export function App() {
         {view === 'contacts' && (
           <div class="utility-grid">
             <section class="pane">
-              <div class="pane-title">users</div>
+              <div class="pane-title">
+                <span>address book</span>
+                <small><kbd>C-1</kbd> chat</small>
+              </div>
+              {contacts.length === 0 && (
+                <div class="empty-card">
+                  <strong>No contacts saved.</strong>
+                  <p>Add an XMTP-reachable identity, or use pairing when neither side wants to exchange identifiers first.</p>
+                </div>
+              )}
               {contacts.map((contact) => (
                 <div class="user-row" key={contact.contactId}>
                   {editingContactId === contact.contactId ? (
@@ -531,17 +687,29 @@ export function App() {
                         <strong>{contact.name}</strong>
                         <small>{contact.address ?? shortId(contact.inboxId)} / {contact.source}</small>
                       </div>
-                      <button data-kbd-focus="true" type="button" class="ghost" onClick={() => {
-                        setTo(contact.name);
-                        setView('inbox');
-                        window.requestAnimationFrame(() => messageRef.current?.focus());
-                      }}>msg</button>
-                      <button data-kbd-focus="true" type="button" class="ghost" onClick={() => {
-                        setEditingContactId(contact.contactId);
-                        setEditingName(contact.name);
-                      }}>rename</button>
-                      {contact.source !== 'self' && (
-                        <button data-kbd-focus="true" type="button" class="danger" onClick={() => void deleteContact(contact.contactId)}>delete</button>
+                      {contact.source === 'self' ? (
+                        <span class="self-badge">local identity</span>
+                      ) : (
+                        <>
+                          <button data-kbd-focus="true" type="button" class="ghost" onClick={() => {
+                            const conversation = conversations.find((candidate) => candidate.peerInboxId === contact.inboxId);
+                            setTo(contact.name);
+                            setView('inbox');
+                            setChatMode('talk');
+                            setSelectedConversationId(conversation?.conversationId ?? '');
+                            if (conversation) {
+                              void refresh(session.client, conversation.conversationId);
+                            } else {
+                              setMessages([]);
+                            }
+                            window.requestAnimationFrame(() => messageRef.current?.focus());
+                          }}>talk</button>
+                          <button data-kbd-focus="true" type="button" class="ghost" onClick={() => {
+                            setEditingContactId(contact.contactId);
+                            setEditingName(contact.name);
+                          }}>rename</button>
+                          <button data-kbd-focus="true" type="button" class="danger" onClick={() => void deleteContact(contact.contactId)}>delete</button>
+                        </>
                       )}
                     </>
                   )}
@@ -549,7 +717,7 @@ export function App() {
               ))}
             </section>
             <section class="pane">
-              <div class="pane-title">add user</div>
+              <div class="pane-title">save contact</div>
               <label>
                 <span>name</span>
                 <input data-kbd-focus="true" value={contactName} onInput={(event) => setContactName(event.currentTarget.value)} placeholder="Alice" />
@@ -568,7 +736,10 @@ export function App() {
         {view === 'pair' && (
           <div class="pair-grid">
             <section class="pane">
-              <div class="pane-title">pairing room</div>
+              <div class="pane-title">
+                <span>pairing room</span>
+                <small><kbd>C</kbd> create <kbd>J</kbd> join</small>
+              </div>
               <p class="terminal-copy">Encrypted rendezvous. Two participants. Ten minute room TTL. No application messages pass through rendezvous.</p>
               <label>
                 <span>save this peer as</span>
@@ -583,8 +754,8 @@ export function App() {
                 <input data-kbd-focus="true" value={pairCode} onInput={(event) => setPairCode(event.currentTarget.value)} placeholder="forest-wormhole-direction" />
               </label>
               <div class="action-bar">
-                <button data-kbd-focus="true" type="button" disabled={busy} aria-keyshortcuts="C" onClick={() => void createCode()}>[C] create code</button>
-                <button data-kbd-focus="true" type="button" class="secondary" disabled={busy || !pairCode.trim()} aria-keyshortcuts="J" onClick={() => void joinCode()}>[J] join code</button>
+                <button data-kbd-focus="true" type="button" disabled={busy} aria-keyshortcuts="C" onClick={() => void createCode()}><kbd>C</kbd> create code</button>
+                <button data-kbd-focus="true" type="button" class="secondary" disabled={busy || !pairCode.trim()} aria-keyshortcuts="J" onClick={() => void joinCode()}><kbd>J</kbd> join code</button>
               </div>
             </section>
             <aside class="pane telemetry-pane" aria-label="Pairing diagnostics">
@@ -593,7 +764,7 @@ export function App() {
               <p class="system-line"><time>{formatClock(logTime)}</time><span>env</span><em>{session.env}</em></p>
               <p class="system-line"><time>{formatClock(logTime)}</time><span>me</span><em>{shortId(session.identity.inboxId)}</em></p>
               <p class="system-line"><time>{formatClock(logTime)}</time><span>code</span><em>{pairCode || 'waiting for code input'}</em></p>
-              <p class="system-line matrix-label"><time>{formatClock(logTime)}</time><span>seal</span><em>room fingerprint</em></p>
+              <p class="system-line matrix-label"><time>{formatClock(logTime)}</time><span>print</span><em>code print</em></p>
               <pre aria-hidden="true">{pairingGlyph(pairCode)}</pre>
             </aside>
           </div>
@@ -601,7 +772,7 @@ export function App() {
 
         {view === 'backup' && (
           <section class="pane narrow">
-            <div class="pane-title">vault</div>
+            <div class="pane-title">encrypted vault</div>
             <p class="terminal-copy">Backups contain Cone contacts and cached messages encrypted with a key derived from your secret.</p>
             <div class="action-bar">
               <button data-kbd-focus="true" type="button" disabled={busy} onClick={() => void exportBackup()}>export backup</button>
@@ -615,7 +786,7 @@ export function App() {
 
         {view === 'settings' && (
           <section class="pane narrow">
-            <div class="pane-title">config</div>
+            <div class="pane-title">station config</div>
             <dl class="terminal-dl">
               <dt>inbox ID</dt>
               <dd>{session.identity.inboxId}</dd>
@@ -629,7 +800,7 @@ export function App() {
         )}
 
         <footer class="footerbar">
-          {footerHints(view).map((hint) => <span key={hint}>{hint}</span>)}
+          {footerHints(view, chatMode).map((hint) => <span key={hint}>{hint}</span>)}
         </footer>
       </section>
     </main>
@@ -653,12 +824,14 @@ function hotkeyView(key: string): View | null {
   }
 }
 
-function footerHints(view: View): string[] {
+function footerHints(view: View, chatMode: ChatMode): string[] {
   switch (view) {
     case 'inbox':
-      return ['[TAB] next', '[S-TAB] prev', '[/] msg input', '[ENTER] send', '[C-3] pair'];
+      return chatMode === 'select'
+        ? ['[J/K] select', '[ENTER] talk', '[N] new message', '[C-2] contacts', '[/] focus composer']
+        : ['[ENTER] transmit', '[ESC] select', '[TAB] next field', '[S-TAB] previous field', '[C-3] pair'];
     case 'contacts':
-      return ['[TAB] next', '[S-TAB] prev', '[C-1] chat', '[MSG] opens composer'];
+      return ['[TAB] next', '[S-TAB] prev', '[C-1] chat', '[TALK] opens composer', '[C-3] pair'];
     case 'pair':
       return ['[TAB] next', '[S-TAB] prev', '[C] create code', '[J] join code', '[C-1] chat'];
     case 'backup':
@@ -666,6 +839,65 @@ function footerHints(view: View): string[] {
     case 'settings':
       return ['[TAB] next', '[S-TAB] prev', '[C-1] chat', '[L] lock'];
   }
+}
+
+function viewLabel(view: View): string {
+  switch (view) {
+    case 'inbox':
+      return 'CHAT';
+    case 'contacts':
+      return 'CONTACTS';
+    case 'pair':
+      return 'PAIR';
+    case 'backup':
+      return 'BACKUP';
+    case 'settings':
+      return 'CONFIG';
+  }
+}
+
+function buildTargetSuggestions(query: string, contacts: Contact[], conversations: ConeConversation[]): TargetSuggestion[] {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const suggestions = new Map<string, TargetSuggestion>();
+  for (const contact of contacts) {
+    if (contact.source === 'self') {
+      continue;
+    }
+    if (contact.name.toLocaleLowerCase().includes(normalizedQuery) || contact.inboxId.toLocaleLowerCase().includes(normalizedQuery)) {
+      suggestions.set(`contact:${contact.contactId}`, {
+        kind: 'contact',
+        label: contact.name,
+        meta: `${contact.source} / ${shortId(contact.inboxId)}`,
+        value: contact.name,
+      });
+    }
+  }
+  for (const conversation of conversations) {
+    if (conversation.title.toLocaleLowerCase().includes(normalizedQuery) || conversation.peerInboxId.toLocaleLowerCase().includes(normalizedQuery)) {
+      suggestions.set(`conversation:${conversation.conversationId}`, {
+        conversationId: conversation.conversationId,
+        kind: 'conversation',
+        label: conversation.title,
+        meta: `chat / ${shortId(conversation.peerInboxId)}`,
+        value: conversation.title,
+      });
+    }
+  }
+  return Array.from(suggestions.values()).slice(0, 5);
+}
+
+function connectionClass(status: ConeConnectionStatus): string {
+  if (status === 'live') {
+    return 'state-ok';
+  }
+  if (status === 'offline' || status === 'stale') {
+    return 'state-bad';
+  }
+  return 'state-warn';
 }
 
 function focusByTab(direction: 1 | -1): void {
@@ -714,28 +946,25 @@ function formatClock(value: Date): string {
   }).format(value);
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
 function pairingGlyph(code: string): string {
   const seed = code || 'cone-of-silence';
-  const rows = Array.from({ length: 7 }, (_, row) => {
-    return Array.from({ length: 15 }, (_, column) => {
-      const charCode = seed.charCodeAt((row * 15 + column) % seed.length) || 0;
-      return (charCode + row + column) % 3 === 0 ? '█' : (charCode + column) % 2 === 0 ? '▓' : '░';
-    }).join('');
+  const alphabet = '0123456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const chars = Array.from({ length: 48 }, (_, index) => {
+    const charCode = seed.charCodeAt(index % seed.length) || 0;
+    return alphabet[(charCode + index * 13) % alphabet.length] ?? '0';
   });
-  return rows.join('\n');
+  return [
+    'CODE-PRINT',
+    chars.slice(0, 16).join('').match(/.{1,4}/gu)?.join('-') ?? '',
+    chars.slice(16, 32).join('').match(/.{1,4}/gu)?.join('-') ?? '',
+    chars.slice(32, 48).join('').match(/.{1,4}/gu)?.join('-') ?? '',
+  ].join('\n');
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function isVisibleChatMessage(message: ConeMessage): boolean {
-  if (message.kind === 'control') {
-    return false;
-  }
-  if (typeof message.json === 'object' && message.json !== null && 'type' in message.json) {
-    const type = message.json.type;
-    return !(typeof type === 'string' && type.startsWith('cos.') && type !== 'cos.app.json.v1');
-  }
-  return true;
 }

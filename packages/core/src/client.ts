@@ -16,6 +16,7 @@ import type {
   SaveContactInput,
   SentMessage,
   StoredMessage,
+  SyncResult,
   Unsubscribe,
 } from './types';
 import { assertValidContactInput, isLikelyInboxId, normalizeContactName, normalizeIdentityRef } from './validation';
@@ -100,21 +101,59 @@ class ConeClientImpl implements ConeClient {
   }
 
   async streamMessages(handler: (message: IncomingMessage) => void | Promise<void>): Promise<Unsubscribe> {
+    await this.options.store.putMetadata({ lastStreamStartedAt: this.nowIso() });
     return this.options.xmtp.streamMessages(async (message) => {
       const isNew = await this.options.store.markMessageProcessed(message.messageId);
       if (!isNew) {
         return;
       }
 
-      await this.maybeCreateInboundContact(message);
-      await this.persistInbound(message);
+      await this.persistNetworkMessage(message);
       await handler(message);
     });
   }
 
+  async sync(): Promise<SyncResult> {
+    const startedAt = this.nowIso();
+    let conversationsSynced = 0;
+    let messagesSynced = 0;
+    const errors: string[] = [];
+
+    try {
+      const result = await this.options.xmtp.sync();
+      for (const conversation of result.conversations) {
+        await this.options.store.putConversation(conversation);
+        conversationsSynced += 1;
+      }
+      for (const message of result.messages) {
+        const isNew = await this.options.store.markMessageProcessed(message.messageId);
+        await this.persistNetworkMessage(message);
+        if (isNew) {
+          messagesSynced += 1;
+        }
+      }
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+
+    const completedAt = this.nowIso();
+    if (errors.length === 0) {
+      await this.options.store.putMetadata({ lastSyncedAt: completedAt });
+    }
+
+    return {
+      completedAt,
+      conversationsSynced,
+      errors,
+      messagesSynced,
+      ok: errors.length === 0,
+      startedAt,
+    };
+  }
+
   async listConversations(): Promise<ConeConversation[]> {
     const [conversations, contacts] = await Promise.all([
-      this.options.xmtp.listConversations(),
+      this.options.store.listConversations(),
       this.options.store.listContacts(),
     ]);
     const contactsByInbox = new Map(contacts.map((contact) => [contact.inboxId, contact]));
@@ -152,6 +191,10 @@ class ConeClientImpl implements ConeClient {
     }));
   }
 
+  deleteConversation(conversationId: string): Promise<void> {
+    return this.options.store.deleteConversation(conversationId);
+  }
+
   listContacts(): Promise<Contact[]> {
     return this.options.store.listContacts();
   }
@@ -159,16 +202,22 @@ class ConeClientImpl implements ConeClient {
   async saveContact(input: SaveContactInput): Promise<Contact> {
     assertValidContactInput(input);
     const now = this.nowIso();
+    const normalizedName = normalizeContactName(input.name);
     const resolved = input.inboxId
       ? { inboxId: input.inboxId, address: input.address, source: 'inboxId' as const }
       : await this.resolveIdentity({ address: input.address });
-    const existing = await this.options.store.getContactByInboxId(resolved.inboxId);
+    const [existing, existingByName] = await Promise.all([
+      this.options.store.getContactByInboxId(resolved.inboxId),
+      this.options.store.getContactByName(normalizedName),
+    ]);
+    if (existingByName && existingByName.inboxId !== resolved.inboxId) {
+      throw new Error(`contact name already exists: ${normalizedName}`);
+    }
     const contact: Contact = {
       contactId: existing?.contactId ?? randomId('contact'),
-      name: normalizeContactName(input.name),
+      name: normalizedName,
       inboxId: resolved.inboxId,
       address: input.address ?? resolved.address,
-      notes: input.notes,
       source: input.source ?? existing?.source ?? 'manual',
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -302,6 +351,10 @@ class ConeClientImpl implements ConeClient {
   }
 
   private async maybeCreateInboundContact(message: IncomingMessage): Promise<void> {
+    const identity = await this.identity();
+    if (message.senderInboxId === identity.inboxId) {
+      return;
+    }
     const existing = await this.options.store.getContactByInboxId(message.senderInboxId);
     if (existing) {
       return;
@@ -316,9 +369,17 @@ class ConeClientImpl implements ConeClient {
 
   private async persistOutbound(sent: SentMessage, resolved: ResolvedIdentity, kind: StoredMessage['kind'], payload: unknown) {
     const identity = await this.identity();
+    const conversationId = sent.conversationId ?? `dm:${resolved.inboxId}`;
+    await this.options.store.putConversation({
+      conversationId,
+      peerAddress: resolved.address,
+      peerInboxId: resolved.inboxId,
+      title: resolved.displayName ?? resolved.address ?? resolved.inboxId,
+      updatedAt: sent.sentAt,
+    });
     await this.options.store.putMessage({
       messageId: sent.messageId,
-      conversationId: sent.conversationId ?? `dm:${resolved.inboxId}`,
+      conversationId,
       senderInboxId: identity.inboxId,
       recipientInboxId: resolved.inboxId,
       sentAt: sent.sentAt,
@@ -327,19 +388,37 @@ class ConeClientImpl implements ConeClient {
     });
   }
 
-  private async persistInbound(message: IncomingMessage): Promise<void> {
-    const kind = message.json === undefined ? 'text' : isConeControlEnvelope(message.json) ? 'control' : 'json';
+  private async persistNetworkMessage(message: IncomingMessage): Promise<void> {
+    await this.maybeCreateInboundContact(message);
+    await this.maybeCreateConversation(message);
+    const payload = storedNetworkPayload(message);
     await this.options.store.putMessage({
       messageId: message.messageId,
       conversationId: message.conversationId,
       senderInboxId: message.senderInboxId,
       sentAt: message.sentAt,
-      kind,
+      kind: payload.kind,
       encryptedPayload: await encryptJson(
         this.options.account.coneStorageKey,
         'cone.message.v1',
-        message.json ?? message.text ?? message.raw,
+        payload.value,
       ),
+    });
+  }
+
+  private async maybeCreateConversation(message: IncomingMessage): Promise<void> {
+    const existing = await this.options.store.getConversationById(message.conversationId);
+    const peerInboxId = existing?.peerInboxId ?? message.senderInboxId;
+    const contact = await this.options.store.getContactByInboxId(peerInboxId);
+    await this.options.store.putConversation({
+      conversationId: message.conversationId,
+      contactId: contact?.contactId ?? existing?.contactId,
+      peerAddress: contact?.address ?? message.senderAddress ?? existing?.peerAddress,
+      peerInboxId,
+      title: contact?.name ?? existing?.title ?? message.senderAddress ?? peerInboxId,
+      updatedAt: maxIso(existing?.updatedAt, message.sentAt),
+      unreadCount: existing?.unreadCount,
+      lastReadAt: existing?.lastReadAt,
     });
   }
 
@@ -352,6 +431,16 @@ class ConeClientImpl implements ConeClient {
   }
 }
 
+function maxIso(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  return left > right ? left : right;
+}
+
 function isConeControlEnvelope(value: unknown): boolean {
   return (
     typeof value === 'object' &&
@@ -361,6 +450,53 @@ function isConeControlEnvelope(value: unknown): boolean {
     value.type.startsWith('cos.') &&
     value.type !== 'cos.app.json.v1'
   );
+}
+
+function storedNetworkPayload(message: IncomingMessage): Pick<StoredMessage, 'kind'> & { value: unknown } {
+  if (message.json !== undefined) {
+    return {
+      kind: isConeControlEnvelope(message.json) ? 'control' : 'json',
+      value: jsonSafe(message.json),
+    };
+  }
+
+  if (message.text !== undefined) {
+    return { kind: 'text', value: message.text };
+  }
+
+  return {
+    kind: 'json',
+    value: {
+      type: 'cos.unsupported-message.v1',
+      messageId: message.messageId,
+      senderInboxId: message.senderInboxId,
+    },
+  };
+}
+
+function jsonSafe(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (value instanceof Uint8Array) {
+    return { type: 'bytes', length: value.byteLength };
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => jsonSafe(item, seen));
+  }
+  if (typeof value === 'object' && value !== null) {
+    if (seen.has(value)) {
+      return '[Circular]';
+    }
+    seen.add(value);
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, child]) => [key, jsonSafe(child, seen)]),
+    );
+  }
+  return value;
 }
 
 function contactToResolved(contact: Contact): ResolvedIdentity {

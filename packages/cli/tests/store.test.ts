@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, rmSync } from 'node:fs';
 
-import { deriveAccount, encryptJson, secretKeyFromHexSeed, type Contact, type StoredMessage } from '@cone/core';
+import { deriveAccount, encryptJson, secretKeyFromHexSeed, type ConeConversation, type Contact, type StoredMessage } from '@cone/core';
 
 import { BunSQLiteStore } from '../src/store';
 
@@ -36,17 +36,29 @@ describe('BunSQLiteStore', () => {
       senderInboxId: 'inbox-contact',
       sentAt: new Date().toISOString(),
     };
+    const conversation: ConeConversation = {
+      conversationId: 'dm-contact',
+      peerInboxId: 'inbox-contact',
+      title: 'Contact',
+      updatedAt: message.sentAt,
+    };
 
     await store.putContact(contact);
+    await store.putConversation(conversation);
     await store.putMessage(message);
+    await store.putMetadata({ lastStreamStartedAt: '2026-01-01T00:00:00.000Z', lastSyncedAt: '2026-01-01T00:01:00.000Z' });
     expect(await store.markMessageProcessed('msg-1')).toBe(true);
     expect(await store.markMessageProcessed('msg-1')).toBe(false);
     store.close();
 
     const reopened = new BunSQLiteStore(path);
     expect(await reopened.getContactByName('contact')).toEqual(contact);
+    expect(await reopened.getConversationById('dm-contact')).toEqual(conversation);
+    expect(await reopened.listConversations()).toEqual([conversation]);
     expect(await reopened.listMessages()).toEqual([message]);
-    expect((await reopened.exportSnapshot()).processedMessageIds).toEqual(['msg-1']);
+    const snapshot = await reopened.exportSnapshot();
+    expect(snapshot.metadata).toEqual({ lastStreamStartedAt: '2026-01-01T00:00:00.000Z', lastSyncedAt: '2026-01-01T00:01:00.000Z' });
+    expect(snapshot.processedMessageIds).toEqual(['msg-1']);
     reopened.close();
   });
 });

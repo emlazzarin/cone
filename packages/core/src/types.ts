@@ -43,7 +43,6 @@ export interface Contact {
   name: string;
   inboxId: string;
   address?: string;
-  notes?: string;
   source: ContactSource;
   createdAt: string;
   updatedAt: string;
@@ -53,7 +52,6 @@ export interface SaveContactInput {
   name: string;
   inboxId?: string;
   address?: string;
-  notes?: string;
   source?: ContactSource;
 }
 
@@ -64,6 +62,13 @@ export interface ConeConversation {
   contactId?: string;
   title: string;
   updatedAt?: string;
+  unreadCount?: number;
+  lastReadAt?: string;
+}
+
+export interface ConeStoreMetadata {
+  lastStreamStartedAt?: string;
+  lastSyncedAt?: string;
 }
 
 export interface StoredMessage {
@@ -108,6 +113,26 @@ export interface IncomingMessage {
 export type MessageHandler = (message: IncomingMessage) => void | Promise<void>;
 export type Unsubscribe = () => void | Promise<void>;
 
+export interface MessageListOptions {
+  after?: string;
+  before?: string;
+  limit?: number;
+}
+
+export interface XmtpSyncResult {
+  conversations: ConeConversation[];
+  messages: IncomingMessage[];
+}
+
+export interface SyncResult {
+  completedAt: string;
+  conversationsSynced: number;
+  errors: string[];
+  messagesSynced: number;
+  ok: boolean;
+  startedAt: string;
+}
+
 export interface HandshakeCode {
   code: string;
   expiresAt: string;
@@ -151,8 +176,10 @@ export interface XmtpAdapter {
   resolveIdentity(ref: IdentityRef): Promise<ResolvedIdentity | null>;
   canMessage(identity: ResolvedIdentity): Promise<boolean>;
   sendText(identity: ResolvedIdentity, text: string): Promise<SentMessage>;
+  sync(): Promise<XmtpSyncResult>;
   streamMessages(handler: MessageHandler): Promise<Unsubscribe>;
   listConversations(): Promise<ConeConversation[]>;
+  listMessages(conversationId: string, options?: MessageListOptions): Promise<IncomingMessage[]>;
   exportArchive?(key: Uint8Array): Promise<Uint8Array>;
   importArchive?(data: Uint8Array, key: Uint8Array): Promise<void>;
   close?(): Promise<void>;
@@ -160,11 +187,18 @@ export interface XmtpAdapter {
 
 export interface ConeStoreSnapshot {
   contacts: Contact[];
+  conversations: ConeConversation[];
+  metadata: ConeStoreMetadata;
   messages: StoredMessage[];
   processedMessageIds: string[];
 }
 
 export interface ConeStore {
+  putConversation(conversation: ConeConversation): Promise<void>;
+  getConversationById(conversationId: string): Promise<ConeConversation | null>;
+  listConversations(): Promise<ConeConversation[]>;
+  deleteConversation(conversationId: string): Promise<void>;
+
   putContact(contact: Contact): Promise<void>;
   getContactById(contactId: string): Promise<Contact | null>;
   getContactByInboxId(inboxId: string): Promise<Contact | null>;
@@ -175,6 +209,9 @@ export interface ConeStore {
   putMessage(message: StoredMessage): Promise<void>;
   listMessages(conversationId?: string): Promise<StoredMessage[]>;
   markMessageProcessed(messageId: string): Promise<boolean>;
+
+  getMetadata(): Promise<ConeStoreMetadata>;
+  putMetadata(metadata: ConeStoreMetadata): Promise<void>;
 
   exportSnapshot(): Promise<ConeStoreSnapshot>;
   importSnapshot(snapshot: ConeStoreSnapshot): Promise<void>;
@@ -187,9 +224,11 @@ export interface ConeClient {
   canMessage(ref: IdentityRef): Promise<boolean>;
   sendText(to: IdentityRef, text: string): Promise<SentMessage>;
   sendJson(to: IdentityRef, value: unknown): Promise<SentMessage>;
+  sync(): Promise<SyncResult>;
   streamMessages(handler: MessageHandler): Promise<Unsubscribe>;
   listConversations(): Promise<ConeConversation[]>;
   listMessages(conversationId?: string): Promise<ConeMessage[]>;
+  deleteConversation(conversationId: string): Promise<void>;
   listContacts(): Promise<Contact[]>;
   saveContact(input: SaveContactInput): Promise<Contact>;
   deleteContact(contactId: string): Promise<void>;

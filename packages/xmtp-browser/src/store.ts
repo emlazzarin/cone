@@ -3,7 +3,9 @@ import {
   encryptJson,
   MemoryStore,
   type ConeStore,
+  type ConeStoreMetadata,
   type ConeStoreSnapshot,
+  type ConeConversation,
   type Contact,
   type StoredMessage,
 } from '@cone/core';
@@ -19,6 +21,28 @@ export class IndexedDbStore implements ConeStore {
     private readonly dbName: string,
     private readonly storageKey: Uint8Array,
   ) {}
+
+  async putConversation(conversation: ConeConversation): Promise<void> {
+    await this.load();
+    await this.memory.putConversation(conversation);
+    await this.save();
+  }
+
+  async getConversationById(conversationId: string): Promise<ConeConversation | null> {
+    await this.load();
+    return this.memory.getConversationById(conversationId);
+  }
+
+  async listConversations(): Promise<ConeConversation[]> {
+    await this.load();
+    return this.memory.listConversations();
+  }
+
+  async deleteConversation(conversationId: string): Promise<void> {
+    await this.load();
+    await this.memory.deleteConversation(conversationId);
+    await this.save();
+  }
 
   async putContact(contact: Contact): Promise<void> {
     await this.load();
@@ -70,6 +94,17 @@ export class IndexedDbStore implements ConeStore {
       await this.save();
     }
     return isNew;
+  }
+
+  async getMetadata(): Promise<ConeStoreMetadata> {
+    await this.load();
+    return this.memory.getMetadata();
+  }
+
+  async putMetadata(metadata: ConeStoreMetadata): Promise<void> {
+    await this.load();
+    await this.memory.putMetadata(metadata);
+    await this.save();
   }
 
   async exportSnapshot(): Promise<ConeStoreSnapshot> {

@@ -1,10 +1,39 @@
-import type { ConeStore, ConeStoreSnapshot, Contact, StoredMessage } from './types';
+import type { ConeConversation, ConeStore, ConeStoreMetadata, ConeStoreSnapshot, Contact, StoredMessage } from './types';
 import { contactMatchesName } from './validation';
 
 export class MemoryStore implements ConeStore {
+  private readonly conversationsById = new Map<string, ConeConversation>();
   private readonly contactsById = new Map<string, Contact>();
   private readonly messagesById = new Map<string, StoredMessage>();
   private readonly processedMessageIds = new Set<string>();
+  private metadata: ConeStoreMetadata = {};
+
+  putConversation(conversation: ConeConversation): Promise<void> {
+    this.conversationsById.set(conversation.conversationId, conversation);
+    return Promise.resolve();
+  }
+
+  getConversationById(conversationId: string): Promise<ConeConversation | null> {
+    return Promise.resolve(this.conversationsById.get(conversationId) ?? null);
+  }
+
+  listConversations(): Promise<ConeConversation[]> {
+    return Promise.resolve(
+      [...this.conversationsById.values()].sort((a, b) => {
+        return (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '') || a.title.localeCompare(b.title);
+      }),
+    );
+  }
+
+  deleteConversation(conversationId: string): Promise<void> {
+    this.conversationsById.delete(conversationId);
+    for (const [messageId, message] of this.messagesById) {
+      if (message.conversationId === conversationId) {
+        this.messagesById.delete(messageId);
+      }
+    }
+    return Promise.resolve();
+  }
 
   putContact(contact: Contact): Promise<void> {
     this.contactsById.set(contact.contactId, contact);
@@ -65,9 +94,20 @@ export class MemoryStore implements ConeStore {
     return Promise.resolve(true);
   }
 
+  getMetadata(): Promise<ConeStoreMetadata> {
+    return Promise.resolve({ ...this.metadata });
+  }
+
+  putMetadata(metadata: ConeStoreMetadata): Promise<void> {
+    this.metadata = { ...this.metadata, ...metadata };
+    return Promise.resolve();
+  }
+
   exportSnapshot(): Promise<ConeStoreSnapshot> {
     return Promise.resolve({
       contacts: [...this.contactsById.values()],
+      conversations: [...this.conversationsById.values()],
+      metadata: { ...this.metadata },
       messages: [...this.messagesById.values()],
       processedMessageIds: [...this.processedMessageIds],
     });
@@ -77,6 +117,10 @@ export class MemoryStore implements ConeStore {
     for (const contact of snapshot.contacts) {
       this.contactsById.set(contact.contactId, contact);
     }
+    for (const conversation of snapshot.conversations ?? []) {
+      this.conversationsById.set(conversation.conversationId, conversation);
+    }
+    this.metadata = { ...this.metadata, ...snapshot.metadata };
     for (const message of snapshot.messages) {
       this.messagesById.set(message.messageId, message);
     }

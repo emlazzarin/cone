@@ -19,7 +19,6 @@
   "dependencies": {
     "@noble/hashes": "^1.8.0",
     "@preact/preset-vite": "^2.10.2",
-    "@vitejs/plugin-legacy": "^6.0.0",
     "@xmtp/browser-sdk": "^7.0.0",
     "@xmtp/node-bindings": ">=1.11.0-nightly <2.0.0-0",
     "@xmtp/node-sdk": ">=6.1.0-nightly <6.2.0",

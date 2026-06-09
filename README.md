@@ -58,25 +58,39 @@ bun run packages/cli/src/bin.ts keygen
 
 ```sh
 cos keygen
-cos login --secret-stdin --remember
+cos login --remember
 cos whoami
+cos inbox
+cos inbox sync
+cos inbox read <conversationId|contactName|inboxId>
+cos chat
 cos send --to <inboxId|address|contactName> --text "hello"
 cos listen
 cos contacts list
 cos contacts add --name <name> --identity <inboxId|address>
-cos pair new
-cos pair join <code> [--share-name <name>] [--save-as <contactName>]
+cos pair
+cos pair <code> [--share-name <name>] [--save-as <contactName>]
 cos backup export --out backup.cos
 cos backup import --in backup.cos
 ```
 
-The CLI reads `COS_SECRET_KEY`, `cos login --secret-stdin --remember`, or command-level `--secret-stdin`.
+The CLI reads `COS_SECRET_KEY`, `cos login --remember`, or command-level `--secret-stdin`.
+
+For automation, pipe the key instead of using the interactive prompt:
+
+```sh
+printf '%s\n' "$COS_SECRET_KEY" | cos login --secret-stdin --remember
+```
 
 The `SECRET_KEY` determines the XMTP account/inbox. The CLI stores one remembered secret and one local state database by default. Use `COS_HOME` or exact `COS_STATE_PATH`/`COS_CONFIG_PATH` overrides only when you need isolated local state for tests or multiple concurrent agent processes.
 
 Pairing names are explicit. `--share-name` proposes a peer-visible contact name during pairing. `--save-as` saves the peer under a local contact name. Contact names are local aliases and are not global usernames.
 
 Set `COS_HOME=./.cone` to keep config and state in a local ignored directory while testing. Use `--plain` for human-readable output; JSON is the default for agent-friendly structured output.
+
+`cos inbox sync` pulls account-level XMTP state into the local encrypted read model. `cos inbox` lists local conversations and `cos inbox read <target>` reads a local transcript. `cos chat` opens the lightweight terminal chat client over the same local read model; use `cos chat --plain-log` for a non-interactive stream log.
+
+`cos chat` is mode-driven, not command-palette driven. In Chats, use `j/k` or arrows to move, `Enter` to talk, `n` for a structured new message, and `2` for contacts. In Contacts, use `a` add, `r` rename, `d` delete, `c` create pairing code, `p` join pairing code, and `1` for chats. Transcript rows use the same human format across CLI and web: `16:39 - Alice: hello`.
 
 ## Secret Keys
 
@@ -107,7 +121,6 @@ Contacts are local aliases. A contact stores:
 - display name
 - canonical XMTP inbox ID
 - optional EVM address
-- optional notes
 - source: `manual`, `paired`, `inbound`, or `self`
 
 Names are not global usernames and do not affect XMTP identity.

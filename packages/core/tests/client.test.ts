@@ -41,6 +41,19 @@ describe('ConeClient', () => {
     await expect(client.sendText('Blocked', 'hello')).rejects.toThrow(/not XMTP-reachable/i);
   });
 
+  test('rejects duplicate contact names that point to different inboxes', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+
+    await client.saveContact({ name: 'Dana', inboxId: 'inbox-dana' });
+
+    await expect(client.saveContact({ name: 'Dana', inboxId: 'inbox-other' })).rejects.toThrow(/contact name already exists/i);
+    await expect(client.saveContact({ name: 'Dana', inboxId: 'inbox-dana' })).resolves.toMatchObject({
+      inboxId: 'inbox-dana',
+      name: 'Dana',
+    });
+  });
+
   test('creates inbound contacts and persists encrypted message snapshots', async () => {
     const adapter = new FakeAdapter();
     const store = new MemoryStore();
@@ -96,6 +109,56 @@ describe('ConeClient', () => {
     expect(message?.kind).toBe('control');
     expect(message?.json).toMatchObject({ type: 'cos.pair.confirm.v1' });
   });
+
+  test('sync persists conversations and messages into the local read model', async () => {
+    const adapter = new FakeAdapter();
+    adapter.conversations = [{
+      conversationId: 'dm-synced',
+      peerInboxId: 'inbox-peer',
+      title: 'inbox-peer',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }];
+    adapter.networkMessages = [{
+      conversationId: 'dm-synced',
+      messageId: 'msg-synced',
+      raw: {},
+      senderInboxId: 'inbox-peer',
+      sentAt: '2026-01-01T00:00:00.000Z',
+      text: 'synced hello',
+    }];
+    const client = await makeClient(adapter);
+
+    const result = await client.sync();
+
+    expect(result).toMatchObject({ conversationsSynced: 1, messagesSynced: 1, ok: true });
+    expect((await client.listConversations())[0]?.conversationId).toBe('dm-synced');
+    expect((await client.listMessages('dm-synced'))[0]?.text).toBe('synced hello');
+  });
+
+  test('deletes a local conversation and its cached messages', async () => {
+    const adapter = new FakeAdapter();
+    adapter.conversations = [{
+      conversationId: 'dm-local',
+      peerInboxId: 'inbox-peer',
+      title: 'Peer',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }];
+    adapter.networkMessages = [{
+      conversationId: 'dm-local',
+      messageId: 'msg-local',
+      raw: {},
+      senderInboxId: 'inbox-peer',
+      sentAt: '2026-01-01T00:00:00.000Z',
+      text: 'cached hello',
+    }];
+    const client = await makeClient(adapter);
+    await client.sync();
+
+    await client.deleteConversation('dm-local');
+
+    expect(await client.listConversations()).toHaveLength(0);
+    expect(await client.listMessages('dm-local')).toHaveLength(0);
+  });
 });
 
 async function makeClient(adapter: FakeAdapter, store = new MemoryStore()) {
@@ -104,6 +167,8 @@ async function makeClient(adapter: FakeAdapter, store = new MemoryStore()) {
 }
 
 class FakeAdapter implements XmtpAdapter {
+  conversations: ConeConversation[] = [];
+  networkMessages: IncomingMessage[] = [];
   sent: Array<{ inboxId: string; text: string }> = [];
   private handler: MessageHandler | null = null;
   private sentCount = 0;
@@ -150,8 +215,19 @@ class FakeAdapter implements XmtpAdapter {
     });
   }
 
+  sync() {
+    return Promise.resolve({
+      conversations: this.conversations,
+      messages: this.networkMessages,
+    });
+  }
+
   listConversations(): Promise<ConeConversation[]> {
-    return Promise.resolve([]);
+    return Promise.resolve(this.conversations);
+  }
+
+  listMessages(conversationId: string): Promise<IncomingMessage[]> {
+    return Promise.resolve(this.networkMessages.filter((message) => message.conversationId === conversationId));
   }
 
   async emit(message: IncomingMessage): Promise<void> {

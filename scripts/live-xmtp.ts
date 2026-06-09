@@ -49,10 +49,10 @@ try {
   const aliceIdentity = JSON.parse((await assertCommand(['whoami'], { actor: 'alice' })).stdout) as { inboxId: string };
   const bobIdentity = JSON.parse((await assertCommand(['whoami'], { actor: 'bob' })).stdout) as { inboxId: string };
 
-  const code = JSON.parse((await assertCommand(['pair', 'new'])).stdout) as { code: string };
+  const code = JSON.parse((await assertCommand(['pair'])).stdout) as { code: string };
   await Promise.all([
-    assertCommand(['pair', 'join', code.code, '--share-name', 'alice', '--save-as', 'bob'], { actor: 'alice' }),
-    assertCommand(['pair', 'join', code.code, '--share-name', 'bob', '--save-as', 'alice'], { actor: 'bob' }),
+    assertCommand(['pair', code.code, '--share-name', 'alice', '--save-as', 'bob'], { actor: 'alice' }),
+    assertCommand(['pair', code.code, '--share-name', 'bob', '--save-as', 'alice'], { actor: 'bob' }),
   ]);
 
   const bobListen = runCommand(['listen', '--once', '--timeout-ms', '120000'], { actor: 'bob' });
@@ -60,7 +60,7 @@ try {
   const sentToBob = JSON.parse((await assertCommand(['send', '--to', 'bob', '--text', 'live alice to bob'], { actor: 'alice' })).stdout) as {
     messageId: string;
   };
-  const bobReceived = parseJsonLine((await assertResult(await bobListen)).stdout) as { messageId: string; senderInboxId: string; text: string };
+  const bobReceived = parseJsonLine((await assertResult(await bobListen)).stdout) as { conversationId: string; messageId: string; senderInboxId: string; text: string };
   assertEqual(bobReceived.messageId, sentToBob.messageId, 'Bob received a different message id');
   assertEqual(bobReceived.senderInboxId, aliceIdentity.inboxId, 'Bob saw the wrong sender inbox');
   assertEqual(bobReceived.text, 'live alice to bob', 'Bob received the wrong text');
@@ -70,10 +70,25 @@ try {
   const sentToAlice = JSON.parse((await assertCommand(['send', '--to', 'alice', '--text', 'live bob to alice'], { actor: 'bob' })).stdout) as {
     messageId: string;
   };
-  const aliceReceived = parseJsonLine((await assertResult(await aliceListen)).stdout) as { messageId: string; senderInboxId: string; text: string };
+  const aliceReceived = parseJsonLine((await assertResult(await aliceListen)).stdout) as { conversationId: string; messageId: string; senderInboxId: string; text: string };
   assertEqual(aliceReceived.messageId, sentToAlice.messageId, 'Alice received a different message id');
   assertEqual(aliceReceived.senderInboxId, bobIdentity.inboxId, 'Alice saw the wrong sender inbox');
   assertEqual(aliceReceived.text, 'live bob to alice', 'Alice received the wrong text');
+
+  await assertCommand(['inbox', 'sync'], { actor: 'alice' });
+  await assertCommand(['inbox', 'sync'], { actor: 'bob' });
+  assertIncludes((await assertCommand(['inbox'], { actor: 'alice' })).stdout, 'bob', 'Alice inbox did not include Bob contact');
+  assertIncludes((await assertCommand(['inbox'], { actor: 'bob' })).stdout, 'alice', 'Bob inbox did not include Alice contact');
+  assertIncludes(
+    (await assertCommand(['inbox', 'read', bobReceived.conversationId], { actor: 'bob' })).stdout,
+    'live alice to bob',
+    'Bob local read model did not include Alice message',
+  );
+  assertIncludes(
+    (await assertCommand(['inbox', 'read', aliceReceived.conversationId], { actor: 'alice' })).stdout,
+    'live bob to alice',
+    'Alice local read model did not include Bob message',
+  );
 
   console.log(JSON.stringify({
     alice: aliceIdentity.inboxId,
@@ -158,6 +173,12 @@ function parseJsonLine(output: string): unknown {
 function assertEqual(actual: string, expected: string, message: string): void {
   if (actual !== expected) {
     throw new Error(`${message}: expected ${expected}, got ${actual}`);
+  }
+}
+
+function assertIncludes(actual: string, expected: string, message: string): void {
+  if (!actual.includes(expected)) {
+    throw new Error(`${message}: expected output to include ${expected}\n${actual}`);
   }
 }
 

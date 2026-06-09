@@ -28,6 +28,18 @@ export {
 } from './secret';
 export { createConeClient } from './client';
 export {
+  formatConeMessageLine,
+  formatConnectionStatus,
+  formatIncomingMessageLine,
+  formatSyncStatus,
+  formatTranscriptLine,
+  formatTranscriptTime,
+  incomingMessageBody,
+  isVisibleChatMessage,
+  messageBody,
+} from './display';
+export type { ConeConnectionStatus, TranscriptLineInput } from './display';
+export {
   PAIRING_TTL_MS,
   createEncryptedPairingOffer,
   createHandshakeCode,
@@ -49,6 +61,7 @@ export type {
   ConeIdentity,
   ConeMessage,
   ConeStore,
+  ConeStoreMetadata,
   ConeStoreSnapshot,
   Contact,
   ContactSource,
@@ -58,6 +71,7 @@ export type {
   IdentityRef,
   IdentityRefObject,
   IncomingMessage,
+  MessageListOptions,
   MessageHandler,
   PairingOffer,
   PairingResult,
@@ -68,7 +82,9 @@ export type {
   SecretKey,
   SentMessage,
   StoredMessage,
+  SyncResult,
   Unsubscribe,
   XmtpAdapter,
   XmtpEnv,
+  XmtpSyncResult,
 } from './types';

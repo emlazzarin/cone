@@ -19,6 +19,8 @@ Cone of Silence is a Bun-first TypeScript product with a static PWA and a CLI/li
 
 Cone resolves identities through the configured XMTP adapter. v1 supports inbox IDs and EVM addresses. Address-book names are local aliases that resolve to canonical inbox IDs. Before sending, Cone asks the adapter whether the resolved identity is messageable.
 
+`client.sync()` is the explicit account-level network refresh. It asks the XMTP adapter to sync conversations/messages, persists conversations and encrypted message snapshots into Cone storage, and records sync metadata. `client.listConversations()` and `client.listMessages()` are local read-model calls.
+
 ## CLI Account And State
 
 The CLI has no local selector. The cryptographic account is determined by the `SECRET KEY`, with the default derived account label currently fixed to `main`.
@@ -27,15 +29,17 @@ By default, the CLI uses one remembered secret and one local state database. `CO
 
 CLI output is JSON by default for agent use. `--plain` switches supported commands to human-readable output.
 
+`cos inbox sync`, `cos inbox`, and `cos inbox read <conversationId|contactName|inboxId>` provide non-TUI validation surfaces for the local inbox read model. `cos chat` opens a lightweight terminal UI with four primary modes: `Chat(select)`, `Chat(talk)`, `Contacts(select)`, and `Contacts(edit)`. `Chat(select)` also exposes `n` for a structured new-message form with contact/conversation suggestions. Contacts expose explicit pairing actions: `c` creates a code and `p` joins a code.
+
 ## Pairing
 
 Handshake-code pairing is ephemeral and opt-in. Two participants enter the same high-entropy code. Each posts an encrypted offer to the rendezvous service. Once both offers exist, clients decrypt locally, confirm over XMTP, and save each other as contacts. The rendezvous service caps rooms at two participants and expires offers after 10 minutes.
 
-`pair join --share-name <name>` sends an optional peer-visible proposed contact name. `pair join --save-as <contactName>` saves the peer under a local contact name. Cone never sends local state selectors as identity hints.
+`cos pair <code> --share-name <name>` sends an optional peer-visible proposed contact name. `cos pair <code> --save-as <contactName>` saves the peer under a local contact name. Cone never sends local state selectors as identity hints.
 
 ## Persistence
 
-The CLI uses `bun:sqlite`. Message payloads are encrypted before persistence. The PWA uses IndexedDB and stores the full Cone snapshot encrypted with the derived storage key. Browser XMTP storage is treated as separate because XMTP does not use `dbEncryptionKey` for browser DB encryption.
+The CLI uses `bun:sqlite`. Conversation rows, sync metadata, processed message IDs, contacts, and encrypted message payloads are persisted locally. The PWA uses IndexedDB and stores the full Cone snapshot encrypted with the derived storage key. Browser XMTP storage is treated as separate because XMTP does not use `dbEncryptionKey` for browser DB encryption.
 
 ## Tests
 

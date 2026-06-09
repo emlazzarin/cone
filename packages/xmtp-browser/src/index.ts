@@ -1,5 +1,5 @@
 import { Client, IdentifierKind, type ClientOptions, type DecodedMessage, type Dm, type Identifier, type XmtpEnv as SdkXmtpEnv } from '@xmtp/browser-sdk';
-import { hexToBytes, isEvmAddress, type ConeConversation, type DerivedAccount, type IdentityRef, type IncomingMessage, type MessageHandler, type ResolvedIdentity, type SentMessage, type Unsubscribe, type XmtpAdapter, type XmtpEnv } from '@cone/core';
+import { hexToBytes, isEvmAddress, type ConeConversation, type DerivedAccount, type IdentityRef, type IncomingMessage, type MessageHandler, type MessageListOptions, type ResolvedIdentity, type SentMessage, type Unsubscribe, type XmtpAdapter, type XmtpEnv, type XmtpSyncResult } from '@cone/core';
 import { privateKeyToAccount } from 'viem/accounts';
 
 export { IndexedDbStore } from './store';
@@ -72,7 +72,6 @@ class BrowserXmtpAdapter implements XmtpAdapter {
   }
 
   async streamMessages(handler: MessageHandler): Promise<Unsubscribe> {
-    await this.client.conversations.syncAll();
     const stream = await this.client.conversations.streamAllMessages({
       onValue: (message: unknown) => {
         void handler(toIncomingMessage(message));
@@ -87,19 +86,29 @@ class BrowserXmtpAdapter implements XmtpAdapter {
     };
   }
 
-  async listConversations(): Promise<ConeConversation[]> {
+  async sync(): Promise<XmtpSyncResult> {
     await this.client.conversations.syncAll();
+    const dms = await this.client.conversations.listDms();
+    const conversations = await Promise.all(dms.map((conversation) => toConeConversation(conversation)));
+    const messages = (await Promise.all(dms.map((conversation) => listConversationMessages(conversation))))
+      .flat()
+      .map(toIncomingMessage);
+    return { conversations, messages };
+  }
+
+  async listConversations(): Promise<ConeConversation[]> {
     const raw = await this.client.conversations.listDms();
 
-    return Promise.all(raw.map(async (conversation) => {
-      const peerInboxId = await conversation.peerInboxId();
-      return {
-        conversationId: conversation.id,
-        peerInboxId,
-        title: peerInboxId,
-        updatedAt: conversation.createdAt?.toISOString(),
-      };
-    }));
+    return Promise.all(raw.map((conversation) => toConeConversation(conversation)));
+  }
+
+  async listMessages(conversationId: string, options?: MessageListOptions): Promise<IncomingMessage[]> {
+    const conversation = await this.client.conversations.getConversationById(conversationId);
+    if (!conversation) {
+      return [];
+    }
+    const messages = await listConversationMessages(conversation, options);
+    return messages.map(toIncomingMessage);
   }
 
   async exportArchive(key: Uint8Array): Promise<Uint8Array> {
@@ -120,6 +129,16 @@ class BrowserXmtpAdapter implements XmtpAdapter {
     this.client.close();
     return Promise.resolve();
   }
+}
+
+async function toConeConversation(conversation: Dm<unknown>): Promise<ConeConversation> {
+  const peerInboxId = await conversation.peerInboxId();
+  return {
+    conversationId: conversation.id,
+    peerInboxId,
+    title: peerInboxId,
+    updatedAt: conversation.createdAt?.toISOString(),
+  };
 }
 
 async function createClient(options: BrowserXmtpAdapterOptions): Promise<{ address: string; client: Client<unknown> }> {
@@ -162,6 +181,13 @@ async function sendConversationText(conversation: Dm<unknown>, text: string): Pr
   return conversation.sendText(text);
 }
 
+async function listConversationMessages(
+  conversation: { messages: (options?: Record<string, unknown>) => Promise<Array<DecodedMessage | unknown>> },
+  options: MessageListOptions = {},
+): Promise<Array<DecodedMessage | unknown>> {
+  return conversation.messages(toSdkMessageOptions(options));
+}
+
 function toIncomingMessage(message: DecodedMessage | unknown): IncomingMessage {
   const record = message as Partial<DecodedMessage> & Record<string, unknown>;
   const content = record.content;
@@ -185,7 +211,11 @@ function toIncomingMessage(message: DecodedMessage | unknown): IncomingMessage {
     sentAt: record.sentAt instanceof Date ? record.sentAt.toISOString() : nsToIso(record.sentAtNs) ?? new Date().toISOString(),
     text: typeof content === 'string' ? content : undefined,
     json,
-    raw: message,
+    raw: {
+      contentType: String(record.contentType ?? 'unknown'),
+      conversationId: String(record.conversationId ?? record.topic ?? 'unknown'),
+      messageId: String(record.id ?? 'unknown'),
+    },
   };
 }
 
@@ -197,4 +227,22 @@ function nsToIso(value: unknown): string | null {
     return new Date(value / 1_000_000).toISOString();
   }
   return null;
+}
+
+function toSdkMessageOptions(options: MessageListOptions): Record<string, unknown> {
+  const sdkOptions: Record<string, unknown> = {};
+  if (options.limit !== undefined) {
+    sdkOptions.limit = options.limit;
+  }
+  if (options.before) {
+    sdkOptions.sentBeforeNs = isoToNs(options.before);
+  }
+  if (options.after) {
+    sdkOptions.sentAfterNs = isoToNs(options.after);
+  }
+  return sdkOptions;
+}
+
+function isoToNs(value: string): bigint {
+  return BigInt(new Date(value).getTime()) * 1_000_000n;
 }

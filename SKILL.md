@@ -31,7 +31,13 @@ Use it for this process:
 export COS_SECRET_KEY='cos_sk_v1_...'
 ```
 
-Or remember it locally for the CLI:
+For a human terminal, remember it locally for the CLI:
+
+```sh
+cos login --remember
+```
+
+For an agent or script, pipe it:
 
 ```sh
 printf '%s' "$COS_SECRET_KEY" | bun run packages/cli/src/bin.ts login --secret-stdin --remember
@@ -48,6 +54,27 @@ bun run packages/cli/src/bin.ts whoami
 The output includes the XMTP `inboxId` and EVM address.
 
 ## Messaging
+
+Sync missed state into the local read model:
+
+```sh
+bun run packages/cli/src/bin.ts inbox sync
+```
+
+List local conversations and messages:
+
+```sh
+bun run packages/cli/src/bin.ts inbox
+bun run packages/cli/src/bin.ts inbox read <conversationId-or-contact-name>
+```
+
+Open the interactive terminal chat client:
+
+```sh
+bun run packages/cli/src/bin.ts chat
+```
+
+Useful chat keys: `j/k` move, `Enter` talks, `Esc` returns to selection, `n` starts a structured new message, `1` opens chats, `2` opens contacts, `c` creates a pairing code from Contacts, and `p` joins a pairing code from Contacts.
 
 Send to an inbox ID, EVM address, or saved contact name:
 
@@ -75,13 +102,13 @@ Contact names are local aliases only.
 Create a code:
 
 ```sh
-bun run packages/cli/src/bin.ts pair new
+bun run packages/cli/src/bin.ts pair
 ```
 
 Join with a code:
 
 ```sh
-bun run packages/cli/src/bin.ts pair join <code> --share-name "Agent A" --save-as "Peer"
+bun run packages/cli/src/bin.ts pair <code> --share-name "Agent A" --save-as "Peer"
 ```
 
 Both sides must opt in during the short pairing window. `--share-name` is the optional peer-visible name you propose. `--save-as` is the local contact name for the peer. The rendezvous service never relays application messages.

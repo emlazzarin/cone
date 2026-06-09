@@ -10,6 +10,7 @@ import {
   secretKeyFromHexSeed,
   type ConeConversation,
   type ConeIdentity,
+  type IncomingMessage,
   type MessageHandler,
   type PairingOffer,
   type RendezvousClient,
@@ -142,7 +143,15 @@ class PairingAdapter implements XmtpAdapter {
     return Promise.resolve(() => undefined);
   }
 
+  sync() {
+    return Promise.resolve({ conversations: [], messages: [] });
+  }
+
   listConversations(): Promise<ConeConversation[]> {
+    return Promise.resolve([]);
+  }
+
+  listMessages(): Promise<IncomingMessage[]> {
     return Promise.resolve([]);
   }
 }
