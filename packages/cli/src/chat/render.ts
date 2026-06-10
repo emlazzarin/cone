@@ -1,12 +1,22 @@
-import { formatConnectionStatus, isVisibleChatMessage, latestReadOutboundId, relativeTime, type ConeConnectionStatus, type ConeConversation, type ConeMessage } from '@cone/core';
+import {
+  formatConnectionStatus,
+  formatTranscriptTime,
+  isVisibleChatMessage,
+  latestReadOutboundId,
+  matchesPendingSend,
+  messageBody,
+  relativeTime,
+  type ConeConnectionStatus,
+  type ConeConversation,
+} from '@cone/core';
 
-import { activeContact, conversationActivityAt, isContactsMode, selectedContact, selectedConversation, visibleConversations } from './state';
+import { activeContact, composerKey, conversationActivityAt, isContactsMode, selectedContact, selectedConversation, visibleConversations } from './state';
 import type { ChatMode, ChatState } from './types';
-import { accent, danger, dim, ellipsize, ESC, formatTime, highlight, inputField, inverse, messageBody, pad, shortId, stripAnsi, success, tailLine, wrapText } from './text';
+import { CSI, accent, danger, dim, ellipsize, highlight, inputField, inverse, pad, shortId, stripAnsi, success, tailLine, wrapText } from './text';
 
 export function renderChat(state: ChatState, width: number, height: number): string {
   if (width < 50 || height < 10) {
-    return `${ESC}2J${ESC}H${inverse(' Cone of Silence '.slice(0, Math.max(1, width)))}\nterminal too small for cos chat\n`;
+    return `${CSI}2J${CSI}H${inverse(' Cone of Silence '.slice(0, Math.max(1, width)))}\nterminal too small for cos chat\n`;
   }
 
   const safeWidth = Math.max(1, width);
@@ -16,7 +26,7 @@ export function renderChat(state: ChatState, width: number, height: number): str
   const bodyHeight = safeHeight - 4;
   const lines: string[] = [];
 
-  lines.push(`${ESC}2J${ESC}H${ESC}?25l`);
+  lines.push(`${CSI}2J${CSI}H${CSI}?25l`);
   lines.push(topBar(state, safeWidth));
   for (let row = 0; row < bodyHeight; row += 1) {
     const left = isContactsMode(state)
@@ -250,12 +260,15 @@ function footerLine(state: ChatState, width: number): string {
   // on the keys unique to the current mode.
   const retrySync = state.syncState === 'stale' || state.streamState === 'offline';
   const filterHint = state.filter ? '/ edit filter | Esc clear filter' : '/ filter';
+  const failedHere = state.pendingMessages.some((entry) => entry.status === 'failed' && entry.key === composerKey(state));
   const text = state.mode === 'chat-select'
     ? state.filterActive
       ? ' type to filter | Up/Down move | Enter keep | Esc clear '
-      : ` j/k move | Enter talk | n new message | ${filterHint} | d delete${retrySync ? ' | s retry sync' : ''} | ? help | q quit `
+      : ` j/k move | Enter talk | n new message | ${filterHint} | d delete${failedHere ? ' | Ctrl+X delete failed' : ''}${retrySync ? ' | s retry sync' : ''} | ? help | q quit `
     : state.mode === 'chat-talk'
-      ? ' Enter send | Esc back | Ctrl+U clear | Ctrl+W delete word '
+      ? failedHere
+        ? ' Enter retry | Ctrl+X delete failed | Esc back | Ctrl+U clear '
+        : ' Enter send | Esc back | Ctrl+U clear | Ctrl+W delete word '
     : state.mode === 'chat-compose'
         ? chatComposeFooter(state)
         : state.mode === 'contacts-select'
@@ -290,13 +303,7 @@ function transcriptRows(
   const pending = key
     ? state.pendingMessages.filter((entry) =>
         entry.key === key &&
-        (entry.status === 'failed' ||
-          !messages.some(
-            (message) =>
-              message.direction === 'outbound' &&
-              messageBody(message).trim() === entry.text &&
-              Math.abs(Date.parse(message.sentAt) - Date.parse(entry.sentAt)) < 300_000,
-          )),
+        (entry.status === 'failed' || !messages.some((message) => matchesPendingSend(message, entry))),
       )
     : [];
 
@@ -311,7 +318,7 @@ function transcriptRows(
   const rows: string[] = [];
   const pushEntry = (sentAt: string, sender: string, body: string, failed: boolean) => {
     const marker = failed ? `${danger('✗')} ` : '';
-    const prefix = `${marker}${formatTime(sentAt)} - ${sender}: `;
+    const prefix = `${marker}${formatTranscriptTime(sentAt)} - ${sender}: `;
     const indent = stripAnsi(prefix).length;
     const wrapped = wrapText(body, Math.max(10, width - indent));
     rows.push(`${prefix}${failed ? danger(wrapped[0] ?? '') : wrapped[0] ?? ''}`);
@@ -345,6 +352,8 @@ function renderHelpRow(state: ChatState, row: number, width: number): string {
     'PgUp/PgDn (or Ctrl+B/Ctrl+F) scroll the transcript.',
     'R toggles read receipts. When on, peers see when you read them and you',
     '  see ✓✓ Read on your last message they read; off sends and shows neither.',
+    'Messages send instantly; a successful send is silent. A send that fails to',
+    '  publish shows ✗ — Enter retries, Ctrl+X deletes it.',
     'Chats: d deletes the local cached chat after confirmation.',
     'Contacts: a add, r rename, d delete, c create code, p join code.',
     'Realtime stream stays on; s only appears when sync/stream needs retry.',

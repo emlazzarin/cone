@@ -16,6 +16,7 @@
     "noUncheckedIndexedAccess": true,
     "paths": {
       "@cone/core": ["packages/core/src/index.ts"],
+      "@cone/core/xmtp": ["packages/core/src/xmtp.ts"],
       "@cone/cli": ["packages/cli/src/index.ts"],
       "@cone/xmtp-browser": ["packages/xmtp-browser/src/index.ts"],
       "@cone/xmtp-node": ["packages/xmtp-node/src/index.ts"]

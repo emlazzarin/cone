@@ -1,6 +1,6 @@
 import { sha256 } from '@noble/hashes/sha256';
 
-import { base64UrlDecode, base64UrlEncode, bytesToUtf8, concatBytes, utf8ToBytes } from './encoding';
+import { base64UrlDecode, base64UrlEncode, bytesToHex, bytesToUtf8, utf8ToBytes } from './encoding';
 
 const AES_KEY_LENGTH = 32;
 const AES_IV_LENGTH = 12;
@@ -56,7 +56,9 @@ export async function decryptJson<T>(keyMaterial: Uint8Array, encrypted: Encrypt
   return JSON.parse(bytesToUtf8(await decryptBytes(keyMaterial, encrypted))) as T;
 }
 
-export function codeScopedKey(_pairingKey: Uint8Array, code: string): Uint8Array {
+// Pairing encryption is keyed by the shared handshake code alone: the peer
+// knows nothing about us yet, so no account-derived secret can participate.
+export function codeScopedKey(code: string): Uint8Array {
   return sha256(utf8ToBytes(`cone-pairing-code:v1:${normalizeHandshakeCode(code)}`)).slice(0, AES_KEY_LENGTH);
 }
 
@@ -77,9 +79,7 @@ export function randomHandshakeCode(): string {
 }
 
 export function sha256Hex(input: string): string {
-  return Array.from(sha256(utf8ToBytes(input)))
-    .map((byte) => byte.toString(16).padStart(2, '0'))
-    .join('');
+  return bytesToHex(sha256(utf8ToBytes(input)));
 }
 
 async function importAesKey(keyMaterial: Uint8Array): Promise<CryptoKey> {

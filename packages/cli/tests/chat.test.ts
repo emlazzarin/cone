@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import type { ConeClient, SentMessage } from '@cone/core';
+import type { ConeClient, ConeMessage, SentMessage } from '@cone/core';
 
 import {
   applyConversationMeta,
@@ -360,6 +360,45 @@ describe('cos chat', () => {
     expect(state.status).toContain('read receipts off');
   });
 
+  test('Ctrl+X discards a failed message instead of retrying it', async () => {
+    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
+    state.mode = 'chat-talk';
+    state.input = 'doomed';
+    const client = stubClient({ sendText: () => Promise.reject(new Error('network down')) });
+
+    await handleInput('\n', client, state, async () => {}, async () => {}, async () => {});
+    await delay(0);
+    expect(state.pendingMessages.some((entry) => entry.status === 'failed')).toBe(true);
+    expect(renderChat(state, 90, 16)).toContain('✗');
+
+    // Ctrl+X (\u0018) drops the failed row without resending.
+    await handleInput('\u0018', client, state, async () => {}, async () => {}, async () => {});
+    expect(state.pendingMessages).toHaveLength(0);
+    expect(state.status).toContain('discarded');
+    expect(renderChat(state, 90, 16)).not.toContain('✗');
+  });
+
+  test('Ctrl+X also discards a failed message from the chat list', async () => {
+    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
+    state.mode = 'chat-talk';
+    state.input = 'doomed';
+    const client = stubClient({ sendText: () => Promise.reject(new Error('network down')) });
+
+    await handleInput('\n', client, state, async () => {}, async () => {}, async () => {});
+    await delay(0);
+    expect(state.pendingMessages.some((entry) => entry.status === 'failed')).toBe(true);
+
+    // The chat-select footer offers Ctrl+X for the selected chat's
+    // failed row too — Esc back to the list, then discard.
+    await handleInput('\u001b', client, state, async () => {}, async () => {}, async () => {});
+    expect(state).toHaveProperty('mode', 'chat-select');
+    await handleInput('\u0018', client, state, async () => {}, async () => {}, async () => {});
+    expect(state.pendingMessages).toHaveLength(0);
+    expect(state.status).toContain('discarded');
+  });
+
   test('renders structured new-message form with target suggestions', () => {
     const state = createChatState(
       { env: 'dev', inboxId: 'inbox-alice' },
@@ -482,7 +521,7 @@ describe('cos chat', () => {
   });
 
   test('humanizes Cone JSON envelopes instead of dumping protocol wrappers', () => {
-    expect(messageBody({
+    const appJson: ConeMessage = {
       conversationId: 'dm-bob',
       direction: 'inbound',
       json: { type: 'cos.app.json.v1', value: 'plain value' },
@@ -490,9 +529,10 @@ describe('cos chat', () => {
       messageId: 'msg-json',
       senderInboxId: 'inbox-bob',
       sentAt: '2026-01-01T00:00:00.000Z',
-    })).toBe('plain value');
+    };
+    expect(messageBody(appJson)).toBe('plain value');
 
-    expect(messageBody({
+    const control: ConeMessage = {
       conversationId: 'dm-bob',
       direction: 'inbound',
       json: { type: 'cos.pair.confirm.v1' },
@@ -500,7 +540,8 @@ describe('cos chat', () => {
       messageId: 'msg-control',
       senderInboxId: 'inbox-bob',
       sentAt: '2026-01-01T00:00:00.000Z',
-    })).toBe('[pair confirmed]');
+    };
+    expect(messageBody(control)).toBe('[pair confirmed]');
   });
 
   test('wraps multiline text and long tokens', () => {

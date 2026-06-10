@@ -13,7 +13,6 @@ export interface DerivedAccount {
   xmtpDbEncryptionKey: string;
   coneStorageKey: Uint8Array;
   backupArchiveKey: Uint8Array;
-  pairingKey: Uint8Array;
 }
 
 export interface ConeIdentity {
@@ -93,10 +92,17 @@ export interface ConeMessage {
   json?: unknown;
 }
 
+// XMTP is decentralized, so there is no per-recipient "delivered" ack. The
+// authoritative signal is whether a message published to the network; a send
+// that cannot publish surfaces as a rejection. "unpublished" only appears for
+// our own messages that never made it out.
+export type MessageDeliveryStatus = 'published' | 'unpublished' | 'failed';
+
 export interface SentMessage {
   messageId: string;
   conversationId?: string;
   sentAt: string;
+  deliveryStatus?: MessageDeliveryStatus;
 }
 
 export interface IncomingMessage {
@@ -180,8 +186,6 @@ export interface XmtpAdapter {
   streamMessages(handler: MessageHandler): Promise<Unsubscribe>;
   listConversations(): Promise<ConeConversation[]>;
   listMessages(conversationId: string, options?: MessageListOptions): Promise<IncomingMessage[]>;
-  exportArchive?(key: Uint8Array): Promise<Uint8Array>;
-  importArchive?(data: Uint8Array, key: Uint8Array): Promise<void>;
   close?(): Promise<void>;
 }
 

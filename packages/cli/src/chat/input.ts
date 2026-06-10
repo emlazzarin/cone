@@ -1,5 +1,6 @@
-import type { ConeClient, Contact } from '@cone/core';
+import { errorMessage, type ConeClient, type Contact } from '@cone/core';
 
+import { KEY, isChatsShortcut, isContactsShortcut, isEnter } from './keys';
 import {
   createAddContactForm,
   createDeleteContactForm,
@@ -31,7 +32,7 @@ import {
   visibleConversations,
 } from './state';
 import type { ChatState, ContactEditForm, PendingMessage, RefreshChat, SyncNow } from './types';
-import { deleteLastWord, errorMessage, isChatsShortcut, isContactsShortcut, isPrintableInput, shortId } from './text';
+import { deleteLastWord, isPrintableInput, shortId } from './text';
 
 export async function handleInput(
   input: string,
@@ -41,12 +42,12 @@ export async function handleInput(
   syncNow: SyncNow,
   quit: () => Promise<void>,
 ): Promise<void> {
-  if (input === '\u0003') {
+  if (input === KEY.ctrlC) {
     await quit();
     return;
   }
   if (state.helpVisible) {
-    if (input === '\u001b' || input === '?') {
+    if (input === KEY.esc || input === '?') {
       state.helpVisible = false;
       state.status = 'help closed';
     }
@@ -61,12 +62,12 @@ export async function handleInput(
     enterContactsSelect(state);
     return;
   }
-  if ((state.mode === 'chat-select' || state.mode === 'chat-talk') && (input === '\u001b[5~' || input === '\u0002')) {
+  if ((state.mode === 'chat-select' || state.mode === 'chat-talk') && (input === KEY.pageUp || input === KEY.ctrlB)) {
     state.transcriptScroll += 5;
     state.status = `scroll +${state.transcriptScroll}`;
     return;
   }
-  if ((state.mode === 'chat-select' || state.mode === 'chat-talk') && (input === '\u001b[6~' || input === '\u0006')) {
+  if ((state.mode === 'chat-select' || state.mode === 'chat-talk') && (input === KEY.pageDown || input === KEY.ctrlF)) {
     state.transcriptScroll = Math.max(0, state.transcriptScroll - 5);
     state.status = state.transcriptScroll === 0 ? 'bottom' : `scroll +${state.transcriptScroll}`;
     return;
@@ -107,7 +108,7 @@ async function handleChatSelectInput(
     state.status = 'type to filter chats';
     return;
   }
-  if (input === '\u001b' && state.filter) {
+  if (input === KEY.esc && state.filter) {
     clearFilter(state);
     state.status = 'filter cleared';
     await refreshMessages(client, state);
@@ -124,6 +125,10 @@ async function handleChatSelectInput(
   }
   if (input === 'R') {
     toggleReadReceipts(state);
+    return;
+  }
+  if (input === KEY.ctrlX) {
+    discardFailed(state);
     return;
   }
   if (input === 'n') {
@@ -143,17 +148,17 @@ async function handleChatSelectInput(
     await syncNow();
     return;
   }
-  if (input === '\u001b[A' || input === 'k') {
+  if (input === KEY.up || input === 'k') {
     selectConversation(state, -1);
     await refreshMessages(client, state);
     return;
   }
-  if (input === '\u001b[B' || input === 'j') {
+  if (input === KEY.down || input === 'j') {
     selectConversation(state, 1);
     await refreshMessages(client, state);
     return;
   }
-  if (input === '\r' || input === '\n') {
+  if (isEnter(input)) {
     if (!selectedConversation(state)) {
       state.status = 'no chat selected';
       return;
@@ -165,36 +170,36 @@ async function handleChatSelectInput(
 // Live chat filter: printable keys narrow the list, arrows move within the
 // matches, Enter keeps the filter, Esc clears it.
 async function handleFilterInput(input: string, client: ConeClient, state: ChatState): Promise<void> {
-  if (input === '\u001b') {
+  if (input === KEY.esc) {
     clearFilter(state);
     state.status = 'filter cleared';
     await refreshMessages(client, state);
     return;
   }
-  if (input === '\r' || input === '\n') {
+  if (isEnter(input)) {
     state.filterActive = false;
     const matches = visibleConversations(state).length;
     state.status = state.filter ? `filter: ${state.filter} (${matches} match${matches === 1 ? '' : 'es'})` : 'filter cleared';
     return;
   }
-  if (input === '\u001b[A') {
+  if (input === KEY.up) {
     selectConversation(state, -1);
     await refreshMessages(client, state);
     return;
   }
-  if (input === '\u001b[B') {
+  if (input === KEY.down) {
     selectConversation(state, 1);
     await refreshMessages(client, state);
     return;
   }
-  if (input === '\u0015') {
+  if (input === KEY.ctrlU) {
     state.filter = '';
     state.selectedIndex = 0;
     clampSelections(state);
     await refreshMessages(client, state);
     return;
   }
-  if (input === '\u007f') {
+  if (input === KEY.backspace) {
     state.filter = state.filter.slice(0, -1);
     state.selectedIndex = 0;
     clampSelections(state);
@@ -223,36 +228,49 @@ function toggleReadReceipts(state: ChatState): void {
   state.status = `read receipts ${state.readReceipts ? 'on' : 'off'}`;
 }
 
+// Drops the failed (undelivered) optimistic rows for the active conversation —
+// the "delete" half of the failed-message choice (Enter is "retry").
+function discardFailed(state: ChatState): void {
+  const key = composerKey(state);
+  const before = state.pendingMessages.length;
+  state.pendingMessages = state.pendingMessages.filter((entry) => !(entry.key === key && entry.status === 'failed'));
+  state.status = state.pendingMessages.length < before ? 'discarded failed message' : 'nothing to discard';
+}
+
 async function handleChatTalkInput(
   input: string,
   client: ConeClient,
   state: ChatState,
   refresh: RefreshChat,
 ): Promise<void> {
-  if (input === '\u001b') {
+  if (input === KEY.esc) {
     enterChatSelect(state);
     return;
   }
-  if (input === '\t' || input === '\u001b[Z') {
+  if (input === KEY.tab || input === KEY.shiftTab) {
     state.status = 'composer focused';
     return;
   }
-  if (input === '\u0015') {
+  if (input === KEY.ctrlU) {
     state.input = '';
     saveDraft(state);
     return;
   }
-  if (input === '\u0017') {
+  if (input === KEY.ctrlW) {
     state.input = deleteLastWord(state.input);
     saveDraft(state);
     return;
   }
-  if (input === '\u007f') {
+  if (input === KEY.ctrlX) {
+    discardFailed(state);
+    return;
+  }
+  if (input === KEY.backspace) {
     state.input = state.input.slice(0, -1);
     saveDraft(state);
     return;
   }
-  if (input === '\r' || input === '\n') {
+  if (isEnter(input)) {
     const text = state.input.trim();
     const target = sendTargetForState(state);
     const key = composerKey(state);
@@ -312,16 +330,16 @@ async function handleChatComposeInput(
     enterChatSelect(state);
     return;
   }
-  if (input === '\u001b') {
+  if (input === KEY.esc) {
     enterChatSelect(state);
     state.status = 'cancelled';
     return;
   }
-  if (input === '\u001b[A' || input === '\u001b[B') {
-    applyMessageTargetSuggestion(form, state, input === '\u001b[A' ? -1 : 1);
+  if (input === KEY.up || input === KEY.down) {
+    applyMessageTargetSuggestion(form, state, input === KEY.up ? -1 : 1);
     return;
   }
-  if (input === '\r' || input === '\n') {
+  if (isEnter(input)) {
     if (form.kind === 'conversation-delete') {
       await submitDeleteConversation(client, state, refresh);
       return;
@@ -388,15 +406,15 @@ async function handleContactsSelectInput(
     startContactsEdit(state, createDeleteContactForm(contact));
     return;
   }
-  if (input === '\u001b[A' || input === 'k') {
+  if (input === KEY.up || input === 'k') {
     selectContact(state, -1);
     return;
   }
-  if (input === '\u001b[B' || input === 'j') {
+  if (input === KEY.down || input === 'j') {
     selectContact(state, 1);
     return;
   }
-  if (input === '\r' || input === '\n') {
+  if (isEnter(input)) {
     enterChatForSelectedContact(state);
     await refreshMessages(client, state);
     return;
@@ -414,12 +432,12 @@ async function handleContactsEditInput(
     enterContactsSelect(state);
     return;
   }
-  if (input === '\u001b') {
+  if (input === KEY.esc) {
     enterContactsSelect(state);
     state.status = 'cancelled';
     return;
   }
-  if (input === '\r' || input === '\n') {
+  if (isEnter(input)) {
     await submitContactEditForm(client, state, refresh);
     return;
   }
@@ -430,14 +448,14 @@ async function handleContactsEditInput(
 }
 
 function editFormField(input: string, form: ContactEditForm): void {
-  if (input === '\t') {
+  if (input === KEY.tab) {
     if (form.fields.length > 0) {
       form.activeField = (form.activeField + 1) % form.fields.length;
     }
     form.error = undefined;
     return;
   }
-  if (input === '\u001b[Z') {
+  if (input === KEY.shiftTab) {
     if (form.fields.length > 0) {
       form.activeField = (form.activeField - 1 + form.fields.length) % form.fields.length;
     }
@@ -449,17 +467,17 @@ function editFormField(input: string, form: ContactEditForm): void {
   if (!field) {
     return;
   }
-  if (input === '\u0015') {
+  if (input === KEY.ctrlU) {
     field.value = '';
     form.error = undefined;
     return;
   }
-  if (input === '\u0017') {
+  if (input === KEY.ctrlW) {
     field.value = deleteLastWord(field.value);
     form.error = undefined;
     return;
   }
-  if (input === '\u007f') {
+  if (input === KEY.backspace) {
     field.value = field.value.slice(0, -1);
     form.error = undefined;
     return;

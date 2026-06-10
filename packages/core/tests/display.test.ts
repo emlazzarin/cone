@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { isReadReceipt, isVisibleChatMessage, latestReadOutboundId, type ConeMessage } from '../src/index';
+import { isReadReceipt, isVisibleChatMessage, latestReadOutboundId, normalizeDeliveryStatus, type ConeMessage } from '../src/index';
 
 function message(partial: Partial<ConeMessage> & Pick<ConeMessage, 'messageId' | 'direction' | 'sentAt'>): ConeMessage {
   return {
@@ -64,5 +64,25 @@ describe('read receipts', () => {
       message({ messageId: 'r1', direction: 'inbound', kind: 'control', json: READ, text: undefined, sentAt: '2026-01-01T10:02:00.000Z' }),
     ];
     expect(latestReadOutboundId(messages)).toBeUndefined();
+  });
+});
+
+describe('delivery status', () => {
+  test('normalizes the SDK numeric enum (Unpublished=0, Published=1, Failed=2)', () => {
+    expect(normalizeDeliveryStatus(0)).toBe('unpublished');
+    expect(normalizeDeliveryStatus(1)).toBe('published');
+    expect(normalizeDeliveryStatus(2)).toBe('failed');
+  });
+
+  test('normalizes string forms', () => {
+    expect(normalizeDeliveryStatus('failed')).toBe('failed');
+    expect(normalizeDeliveryStatus('unpublished')).toBe('unpublished');
+    expect(normalizeDeliveryStatus('published')).toBe('published');
+  });
+
+  test('defaults unknown/missing values to published so real messages are never hidden', () => {
+    expect(normalizeDeliveryStatus(undefined)).toBe('published');
+    expect(normalizeDeliveryStatus(null)).toBe('published');
+    expect(normalizeDeliveryStatus('weird')).toBe('published');
   });
 });

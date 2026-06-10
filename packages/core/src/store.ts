@@ -113,18 +113,20 @@ export class MemoryStore implements ConeStore {
     });
   }
 
+  // Snapshots come from user-supplied backups, so every collection is treated
+  // as optional even though the type says otherwise.
   importSnapshot(snapshot: ConeStoreSnapshot): Promise<void> {
-    for (const contact of snapshot.contacts) {
+    for (const contact of snapshot.contacts ?? []) {
       this.contactsById.set(contact.contactId, contact);
     }
     for (const conversation of snapshot.conversations ?? []) {
       this.conversationsById.set(conversation.conversationId, conversation);
     }
     this.metadata = { ...this.metadata, ...snapshot.metadata };
-    for (const message of snapshot.messages) {
+    for (const message of snapshot.messages ?? []) {
       this.messagesById.set(message.messageId, message);
     }
-    for (const messageId of snapshot.processedMessageIds) {
+    for (const messageId of snapshot.processedMessageIds ?? []) {
       this.processedMessageIds.add(messageId);
     }
     return Promise.resolve();

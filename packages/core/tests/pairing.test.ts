@@ -52,14 +52,12 @@ describe('pairing protocol', () => {
   });
 
   test('wrong handshake code cannot decrypt a pairing offer', async () => {
-    const account = deriveAccount(secretKeyFromHexSeed('04'.repeat(32)), { env: 'dev' });
     const encrypted = await createEncryptedPairingOffer({
-      account,
       code: 'correct-code-value',
       identity: { env: 'dev', inboxId: 'inbox-a' },
     });
 
-    await expect(decryptJson<PairingOffer>(codeScopedKey(account.pairingKey, 'wrong-code-value'), encrypted.encryptedOffer)).rejects.toThrow();
+    await expect(decryptJson<PairingOffer>(codeScopedKey('wrong-code-value'), encrypted.encryptedOffer)).rejects.toThrow();
   });
 
   test('rendezvous rejects a third participant', async () => {
@@ -157,9 +155,7 @@ class PairingAdapter implements XmtpAdapter {
 }
 
 async function fakeStoredOffer(id: string, expiresAt = new Date(Date.now() + 60_000).toISOString()) {
-  const account = deriveAccount(secretKeyFromHexSeed('05'.repeat(32)), { env: 'dev' });
   const offer = await createEncryptedPairingOffer({
-    account,
     code: 'room-code',
     identity: { env: 'dev', inboxId: `inbox-${id}` },
   });

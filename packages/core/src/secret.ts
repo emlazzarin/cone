@@ -48,7 +48,6 @@ export function deriveAccount(
     xmtpDbEncryptionKey: bytesToHex(deriveBytes(seed, salt, 'xmtp-db', 32)),
     coneStorageKey: deriveBytes(seed, salt, 'cone-storage', 32),
     backupArchiveKey: deriveBytes(seed, salt, 'backup-archive', 32),
-    pairingKey: deriveBytes(seed, salt, 'pairing', 32),
   };
 }
 

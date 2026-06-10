@@ -1,4 +1,4 @@
-import { formatIncomingMessageLine } from '@cone/core';
+import { formatMessageLine } from '@cone/core';
 
 import { loadSecretKey } from '../../../packages/cli/src/config';
 import { createCliClient } from '../../../packages/cli/src/index';
@@ -11,7 +11,7 @@ console.log(`Inbox:   ${identity.inboxId}`);
 console.log(`Address: ${identity.address ?? '(none)'}`);
 
 await client.streamMessages(async (message) => {
-  console.log(formatIncomingMessageLine(message, message.senderInboxId));
+  console.log(formatMessageLine(message, message.senderInboxId));
 });
 
 await new Promise(() => undefined);

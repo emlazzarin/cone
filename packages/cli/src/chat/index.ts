@@ -1,4 +1,4 @@
-import type { ConeClient, Unsubscribe } from '@cone/core';
+import { errorMessage, formatMessageLine, formatSyncStatus, type ConeClient, type Unsubscribe } from '@cone/core';
 
 import { ESC_FLUSH_MS, InputDecoder } from './input-decoder';
 import { handleInput } from './input';
@@ -14,7 +14,7 @@ import {
   selectedContact,
   selectedConversation,
 } from './state';
-import { errorMessage, ESC, formatIncomingMessageLine, formatSyncStatus, shortId } from './text';
+import { CSI, shortId } from './text';
 import type { ChatOptions, RefreshOptions } from './types';
 
 const AUTO_SYNC_MS = 60_000;
@@ -203,7 +203,7 @@ async function runPlainLog(client: ConeClient, options: ChatOptions): Promise<vo
     process.stdout.write(`# ${conversation.title} ${conversation.conversationId}\n`);
   }
   await client.streamMessages((message) => {
-    process.stdout.write(`${formatIncomingMessageLine(message, shortId(message.senderInboxId))}\n`);
+    process.stdout.write(`${formatMessageLine(message, shortId(message.senderInboxId))}\n`);
   });
   await new Promise(() => undefined);
 }
@@ -212,12 +212,12 @@ function setupTerminal(): void {
   process.stdin.setEncoding('utf8');
   process.stdin.resume();
   process.stdin.setRawMode(true);
-  process.stdout.write(`${ESC}?1049h${ESC}?25l`);
+  process.stdout.write(`${CSI}?1049h${CSI}?25l`);
 }
 
 function restoreTerminal(): void {
   process.stdin.setRawMode(false);
-  process.stdout.write(`${ESC}?25h${ESC}?1049l`);
+  process.stdout.write(`${CSI}?25h${CSI}?1049l`);
 }
 
 export type { ChatMode, ChatOptions, ChatState, ContactEditForm } from './types';
@@ -234,4 +234,5 @@ export { renderChat } from './render';
 export { handleInput } from './input';
 export { applyConversationMeta, createChatState, visibleConversations } from './state';
 export { InputDecoder } from './input-decoder';
-export { messageBody, wrapText } from './text';
+export { messageBody } from '@cone/core';
+export { wrapText } from './text';

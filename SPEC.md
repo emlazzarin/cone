@@ -4,16 +4,16 @@ Cone of Silence is a Bun-first TypeScript product with a static PWA and a CLI/li
 
 ## Architecture
 
-- `packages/core`: shared product model, secret parsing, deterministic key derivation, contact/address-book logic, backup encryption, pairing encryption, storage interfaces, and the adapter-facing `ConeClient`.
-- `packages/cli`: `cos` binary, Bun SQLite persistence, command parsing, HTTP rendezvous client.
-- `packages/xmtp-node`: XMTP Node SDK adapter for CLI and agent use.
-- `packages/xmtp-browser`: XMTP Browser SDK adapter and encrypted IndexedDB store for the PWA.
+- `packages/core`: shared product model, secret parsing, deterministic key derivation, contact/address-book logic, backup encryption, pairing encryption, storage interfaces, the adapter-facing `ConeClient`, and the SDK-agnostic XMTP adapter implementation (`@cone/core/xmtp`) that both adapter packages reuse.
+- `packages/cli`: `cos` binary, Bun SQLite persistence, command parsing.
+- `packages/xmtp-node`: XMTP Node SDK wiring (client creation, signer) for CLI and agent use.
+- `packages/xmtp-browser`: XMTP Browser SDK wiring and encrypted IndexedDB store for the PWA.
 - `apps/web`: Vite + Preact PWA.
 - `apps/rendezvous`: Cloudflare Worker/Durable Object rendezvous service.
 
 ## Secret Model
 
-`SECRET KEY` format is `cos_sk_v1_<base64url-payload>`. It contains a 32-byte random seed, a version byte, and checksum metadata. The seed derives labeled keys for XMTP wallet signing, XMTP local DB encryption, Cone storage encryption, backup archives, and pairing.
+`SECRET KEY` format is `cos_sk_v1_<base64url-payload>`. It contains a 32-byte random seed, a version byte, and checksum metadata. The seed derives labeled keys for XMTP wallet signing, XMTP local DB encryption, Cone storage encryption, and backup archives. Pairing-offer encryption is keyed by the normalized handshake code alone — the peer cannot know any account-derived secret before pairing completes.
 
 ## Messaging
 
@@ -35,7 +35,11 @@ CLI output is JSON by default for agent use. `--plain` switches supported comman
 
 The PWA is pointer- and touch-native with TUI-parity accelerators. It has no explicit select/talk modes; focus expresses the mode (typing in the composer vs. navigating). `1–5` switch sections (Chats, Contacts, Pair, Backup, Settings), `j/k` move the chat selection, `Enter` opens the selected chat (or starts a new message when none is selected), `n` composes a new message, `/` filters chats, `?` toggles a help overlay, `Esc` leaves typing. Conversation rows show avatar, last-message preview, relative time, and unread count; transcript lines share the CLI `HH:MM - sender: body` format. Read markers are stored locally per account.
 
-Both surfaces render outbound sends optimistically: the message is appended to the transcript and the composer clears before the network round-trip resolves. A delivered message is reconciled against the optimistic row (matched by body and a five-minute send-time window); a failed send is marked and offers an immediate retry. Optimistic rows are local-only and never persisted.
+Both surfaces render outbound sends optimistically: the message is appended to the transcript and the composer clears before the network round-trip resolves. A delivered message is reconciled against the optimistic row (matched by body and a five-minute send-time window); a failed send is marked and offers retry or delete. Optimistic rows are local-only and never persisted.
+
+## Delivery Status
+
+XMTP exposes a sender-side delivery status (`DecodedMessage.deliveryStatus`: unpublished/published/failed) but no per-recipient delivery ack. The adapter sends synchronously — a resolved send is published; a rejection is a delivery failure surfaced to the optimistic UI. `SentMessage.deliveryStatus` carries the result. The adapter read paths (`listMessages`/`sync`/`streamMessages`) keep only published messages (`normalizeDeliveryStatus` handles the SDK's numeric enum and string forms), so a message that failed to publish cannot later sync in and appear delivered. Successful sends are silent; failures are the only visible state, with retry (resend) and delete (discard the optimistic row).
 
 ## Read Receipts
 

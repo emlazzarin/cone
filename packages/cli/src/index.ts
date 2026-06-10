@@ -1,11 +1,11 @@
 import { createInterface } from 'node:readline/promises';
 
 import {
+  HttpRendezvousClient,
   createConeClient,
   createHandshakeCode,
   deriveAccount,
-  formatConeMessageLine,
-  formatIncomingMessageLine,
+  formatMessageLine,
   generateSecretKey,
   parseSecretKey,
   type ConeClient,
@@ -18,12 +18,11 @@ import { createNodeXmtpAdapter } from '@cone/xmtp-node';
 
 import { loadSecretKey, readConfig, writeConfig } from './config';
 import { defaultConfigPath, defaultRendezvousUrl, defaultStatePath } from './paths';
-import { HttpRendezvousClient } from './rendezvous';
 import { BunSQLiteStore } from './store';
 import { runChat } from './chat';
 
 export { BunSQLiteStore } from './store';
-export { HttpRendezvousClient } from './rendezvous';
+export { HttpRendezvousClient } from '@cone/core';
 
 export interface CliIo {
   isStdinTty: () => boolean;
@@ -146,17 +145,7 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
         return 0;
       }
       case 'pair': {
-        const pairArgs = context.args.slice(1);
-        const code = firstPairCode(pairArgs);
-        if (code === 'new' || code === 'join') {
-          throw new Error('usage: cos pair [code] [--share-name <name>] [--save-as <contactName>]');
-        }
-        if (!code) {
-          const code = createHandshakeCode(new Date());
-          writeValue(io, context, code, (value) => `Handshake code: ${value.code}\nExpires at: ${value.expiresAt}\n`);
-          return 0;
-        }
-        return await handlePair(pairArgs, io, context, await getClient());
+        return await handlePair(context.args.slice(1), io, context, getClient);
       }
       case 'backup': {
         return await handleBackup(context.args.slice(1), io, context, await getClient());
@@ -180,7 +169,7 @@ function printableMessage(message: IncomingMessage): Omit<IncomingMessage, 'raw'
 
 function writeMessage(io: CliIo, context: CliContext, message: IncomingMessage): void {
   if (context.output === 'plain') {
-    io.stdout(`${formatIncomingMessageLine(message, message.senderInboxId)}\n`);
+    io.stdout(`${formatMessageLine(message, message.senderInboxId)}\n`);
     return;
   }
   io.stdout(`${JSON.stringify(printableMessage(message))}\n`);
@@ -301,7 +290,7 @@ async function handleInbox(args: string[], io: CliIo, context: CliContext, clien
       }
       return transcript.map((message) => {
         const from = message.direction === 'outbound' ? 'me' : selected.title;
-        return formatConeMessageLine(message, from);
+        return formatMessageLine(message, from);
       }).join('\n') + '\n';
     });
     return 0;
@@ -332,17 +321,21 @@ async function findInboxConversation(client: ConeClient, target: string) {
   throw new Error(`inbox conversation not found: ${target}`);
 }
 
-async function handlePair(args: string[], io: CliIo, context: CliContext, client: ConeClient): Promise<number> {
-  const code = firstPairCode(args);
+async function handlePair(args: string[], io: CliIo, context: CliContext, getClient: () => Promise<ConeClient>): Promise<number> {
   if (args.includes('new') || args.includes('join')) {
-    throw new Error('usage: cos pair [code] [--share-name <name>] [--save-as <contactName>]');
-  }
-  if (!code) {
     throw new Error('usage: cos pair [code] [--share-name <name>] [--save-as <contactName>]');
   }
   if (args.includes('--name')) {
     throw new Error('use --share-name for the peer-visible name or --save-as for your local contact name');
   }
+  const code = firstPairCode(args);
+  if (!code) {
+    // Creating a code is local-only: no account unlock, no network.
+    const created = createHandshakeCode(new Date());
+    writeValue(io, context, created, (value) => `Handshake code: ${value.code}\nExpires at: ${value.expiresAt}\n`);
+    return 0;
+  }
+  const client = await getClient();
   const shareName = optionalOption(args, '--share-name');
   const saveAs = optionalOption(args, '--save-as');
   const result = await client.pairWithCode(code, { proposedName: shareName });

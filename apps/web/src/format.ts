@@ -1,6 +1,8 @@
-// Pure display helpers for the PWA. Kept framework-free so they can be unit
-// tested and shared between views without pulling in Preact. Helpers shared
-// with the TUI (relative time, conversation previews) live in @cone/core.
+// Pure display helpers specific to the PWA. Kept framework-free so they can
+// be unit tested without pulling in Preact. Anything shared with the TUI
+// (relative time, message bodies, optimistic-send matching) lives in
+// @cone/core; relativeTime is re-exported because PWA views treat it as part
+// of this module's formatting vocabulary.
 
 export { relativeTime } from '@cone/core';
 
@@ -51,8 +53,4 @@ export function countdown(iso: string | undefined, now: number = Date.now()): st
 
 export function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
-}
-
-export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

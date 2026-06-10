@@ -1,7 +1,15 @@
 import { bytesToUtf8, utf8ToBytes } from './encoding';
-import { codeScopedKey, decryptBytes, decryptJson, encryptBytes, encryptJson, randomId } from './crypto';
-import { READ_RECEIPT_TYPE } from './display';
-import { createEncryptedPairingOffer, createHandshakeCode as createCode } from './pairing';
+import { decryptBytes, decryptJson, encryptBytes, encryptJson, normalizeHandshakeCode, randomId } from './crypto';
+import { laterIso } from './display';
+import {
+  APP_JSON_TYPE,
+  BACKUP_TYPE,
+  PAIR_CONFIRM_TYPE,
+  READ_RECEIPT_TYPE,
+  UNSUPPORTED_MESSAGE_TYPE,
+  isControlEnvelope,
+} from './envelope';
+import { PAIRING_TTL_MS, createEncryptedPairingOffer, createHandshakeCode as createCode, decryptPeerOffer } from './pairing';
 import type {
   ConeClient,
   ConeConversation,
@@ -95,10 +103,8 @@ class ConeClientImpl implements ConeClient {
     return sent;
   }
 
-  async sendJson(to: IdentityRef, value: unknown): Promise<SentMessage> {
-    const envelope = { type: 'cos.app.json.v1', value };
-    const sent = await this.sendText(to, JSON.stringify(envelope));
-    return sent;
+  sendJson(to: IdentityRef, value: unknown): Promise<SentMessage> {
+    return this.sendText(to, JSON.stringify({ type: APP_JSON_TYPE, value }));
   }
 
   // Best-effort read receipt: a `cos.read.v1` control message sent into the
@@ -190,7 +196,7 @@ class ConeClientImpl implements ConeClient {
 
     return Promise.all(messages.map(async (message) => {
       const payload = await decryptJson<unknown>(this.options.account.coneStorageKey, message.encryptedPayload);
-      const kind = message.kind === 'json' && isConeControlEnvelope(payload) ? 'control' : message.kind;
+      const kind = message.kind === 'json' && isControlEnvelope(payload) ? 'control' : message.kind;
       return {
         conversationId: message.conversationId,
         direction: message.senderInboxId === identity.inboxId ? 'outbound' as const : 'inbound' as const,
@@ -254,43 +260,31 @@ class ConeClientImpl implements ConeClient {
       throw new Error('rendezvous client is required for code pairing');
     }
 
+    // Both the rendezvous room and the offer encryption are keyed by the
+    // normalized code, so "anchor beacon" and "Anchor-Beacon" pair up.
+    const normalizedCode = normalizeHandshakeCode(code);
     const identity = await this.identity();
     const deadline = this.now().getTime() + (options.timeoutMs ?? 60_000);
     const localOffer = await createEncryptedPairingOffer({
-      account: this.options.account,
-      code,
+      code: normalizedCode,
       identity,
       proposedName: options.proposedName,
       now: this.now(),
     });
-    let peer = null;
+    let peer: PairingOffer | null = null;
 
     while (this.now().getTime() < deadline) {
       const offers = await this.options.rendezvous.exchangeOffer({
-          code,
-          encryptedOffer: localOffer.encryptedOffer,
-          expiresAt: new Date(this.now().getTime() + 10 * 60 * 1000).toISOString(),
-          participantId: localOffer.participantId,
-        });
-
-      for (const offer of offers) {
-        if (offer.participantId === localOffer.participantId) {
-          continue;
-        }
-        try {
-          const candidate = await decryptJson<PairingOffer>(
-            codeScopedKey(this.options.account.pairingKey, code),
-            offer.encryptedOffer,
-          );
-          if (candidate.env === identity.env && candidate.inboxId !== identity.inboxId) {
-            peer = candidate;
-            break;
-          }
-        } catch {
-          continue;
-        }
-      }
-
+        code: normalizedCode,
+        encryptedOffer: localOffer.encryptedOffer,
+        expiresAt: new Date(this.now().getTime() + PAIRING_TTL_MS).toISOString(),
+        participantId: localOffer.participantId,
+      });
+      peer = await decryptPeerOffer(offers, {
+        code: normalizedCode,
+        identity,
+        participantId: localOffer.participantId,
+      });
       if (peer) {
         break;
       }
@@ -314,7 +308,7 @@ class ConeClientImpl implements ConeClient {
       await this.options.xmtp.sendText(
         resolved,
         JSON.stringify({
-          type: 'cos.pair.confirm.v1',
+          type: PAIR_CONFIRM_TYPE,
           inboxId: identity.inboxId,
           address: identity.address,
           codeAcceptedAt: this.nowIso(),
@@ -333,12 +327,12 @@ class ConeClientImpl implements ConeClient {
   async exportBackup(): Promise<Uint8Array> {
     const snapshot = await this.options.store.exportSnapshot();
     const encrypted = await encryptBytes(this.options.account.backupArchiveKey, utf8ToBytes(JSON.stringify(snapshot)));
-    return utf8ToBytes(JSON.stringify({ type: 'cos.backup.v1', encrypted }));
+    return utf8ToBytes(JSON.stringify({ type: BACKUP_TYPE, encrypted }));
   }
 
   async importBackup(data: Uint8Array): Promise<void> {
     const parsed = JSON.parse(bytesToUtf8(data)) as { type?: string; encrypted?: unknown };
-    if (parsed.type !== 'cos.backup.v1' || !parsed.encrypted) {
+    if (parsed.type !== BACKUP_TYPE || !parsed.encrypted) {
       throw new Error('invalid Cone backup');
     }
     const plaintext = await decryptBytes(this.options.account.backupArchiveKey, parsed.encrypted as never);
@@ -430,7 +424,7 @@ class ConeClientImpl implements ConeClient {
       peerAddress: contact?.address ?? message.senderAddress ?? existing?.peerAddress,
       peerInboxId,
       title: contact?.name ?? existing?.title ?? message.senderAddress ?? peerInboxId,
-      updatedAt: maxIso(existing?.updatedAt, message.sentAt),
+      updatedAt: laterIso(existing?.updatedAt, message.sentAt),
       unreadCount: existing?.unreadCount,
       lastReadAt: existing?.lastReadAt,
     });
@@ -445,31 +439,10 @@ class ConeClientImpl implements ConeClient {
   }
 }
 
-function maxIso(left: string | undefined, right: string | undefined): string | undefined {
-  if (!left) {
-    return right;
-  }
-  if (!right) {
-    return left;
-  }
-  return left > right ? left : right;
-}
-
-function isConeControlEnvelope(value: unknown): boolean {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'type' in value &&
-    typeof value.type === 'string' &&
-    value.type.startsWith('cos.') &&
-    value.type !== 'cos.app.json.v1'
-  );
-}
-
 function storedNetworkPayload(message: IncomingMessage): Pick<StoredMessage, 'kind'> & { value: unknown } {
   if (message.json !== undefined) {
     return {
-      kind: isConeControlEnvelope(message.json) ? 'control' : 'json',
+      kind: isControlEnvelope(message.json) ? 'control' : 'json',
       value: jsonSafe(message.json),
     };
   }
@@ -481,7 +454,7 @@ function storedNetworkPayload(message: IncomingMessage): Pick<StoredMessage, 'ki
   return {
     kind: 'json',
     value: {
-      type: 'cos.unsupported-message.v1',
+      type: UNSUPPORTED_MESSAGE_TYPE,
       messageId: message.messageId,
       senderInboxId: message.senderInboxId,
     },

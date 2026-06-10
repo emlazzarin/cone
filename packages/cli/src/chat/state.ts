@@ -1,6 +1,7 @@
 import {
   formatConversationPreview,
   isVisibleChatMessage,
+  latestInboundAt,
   type ConeClient,
   type ConeConversation,
   type ConeIdentity,
@@ -177,12 +178,7 @@ function maybeSendReadReceipt(client: ConeClient, state: ChatState, conversation
   if (!state.readReceipts) {
     return;
   }
-  let newestInbound = '';
-  for (const message of state.messages) {
-    if (message.direction === 'inbound' && isVisibleChatMessage(message) && message.sentAt > newestInbound) {
-      newestInbound = message.sentAt;
-    }
-  }
+  const newestInbound = latestInboundAt(state.messages);
   if (!newestInbound || (state.lastAckedByConversation[conversation.conversationId] ?? '') >= newestInbound) {
     return;
   }

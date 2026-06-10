@@ -2,21 +2,22 @@
 // the signed-in app (and its density) without a real XMTP session. Not part of
 // the production build — preview.html is never referenced by index.html.
 
-import type {
-  ConeClient,
-  ConeConversation,
-  ConeIdentity,
-  ConeMessage,
-  Contact,
-  HandshakeCode,
-  IdentityRef,
-  MessageHandler,
-  PairingResult,
-  ResolvedIdentity,
-  SaveContactInput,
-  SentMessage,
-  SyncResult,
-  Unsubscribe,
+import {
+  READ_RECEIPT_TYPE,
+  type ConeClient,
+  type ConeConversation,
+  type ConeIdentity,
+  type ConeMessage,
+  type Contact,
+  type HandshakeCode,
+  type IdentityRef,
+  type MessageHandler,
+  type PairingResult,
+  type ResolvedIdentity,
+  type SaveContactInput,
+  type SentMessage,
+  type SyncResult,
+  type Unsubscribe,
 } from '@cone/core';
 
 const ME = '0x9f2c4d7b1a3e6f8c0d2b4a6e8f1c3d5b7a9e0c2d4f6b8a1c3e5d7f9b0a2c4e6d';
@@ -167,5 +168,5 @@ function readReceipt(
   recipientInboxId: string,
   sentAt: string,
 ): ConeMessage {
-  return { messageId, conversationId, senderInboxId, recipientInboxId, sentAt, kind: 'control', direction: 'inbound', json: { type: 'cos.read.v1' } };
+  return { messageId, conversationId, senderInboxId, recipientInboxId, sentAt, kind: 'control', direction: 'inbound', json: { type: READ_RECEIPT_TYPE } };
 }

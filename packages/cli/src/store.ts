@@ -184,18 +184,20 @@ export class BunSQLiteStore implements ConeStore {
     };
   }
 
+  // Snapshots come from user-supplied backups, so every collection is treated
+  // as optional even though the type says otherwise.
   async importSnapshot(snapshot: ConeStoreSnapshot): Promise<void> {
-    for (const contact of snapshot.contacts) {
+    for (const contact of snapshot.contacts ?? []) {
       await this.putContact(contact);
     }
     for (const conversation of snapshot.conversations ?? []) {
       await this.putConversation(conversation);
     }
     await this.putMetadata(snapshot.metadata ?? {});
-    for (const message of snapshot.messages) {
+    for (const message of snapshot.messages ?? []) {
       await this.putMessage(message);
     }
-    for (const messageId of snapshot.processedMessageIds) {
+    for (const messageId of snapshot.processedMessageIds ?? []) {
       await this.markMessageProcessed(messageId);
     }
   }

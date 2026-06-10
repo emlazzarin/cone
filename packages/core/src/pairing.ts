@@ -1,5 +1,5 @@
 import { codeScopedKey, decryptJson, encryptJson, normalizeHandshakeCode, randomHandshakeCode, randomId, sha256Hex } from './crypto';
-import type { ConeIdentity, DerivedAccount, HandshakeCode, PairingOffer, RendezvousClient, RendezvousStoredOffer } from './types';
+import type { ConeIdentity, HandshakeCode, PairingOffer, RendezvousStoredOffer } from './types';
 
 export const PAIRING_TTL_MS = 10 * 60 * 1000;
 
@@ -11,7 +11,6 @@ export function createHandshakeCode(now: Date = new Date()): HandshakeCode {
 }
 
 export async function createEncryptedPairingOffer(input: {
-  account: DerivedAccount;
   code: string;
   identity: ConeIdentity;
   proposedName?: string;
@@ -28,38 +27,28 @@ export async function createEncryptedPairingOffer(input: {
     proposedName: input.proposedName,
     createdAt: now.toISOString(),
   };
-  const key = codeScopedKey(input.account.pairingKey, input.code);
-  const encryptedOffer = await encryptJson<PairingOffer>(key, 'cone.pairing.offer.v1', offer);
+  const encryptedOffer = await encryptJson<PairingOffer>(codeScopedKey(input.code), 'cone.pairing.offer.v1', offer);
   const participantId = sha256Hex(`${normalizeHandshakeCode(input.code)}:${offer.inboxId}:${offer.nonce}`);
 
   return { participantId, offer, encryptedOffer };
 }
 
-export async function exchangePairingOffer(input: {
-  rendezvous: RendezvousClient;
-  account: DerivedAccount;
-  code: string;
-  identity: ConeIdentity;
-  proposedName?: string;
-  now?: Date;
-}): Promise<PairingOffer> {
-  const now = input.now ?? new Date();
-  const { participantId, encryptedOffer } = await createEncryptedPairingOffer(input);
-  const offers = await input.rendezvous.exchangeOffer({
-    code: normalizeHandshakeCode(input.code),
-    participantId,
-    encryptedOffer,
-    expiresAt: new Date(now.getTime() + PAIRING_TTL_MS).toISOString(),
-  });
-  const key = codeScopedKey(input.account.pairingKey, input.code);
+// Finds the peer's offer among the stored offers for a code: skips our own,
+// and accepts only an offer that decrypts under the code and belongs to a
+// different inbox on the same network.
+export async function decryptPeerOffer(
+  offers: RendezvousStoredOffer[],
+  input: { code: string; participantId: string; identity: ConeIdentity },
+): Promise<PairingOffer | null> {
+  const key = codeScopedKey(input.code);
 
-  for (const storedOffer of offers) {
-    if (storedOffer.participantId === participantId) {
+  for (const stored of offers) {
+    if (stored.participantId === input.participantId) {
       continue;
     }
 
     try {
-      const peer = await decryptJson<PairingOffer>(key, storedOffer.encryptedOffer);
+      const peer = await decryptJson<PairingOffer>(key, stored.encryptedOffer);
       if (peer.inboxId !== input.identity.inboxId && peer.env === input.identity.env) {
         return peer;
       }
@@ -68,5 +57,5 @@ export async function exchangePairingOffer(input: {
     }
   }
 
-  throw new Error('pairing peer not available yet');
+  return null;
 }

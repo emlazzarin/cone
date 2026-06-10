@@ -1,4 +1,12 @@
-import type { ConeMessage, IncomingMessage, SyncResult } from './types';
+import {
+  PAIR_CONFIRM_TYPE,
+  READ_RECEIPT_TYPE,
+  UNSUPPORTED_MESSAGE_TYPE,
+  envelopeType,
+  isAppJsonEnvelope,
+  isControlEnvelope,
+} from './envelope';
+import type { ConeMessage, MessageDeliveryStatus, SyncResult } from './types';
 
 export type ConeConnectionStatus = 'catching-up' | 'connecting' | 'live' | 'offline' | 'stale';
 
@@ -13,12 +21,8 @@ interface MessagePayload {
   text?: string;
 }
 
-export function messageBody<T extends MessagePayload>(message: T): string {
+export function messageBody(message: MessagePayload): string {
   return payloadBody(message.text, message.json);
-}
-
-export function incomingMessageBody(message: IncomingMessage): string {
-  return messageBody(message);
 }
 
 export function formatTranscriptTime(value: string): string {
@@ -31,6 +35,14 @@ export function formatTranscriptTime(value: string): string {
 
 export function formatTranscriptLine(input: TranscriptLineInput): string {
   return `${formatTranscriptTime(input.sentAt)} - ${input.sender}: ${input.body}`;
+}
+
+export function formatMessageLine(message: MessagePayload & { sentAt: string }, sender: string): string {
+  return formatTranscriptLine({
+    body: messageBody(message),
+    sender,
+    sentAt: message.sentAt,
+  });
 }
 
 export function formatConversationPreview(message: ConeMessage): string {
@@ -65,46 +77,52 @@ export function relativeTime(iso: string | undefined, now: number = Date.now()):
   return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(new Date(then));
 }
 
-export function formatConeMessageLine(message: ConeMessage, sender: string): string {
-  return formatTranscriptLine({
-    body: messageBody(message),
-    sender,
-    sentAt: message.sentAt,
-  });
+export function laterIso(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  return left > right ? left : right;
 }
 
-export function formatIncomingMessageLine(message: IncomingMessage, sender: string): string {
-  return formatTranscriptLine({
-    body: incomingMessageBody(message),
-    sender,
-    sentAt: message.sentAt,
-  });
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function isVisibleChatMessage(message: Pick<ConeMessage, 'json' | 'kind'>): boolean {
-  if (message.kind === 'control') {
-    return false;
-  }
-  if (typeof message.json === 'object' && message.json !== null && 'type' in message.json) {
-    const type = message.json.type;
-    return !(typeof type === 'string' && type.startsWith('cos.') && type !== 'cos.app.json.v1');
-  }
-  return true;
+  return message.kind !== 'control' && !isControlEnvelope(message.json);
 }
 
-// Cone read receipts ride the same control-envelope channel as pairing
-// confirmations: a `cos.read.v1` message sent into a conversation means "I have
-// read everything up to this message's sentAt". They are hidden from the
-// transcript and only interoperate between Cone clients.
-export const READ_RECEIPT_TYPE = 'cos.read.v1';
-
 export function isReadReceipt(message: Pick<ConeMessage, 'json'>): boolean {
-  const json = message.json;
+  return envelopeType(message.json) === READ_RECEIPT_TYPE;
+}
+
+// The sentAt of the newest visible inbound message, or undefined if none.
+// Both surfaces use this to decide whether a conversation has anything new
+// worth acknowledging with a read receipt.
+export function latestInboundAt(messages: ConeMessage[]): string | undefined {
+  let newest: string | undefined;
+  for (const message of messages) {
+    if (message.direction === 'inbound' && isVisibleChatMessage(message) && (!newest || message.sentAt > newest)) {
+      newest = message.sentAt;
+    }
+  }
+  return newest;
+}
+
+// An optimistic (locally rendered, not yet stored) send is considered
+// delivered once a matching outbound message appears in the read model:
+// same trimmed body, sent within this window. Both surfaces use this to hide
+// the optimistic row in favor of the stored copy.
+const PENDING_SEND_MATCH_WINDOW_MS = 5 * 60_000;
+
+export function matchesPendingSend(message: ConeMessage, pending: { sentAt: string; text: string }): boolean {
   return (
-    typeof json === 'object' &&
-    json !== null &&
-    'type' in json &&
-    (json as { type?: unknown }).type === READ_RECEIPT_TYPE
+    message.direction === 'outbound' &&
+    messageBody(message).trim() === pending.text &&
+    Math.abs(Date.parse(message.sentAt) - Date.parse(pending.sentAt)) < PENDING_SEND_MATCH_WINDOW_MS
   );
 }
 
@@ -139,6 +157,20 @@ export function latestReadOutboundId(messages: ConeMessage[]): string | undefine
   return bestId;
 }
 
+// XMTP's DecodedMessage.deliveryStatus is the numeric enum
+// (Unpublished=0, Published=1, Failed=2); older/browser builds have used the
+// string form. Normalize both, defaulting unknown values to published so we
+// never hide a real message.
+export function normalizeDeliveryStatus(raw: unknown): MessageDeliveryStatus {
+  if (raw === 2 || raw === 'failed' || raw === 'Failed') {
+    return 'failed';
+  }
+  if (raw === 0 || raw === 'unpublished' || raw === 'Unpublished') {
+    return 'unpublished';
+  }
+  return 'published';
+}
+
 export function formatSyncStatus(result: SyncResult): string {
   const summary = `${result.conversationsSynced} conversations, ${result.messagesSynced} messages`;
   return result.ok ? `synced ${summary}` : `offline/stale: ${result.errors.join('; ')}`;
@@ -166,7 +198,7 @@ function payloadBody(text: string | undefined, json: unknown): string {
       return humanizeValue(parsed.value);
     }
     if (isControlEnvelope(parsed)) {
-      return humanizeControl(parsed);
+      return humanizeControl(envelopeType(parsed)!);
     }
     return text;
   }
@@ -174,22 +206,22 @@ function payloadBody(text: string | undefined, json: unknown): string {
     return humanizeValue(json.value);
   }
   if (isControlEnvelope(json)) {
-    return humanizeControl(json);
+    return humanizeControl(envelopeType(json)!);
   }
   return humanizeValue(json);
 }
 
-function humanizeControl(value: { type?: string }): string {
-  if (value.type === 'cos.pair.confirm.v1') {
+function humanizeControl(type: string): string {
+  if (type === PAIR_CONFIRM_TYPE) {
     return '[pair confirmed]';
   }
-  if (value.type === READ_RECEIPT_TYPE) {
+  if (type === READ_RECEIPT_TYPE) {
     return '[read]';
   }
-  if (value.type === 'cos.unsupported-message.v1') {
+  if (type === UNSUPPORTED_MESSAGE_TYPE) {
     return '[unsupported message]';
   }
-  return `[${value.type ?? 'control message'}]`;
+  return `[${type}]`;
 }
 
 function humanizeValue(value: unknown): string {
@@ -221,24 +253,4 @@ function parseJson(value: string): unknown {
   } catch {
     return null;
   }
-}
-
-function isAppJsonEnvelope(value: unknown): value is { type: 'cos.app.json.v1'; value: unknown } {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'type' in value &&
-    value.type === 'cos.app.json.v1' &&
-    'value' in value
-  );
-}
-
-function isControlEnvelope(value: unknown): value is { type?: string } {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'type' in value &&
-    typeof value.type === 'string' &&
-    value.type.startsWith('cos.')
-  );
 }

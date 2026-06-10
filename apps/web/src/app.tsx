@@ -4,14 +4,18 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   createConeClient,
   deriveAccount,
+  errorMessage,
   formatConnectionStatus,
   formatConversationPreview,
+  formatTranscriptTime,
   generateSecretKey,
   HttpRendezvousClient,
   isVisibleChatMessage,
+  laterIso,
+  latestInboundAt,
   latestReadOutboundId,
+  matchesPendingSend,
   messageBody,
-  formatTranscriptTime,
   parseSecretKey,
   type ConeConnectionStatus,
   type ConeClient,
@@ -23,7 +27,7 @@ import {
 } from '@cone/core';
 import { browserAccountNamespace, createBrowserXmtpAdapter, IndexedDbStore } from '@cone/xmtp-browser';
 
-import { clamp, countdown, errorMessage, hashHue, initials, relativeTime, shortId } from './format';
+import { clamp, countdown, hashHue, initials, relativeTime, shortId } from './format';
 
 export type View = 'chats' | 'contacts' | 'pair' | 'backup' | 'settings';
 
@@ -189,13 +193,7 @@ export function App({ bootstrap }: AppProps = {}) {
   const panePending = pendingSends.filter(
     (entry) =>
       entry.paneKey === (selectedConversationId || 'compose') &&
-      (entry.status === 'failed' ||
-        !visibleMessages.some(
-          (message) =>
-            message.direction === 'outbound' &&
-            messageBody(message).trim() === entry.text &&
-            Math.abs(Date.parse(message.sentAt) - Date.parse(entry.sentAt)) < 300_000,
-        )),
+      (entry.status === 'failed' || !visibleMessages.some((message) => matchesPendingSend(message, entry))),
   );
   const pendingStamp = panePending.map((entry) => `${entry.id}:${entry.status}`).join('|');
   // Single "Read" marker: the most recent of our messages the peer has read.
@@ -319,12 +317,7 @@ export function App({ bootstrap }: AppProps = {}) {
     const conversation = conversations.find((entry) => entry.conversationId === selectedConversationId);
     const visible = typeof document === 'undefined' || document.visibilityState !== 'hidden';
     if (readReceipts && conversation && visible) {
-      let newestInbound = '';
-      for (const message of list) {
-        if (message.direction === 'inbound' && isVisibleChatMessage(message) && message.sentAt > newestInbound) {
-          newestInbound = message.sentAt;
-        }
-      }
+      const newestInbound = latestInboundAt(list);
       if (newestInbound && (ackedRef.current[selectedConversationId] ?? '') < newestInbound) {
         ackedRef.current[selectedConversationId] = newestInbound;
         void session.client.sendReadReceipt(conversation.peerInboxId);
@@ -573,6 +566,10 @@ export function App({ bootstrap }: AppProps = {}) {
     const refreshed = { ...entry, sentAt: new Date().toISOString(), status: 'sending' as const };
     setPendingSends((previous) => previous.map((candidate) => (candidate.id === entry.id ? refreshed : candidate)));
     void deliver(refreshed);
+  }
+
+  function discardSend(entry: PendingSend) {
+    setPendingSends((previous) => previous.filter((candidate) => candidate.id !== entry.id));
   }
 
   async function saveContact() {
@@ -1045,9 +1042,11 @@ export function App({ bootstrap }: AppProps = {}) {
                           <span class="msg__sep">: </span>
                           <span class="msg__body">{entry.text}</span>
                           {entry.status === 'failed' && (
-                            <button type="button" class="retry" onClick={() => retrySend(entry)}>
-                              retry
-                            </button>
+                            <span class="msg__actions">
+                              <span class="msg__fail-note">not delivered</span>
+                              <button type="button" class="retry" onClick={() => retrySend(entry)}>retry</button>
+                              <button type="button" class="discard" onClick={() => discardSend(entry)}>delete</button>
+                            </span>
                           )}
                         </article>
                       ))}
@@ -1380,7 +1379,7 @@ export function App({ bootstrap }: AppProps = {}) {
               </div>
               <div class="help-row">
                 <b>Write</b>
-                <span><kbd>↵</kbd> sends instantly — your message appears immediately and is only marked if delivery fails (✗ with a retry) · <kbd>shift</kbd>+<kbd>↵</kbd> newline</span>
+                <span><kbd>↵</kbd> sends instantly — your message appears immediately, and a successful send is silent. Only a message that fails to reach the network is marked (✗ “not delivered”), with retry or delete. <kbd>shift</kbd>+<kbd>↵</kbd> newline</span>
               </div>
               <div class="help-row">
                 <b>Filter</b>
@@ -1506,16 +1505,6 @@ function pointerFine(): boolean {
   return typeof window !== 'undefined' && typeof window.matchMedia === 'function'
     ? window.matchMedia('(pointer: fine)').matches
     : true;
-}
-
-function laterIso(left: string | undefined, right: string | undefined): string | undefined {
-  if (!left) {
-    return right;
-  }
-  if (!right) {
-    return left;
-  }
-  return left > right ? left : right;
 }
 
 function sessionLabel(startedAt: Date | null): string {

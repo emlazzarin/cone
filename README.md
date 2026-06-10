@@ -13,10 +13,10 @@ Both unlock the same XMTP-backed account from a portable `SECRET KEY`, can messa
 
 This repo has been reset around the full product architecture:
 
-- `packages/core` contains secret-key derivation, contacts, pairing protocol, storage interfaces, and the shared Cone client.
+- `packages/core` contains secret-key derivation, contacts, pairing protocol, storage interfaces, the shared Cone client, and the SDK-agnostic XMTP adapter core (`@cone/core/xmtp`).
 - `packages/cli` contains the `cos` command and Bun SQLite persistence.
-- `packages/xmtp-node` adapts the XMTP Node SDK for CLI and agent use.
-- `packages/xmtp-browser` adapts the XMTP Browser SDK and provides encrypted IndexedDB persistence.
+- `packages/xmtp-node` wires the XMTP Node SDK into the shared adapter core for CLI and agent use.
+- `packages/xmtp-browser` wires the XMTP Browser SDK into the shared adapter core and provides encrypted IndexedDB persistence.
 - `apps/web` is the PWA built with Vite, Preact, and Bun.
 - `apps/rendezvous` is the ephemeral handshake-code service.
 - `examples/agent` shows a minimal long-running agent process.
@@ -44,7 +44,7 @@ bun run dev:web
 
 The PWA shares the CLI chat vocabulary and keys without copying its modality: there are no explicit select/talk modes in the browser — focus position is the mode. `1–5` switch sections (Chats, Contacts, Pair, Backup, Settings), `j/k` move through chats, `Enter` opens the selected chat (or starts a new message when none is selected), `n` starts a new message, `/` filters chats live, `?` opens an in-app help overlay, and `Esc` returns from typing to navigating. Transcript rows use the same `16:39 - Alice: hello` format as the CLI.
 
-Sending is fully optimistic on both surfaces: the message appears in the transcript the instant you press `Enter`, the composer clears, and nothing changes unless delivery fails — a failed message is marked (`✗`, in red) with a one-press retry. Identities are labeled "XMTP inbox ID" where the distinction matters. Handshake codes expire after ten minutes, but the pairing they establish is permanent.
+Sending is fully optimistic on both surfaces: the message appears in the transcript the instant you press `Enter` and the composer clears. A successful send is silent — XMTP has no per-recipient "delivered" ack, so the meaningful signal is whether a message published to the network. Only a send that fails to publish is marked (`✗` "not delivered", in red), offering **retry or delete** (PWA: buttons; TUI: `Enter` retries, `Ctrl+X` deletes). The local read model is kept to published messages, so a failed send never later masquerades as delivered. Identities are labeled "XMTP inbox ID" where the distinction matters. Handshake codes expire after ten minutes, but the pairing they establish is permanent.
 
 Read receipts are on by default and toggleable (PWA Settings; `R` in the TUI chat). When on, a `cos.read.v1` control message is sent into a conversation when you read it, and a single `✓✓ Read` marker appears on the most recent of your messages the peer has read. The toggle is symmetric: turning it off stops sending receipts *and* hides peer read state — only failed sends are ever marked. Receipts interoperate between Cone clients (they ride the same control-envelope channel as pairing confirmations).
 
@@ -112,13 +112,12 @@ The key is a 32-byte root secret with version and checksum metadata. Cone determ
 - XMTP local DB encryption key for non-browser SDKs
 - Cone storage encryption key
 - Cone backup archive key
-- pairing encryption key
 
 ## Pairing
 
 Handshake-code pairing is for cases where two sides want to opt in without exchanging identifiers first.
 
-The rendezvous service stores encrypted offers for a short time. It does not relay application messages. After both sides decrypt each other locally, they confirm over XMTP and save each other as contacts.
+The rendezvous service stores encrypted offers for a short time. It does not relay application messages. Offers are encrypted with a key derived from the handshake code itself — the only secret both sides share before they know each other. After both sides decrypt each other locally, they confirm over XMTP and save each other as contacts.
 
 ## Address Book
 

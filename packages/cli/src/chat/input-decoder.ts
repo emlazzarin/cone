@@ -1,21 +1,20 @@
-const ESC = '\u001b';
+import { CHATS_PANE_SEQUENCES, CONTACTS_PANE_SEQUENCES, KEY } from './keys';
+
 const ESC_FLUSH_MS = 25;
 
+// Multi-byte sequences the decoder must hold together when they arrive split
+// across reads. Longest first so a longer sequence wins over its prefix.
 const KNOWN_SEQUENCES = [
-  '\u001b[49;5u',
-  '\u001b[50;5u',
-  '\u001b[27;5;49~',
-  '\u001b[27;5;50~',
-  '\u001b[1;5P',
-  '\u001b[1;5Q',
-  '\u001b[5~',
-  '\u001b[6~',
-  '\u001b[Z',
-  '\u001b[A',
-  '\u001b[B',
-  '\u001b1',
-  '\u001b2',
-].sort((a, b) => b.length - a.length);
+  ...CHATS_PANE_SEQUENCES,
+  ...CONTACTS_PANE_SEQUENCES,
+  KEY.pageUp,
+  KEY.pageDown,
+  KEY.shiftTab,
+  KEY.up,
+  KEY.down,
+]
+  .filter((sequence) => sequence.length > 1)
+  .sort((a, b) => b.length - a.length);
 
 export { ESC_FLUSH_MS };
 
@@ -46,13 +45,13 @@ export class InputDecoder {
         continue;
       }
 
-      if (this.pending.startsWith(ESC)) {
+      if (this.pending.startsWith(KEY.esc)) {
         const isPartialKnownSequence = KNOWN_SEQUENCES.some((candidate) => candidate.startsWith(this.pending));
         if (!flush && isPartialKnownSequence) {
           break;
         }
-        keys.push(ESC);
-        this.pending = this.pending.slice(ESC.length);
+        keys.push(KEY.esc);
+        this.pending = this.pending.slice(KEY.esc.length);
         continue;
       }
 

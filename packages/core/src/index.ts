@@ -28,27 +28,37 @@ export {
 } from './secret';
 export { createConeClient } from './client';
 export {
-  formatConeMessageLine,
+  errorMessage,
   formatConnectionStatus,
   formatConversationPreview,
-  formatIncomingMessageLine,
+  formatMessageLine,
   formatSyncStatus,
   formatTranscriptLine,
   formatTranscriptTime,
-  incomingMessageBody,
   isReadReceipt,
   isVisibleChatMessage,
+  laterIso,
+  latestInboundAt,
   latestReadOutboundId,
+  matchesPendingSend,
   messageBody,
-  READ_RECEIPT_TYPE,
+  normalizeDeliveryStatus,
   relativeTime,
 } from './display';
 export type { ConeConnectionStatus, TranscriptLineInput } from './display';
 export {
+  APP_JSON_TYPE,
+  PAIR_CONFIRM_TYPE,
+  READ_RECEIPT_TYPE,
+  envelopeType,
+  isAppJsonEnvelope,
+  isControlEnvelope,
+} from './envelope';
+export {
   PAIRING_TTL_MS,
   createEncryptedPairingOffer,
   createHandshakeCode,
-  exchangePairingOffer,
+  decryptPeerOffer,
 } from './pairing';
 export { MemoryStore } from './store';
 export { HttpRendezvousClient } from './rendezvous';
@@ -76,6 +86,7 @@ export type {
   IdentityRef,
   IdentityRefObject,
   IncomingMessage,
+  MessageDeliveryStatus,
   MessageListOptions,
   MessageHandler,
   PairingOffer,

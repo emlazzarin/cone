@@ -673,20 +673,45 @@ kbd {
   font-weight: 700;
 }
 
-.retry {
+.msg__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   margin-left: 8px;
+}
+
+.msg__fail-note {
+  color: var(--red);
+  font-size: 11px;
+}
+
+.retry,
+.discard {
   min-height: 20px;
   padding: 0 7px;
   font-size: 10.5px;
+  background: transparent;
+}
+
+.retry {
   border-color: var(--red);
   color: var(--red);
-  background: transparent;
 }
 
 .retry:hover {
   background: var(--red-soft);
   border-color: var(--red);
   color: var(--red);
+}
+
+.discard {
+  border-color: var(--line-2);
+  color: var(--text-dim);
+}
+
+.discard:hover {
+  background: var(--panel-3);
+  color: var(--text);
 }
 
 .read-receipt {

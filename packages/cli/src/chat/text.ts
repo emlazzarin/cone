@@ -1,18 +1,7 @@
-import {
-  formatIncomingMessageLine,
-  formatSyncStatus,
-  formatTranscriptTime,
-  incomingMessageBody,
-  messageBody,
-} from '@cone/core';
+// ANSI styling and plain-text layout helpers for the chat TUI.
 
-export const ESC = '\x1b[';
-
-export { formatIncomingMessageLine, formatSyncStatus, incomingMessageBody, messageBody };
-
-export function formatTime(value: string): string {
-  return formatTranscriptTime(value);
-}
+// Control Sequence Introducer: the prefix of every ANSI escape we emit.
+export const CSI = '\x1b[';
 
 export function shortId(value: string): string {
   return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
@@ -27,31 +16,31 @@ export function pad(value: string, width: number): string {
 }
 
 export function inverse(value: string): string {
-  return `${ESC}7m${value}${ESC}0m`;
+  return `${CSI}7m${value}${CSI}0m`;
 }
 
 export function dim(value: string): string {
-  return `${ESC}2m${value}${ESC}0m`;
+  return `${CSI}2m${value}${CSI}0m`;
 }
 
 export function highlight(value: string): string {
-  return `${ESC}36m${ESC}7m${value}${ESC}0m`;
+  return `${CSI}36m${CSI}7m${value}${CSI}0m`;
 }
 
 export function accent(value: string): string {
-  return `${ESC}33m${value}${ESC}0m`;
+  return `${CSI}33m${value}${CSI}0m`;
 }
 
 export function danger(value: string): string {
-  return `${ESC}31m${value}${ESC}0m`;
+  return `${CSI}31m${value}${CSI}0m`;
 }
 
 export function success(value: string): string {
-  return `${ESC}32m${value}${ESC}0m`;
+  return `${CSI}32m${value}${CSI}0m`;
 }
 
 export function inputField(value: string): string {
-  return `${ESC}30;47m${value}${ESC}0m`;
+  return `${CSI}30;47m${value}${CSI}0m`;
 }
 
 export function stripAnsi(value: string): string {
@@ -110,31 +99,6 @@ export function isPrintableInput(value: string): boolean {
   return /^[^\x00-\x1f\x7f]+$/u.test(value);
 }
 
-export function isChatsShortcut(value: string, allowPlain = false): boolean {
-  return (
-    value === '\u001b[49;5u' ||
-    value === '\u001b[27;5;49~' ||
-    value === '\u001b[1;5P' ||
-    value === '\u001b1' ||
-    (allowPlain && value === '1')
-  );
-}
-
-export function isContactsShortcut(value: string, allowPlain = false): boolean {
-  return (
-    value === '\u0000' ||
-    value === '\u001b[50;5u' ||
-    value === '\u001b[27;5;50~' ||
-    value === '\u001b[1;5Q' ||
-    value === '\u001b2' ||
-    (allowPlain && value === '2')
-  );
-}
-
-export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 function truncateAnsi(value: string, width: number): string {
   let output = '';
   let visible = 0;
@@ -150,7 +114,7 @@ function truncateAnsi(value: string, width: number): string {
     output += value[index];
     visible += 1;
   }
-  return `${output}${ESC}0m`;
+  return `${output}${CSI}0m`;
 }
 
 function breakLongWord(word: string, width: number): string[] {
