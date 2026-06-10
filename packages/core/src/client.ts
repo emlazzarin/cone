@@ -1,5 +1,6 @@
 import { bytesToUtf8, utf8ToBytes } from './encoding';
 import { codeScopedKey, decryptBytes, decryptJson, encryptBytes, encryptJson, randomId } from './crypto';
+import { READ_RECEIPT_TYPE } from './display';
 import { createEncryptedPairingOffer, createHandshakeCode as createCode } from './pairing';
 import type {
   ConeClient,
@@ -98,6 +99,19 @@ class ConeClientImpl implements ConeClient {
     const envelope = { type: 'cos.app.json.v1', value };
     const sent = await this.sendText(to, JSON.stringify(envelope));
     return sent;
+  }
+
+  // Best-effort read receipt: a `cos.read.v1` control message sent into the
+  // conversation. Never throws and is not persisted locally — we only need the
+  // peer's receipts (which arrive over the stream) to show "Read" on our own
+  // messages.
+  async sendReadReceipt(to: IdentityRef): Promise<void> {
+    try {
+      const resolved = await this.resolveIdentity(to);
+      await this.options.xmtp.sendText(resolved, JSON.stringify({ type: READ_RECEIPT_TYPE }));
+    } catch {
+      // Read receipts are advisory; a failure must never disrupt the session.
+    }
   }
 
   async streamMessages(handler: (message: IncomingMessage) => void | Promise<void>): Promise<Unsubscribe> {

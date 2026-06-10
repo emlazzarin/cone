@@ -4,6 +4,7 @@ import { ESC_FLUSH_MS, InputDecoder } from './input-decoder';
 import { handleInput } from './input';
 import { renderChat } from './render';
 import {
+  applyConversationMeta,
   clampSelections,
   createChatState,
   loadDraft,
@@ -28,6 +29,10 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
   }
 
   const state = createChatState(await client.identity(), await client.listConversations(), await client.listContacts());
+  state.readReceipts = options.readReceipts ?? true;
+  let persistedReadReceipts = state.readReceipts;
+  applyConversationMeta(state, await client.listMessages());
+  clampSelections(state);
   await refreshMessages(client, state);
 
   let unsubscribe: Unsubscribe | undefined;
@@ -45,6 +50,7 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
     const previousContactId = selectedContact(state)?.contactId;
     state.conversations = await client.listConversations();
     state.contacts = await client.listContacts();
+    applyConversationMeta(state, await client.listMessages());
     preserveSelection(state, previousConversationId, previousContactId);
     clampSelections(state);
     promoteActiveContactConversation(state);
@@ -149,6 +155,10 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
               await close();
               resolve();
             });
+            if (state.readReceipts !== persistedReadReceipts) {
+              persistedReadReceipts = state.readReceipts;
+              options.onReadReceiptsChange?.(state.readReceipts);
+            }
             render();
           })
           .catch((error: unknown) => {
@@ -222,6 +232,6 @@ export {
 } from './forms';
 export { renderChat } from './render';
 export { handleInput } from './input';
-export { createChatState } from './state';
+export { applyConversationMeta, createChatState, visibleConversations } from './state';
 export { InputDecoder } from './input-decoder';
 export { messageBody, wrapText } from './text';

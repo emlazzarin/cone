@@ -74,7 +74,9 @@ Open the interactive terminal chat client:
 bun run packages/cli/src/bin.ts chat
 ```
 
-Useful chat keys: `j/k` move, `Enter` talks, `Esc` returns to selection, `n` starts a structured new message, `1` opens chats, `2` opens contacts, `c` creates a pairing code from Contacts, and `p` joins a pairing code from Contacts.
+Useful chat keys: `j/k` move, `Enter` talks, `Esc` returns to selection, `n` starts a structured new message, `/` filters chats as you type, `R` toggles read receipts, `1` opens chats, `2` opens contacts, `c` creates a pairing code from Contacts, and `p` joins a pairing code from Contacts.
+
+Read receipts are on by default. When on, the agent sends a `cos.read.v1` acknowledgement when it views a conversation, and a `✓✓ Read` marker shows on the most recent message the peer has read. Toggle with `R` (persists to config); when off, no receipts are sent or shown.
 
 Send to an inbox ID, EVM address, or saved contact name:
 

@@ -42,6 +42,12 @@ Run the PWA locally:
 bun run dev:web
 ```
 
+The PWA shares the CLI chat vocabulary and keys without copying its modality: there are no explicit select/talk modes in the browser — focus position is the mode. `1–5` switch sections (Chats, Contacts, Pair, Backup, Settings), `j/k` move through chats, `Enter` opens the selected chat (or starts a new message when none is selected), `n` starts a new message, `/` filters chats live, `?` opens an in-app help overlay, and `Esc` returns from typing to navigating. Transcript rows use the same `16:39 - Alice: hello` format as the CLI.
+
+Sending is fully optimistic on both surfaces: the message appears in the transcript the instant you press `Enter`, the composer clears, and nothing changes unless delivery fails — a failed message is marked (`✗`, in red) with a one-press retry. Identities are labeled "XMTP inbox ID" where the distinction matters. Handshake codes expire after ten minutes, but the pairing they establish is permanent.
+
+Read receipts are on by default and toggleable (PWA Settings; `R` in the TUI chat). When on, a `cos.read.v1` control message is sent into a conversation when you read it, and a single `✓✓ Read` marker appears on the most recent of your messages the peer has read. The toggle is symmetric: turning it off stops sending receipts *and* hides peer read state — only failed sends are ever marked. Receipts interoperate between Cone clients (they ride the same control-envelope channel as pairing confirmations).
+
 Run the rendezvous worker locally:
 
 ```sh
@@ -90,7 +96,7 @@ Set `COS_HOME=./.cone` to keep config and state in a local ignored directory whi
 
 `cos inbox sync` pulls account-level XMTP state into the local encrypted read model. `cos inbox` lists local conversations and `cos inbox read <target>` reads a local transcript. `cos chat` opens the lightweight terminal chat client over the same local read model; use `cos chat --plain-log` for a non-interactive stream log.
 
-`cos chat` is mode-driven, not command-palette driven. In Chats, use `j/k` or arrows to move, `Enter` to talk, `n` for a structured new message, and `2` for contacts. In Contacts, use `a` add, `r` rename, `d` delete, `c` create pairing code, `p` join pairing code, and `1` for chats. Transcript rows use the same human format across CLI and web: `16:39 - Alice: hello`.
+`cos chat` is mode-driven, not command-palette driven. The chat list is sorted by most recent activity and shows each chat's last message, relative time, and unread count — the same density and order as the PWA. In Chats, use `j/k` or arrows to move, `Enter` to talk, `n` for a structured new message, `/` to filter chats as you type, and `2` for contacts. In Contacts, use `a` add, `r` rename, `d` delete, `c` create pairing code, `p` join pairing code, and `1` for chats. Transcript rows use the same human format across CLI and web: `16:39 - Alice: hello`.
 
 ## Secret Keys
 

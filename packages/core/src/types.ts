@@ -224,6 +224,7 @@ export interface ConeClient {
   canMessage(ref: IdentityRef): Promise<boolean>;
   sendText(to: IdentityRef, text: string): Promise<SentMessage>;
   sendJson(to: IdentityRef, value: unknown): Promise<SentMessage>;
+  sendReadReceipt(to: IdentityRef): Promise<void>;
   sync(): Promise<SyncResult>;
   streamMessages(handler: MessageHandler): Promise<Unsubscribe>;
   listConversations(): Promise<ConeConversation[]>;

@@ -30,13 +30,18 @@ export { createConeClient } from './client';
 export {
   formatConeMessageLine,
   formatConnectionStatus,
+  formatConversationPreview,
   formatIncomingMessageLine,
   formatSyncStatus,
   formatTranscriptLine,
   formatTranscriptTime,
   incomingMessageBody,
+  isReadReceipt,
   isVisibleChatMessage,
+  latestReadOutboundId,
   messageBody,
+  READ_RECEIPT_TYPE,
+  relativeTime,
 } from './display';
 export type { ConeConnectionStatus, TranscriptLineInput } from './display';
 export {

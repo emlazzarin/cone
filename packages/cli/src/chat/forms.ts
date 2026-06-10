@@ -1,4 +1,4 @@
-import type { ConeConversation, Contact } from '@cone/core';
+import { formatTranscriptTime, type ConeConversation, type Contact } from '@cone/core';
 
 import type { ContactEditForm } from './types';
 
@@ -6,8 +6,8 @@ export function createAddContactForm(): ContactEditForm {
   return {
     activeField: 0,
     fields: [
-      { key: 'name', label: 'Local display name', value: '' },
-      { key: 'identity', label: 'Inbox ID or EVM address', value: '' },
+      { key: 'name', label: 'Name', value: '' },
+      { key: 'identity', label: 'XMTP inbox ID or EVM address', value: '' },
     ],
     kind: 'add',
     title: 'Add contact',
@@ -17,7 +17,7 @@ export function createAddContactForm(): ContactEditForm {
 export function createRenameContactForm(contact: Contact): ContactEditForm {
   return {
     activeField: 0,
-    fields: [{ key: 'name', label: 'Local display name', value: contact.name }],
+    fields: [{ key: 'name', label: 'New name', value: contact.name }],
     kind: 'rename',
     targetContactId: contact.contactId,
     title: `Rename ${contact.name}`,
@@ -65,7 +65,7 @@ export function createPairCreateResultForm(code: string, expiresAt: string): Con
     kind: 'pair-create',
     resultLines: [
       code,
-      `Expires ${expiresAt}`,
+      `Code expires at ${formatTranscriptTime(expiresAt)} — the pairing itself is permanent.`,
       'Give this code to the other person or agent.',
       `CLI: cos pair ${code}`,
     ],
@@ -79,8 +79,8 @@ export function createPairJoinForm(): ContactEditForm {
     activeField: 0,
     fields: [
       { key: 'code', label: 'Handshake code', value: '' },
-      { key: 'shareName', label: 'Share name (optional)', value: '' },
-      { key: 'saveAs', label: 'Save peer as (optional)', value: '' },
+      { key: 'shareName', label: 'Share my name (optional)', value: '' },
+      { key: 'saveAs', label: 'Save the other side as (optional)', value: '' },
     ],
     kind: 'pair-join',
     submitLabel: 'Join',

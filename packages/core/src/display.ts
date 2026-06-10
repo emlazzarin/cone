@@ -33,6 +33,38 @@ export function formatTranscriptLine(input: TranscriptLineInput): string {
   return `${formatTranscriptTime(input.sentAt)} - ${input.sender}: ${input.body}`;
 }
 
+export function formatConversationPreview(message: ConeMessage): string {
+  const body = messageBody(message);
+  return message.direction === 'outbound' ? `you: ${body}` : body;
+}
+
+export function relativeTime(iso: string | undefined, now: number = Date.now()): string {
+  if (!iso) {
+    return '';
+  }
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) {
+    return '';
+  }
+  const seconds = Math.max(0, Math.floor((now - then) / 1000));
+  if (seconds < 45) {
+    return 'now';
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h`;
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 7) {
+    return `${days}d`;
+  }
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(new Date(then));
+}
+
 export function formatConeMessageLine(message: ConeMessage, sender: string): string {
   return formatTranscriptLine({
     body: messageBody(message),
@@ -58,6 +90,53 @@ export function isVisibleChatMessage(message: Pick<ConeMessage, 'json' | 'kind'>
     return !(typeof type === 'string' && type.startsWith('cos.') && type !== 'cos.app.json.v1');
   }
   return true;
+}
+
+// Cone read receipts ride the same control-envelope channel as pairing
+// confirmations: a `cos.read.v1` message sent into a conversation means "I have
+// read everything up to this message's sentAt". They are hidden from the
+// transcript and only interoperate between Cone clients.
+export const READ_RECEIPT_TYPE = 'cos.read.v1';
+
+export function isReadReceipt(message: Pick<ConeMessage, 'json'>): boolean {
+  const json = message.json;
+  return (
+    typeof json === 'object' &&
+    json !== null &&
+    'type' in json &&
+    (json as { type?: unknown }).type === READ_RECEIPT_TYPE
+  );
+}
+
+// The id of the most recent outbound message the peer has read (i.e. sent at or
+// before their latest read receipt), or undefined if none. "Read" is shown only
+// on this single message so the indicator never clutters the transcript.
+export function latestReadOutboundId(messages: ConeMessage[]): string | undefined {
+  let readThroughMs = 0;
+  for (const message of messages) {
+    if (message.direction === 'inbound' && isReadReceipt(message)) {
+      const at = Date.parse(message.sentAt);
+      if (!Number.isNaN(at) && at > readThroughMs) {
+        readThroughMs = at;
+      }
+    }
+  }
+  if (readThroughMs === 0) {
+    return undefined;
+  }
+  let bestId: string | undefined;
+  let bestAt = -1;
+  for (const message of messages) {
+    if (message.direction !== 'outbound' || !isVisibleChatMessage(message)) {
+      continue;
+    }
+    const at = Date.parse(message.sentAt);
+    if (!Number.isNaN(at) && at <= readThroughMs && at > bestAt) {
+      bestAt = at;
+      bestId = message.messageId;
+    }
+  }
+  return bestId;
 }
 
 export function formatSyncStatus(result: SyncResult): string {
@@ -103,6 +182,9 @@ function payloadBody(text: string | undefined, json: unknown): string {
 function humanizeControl(value: { type?: string }): string {
   if (value.type === 'cos.pair.confirm.v1') {
     return '[pair confirmed]';
+  }
+  if (value.type === READ_RECEIPT_TYPE) {
+    return '[read]';
   }
   if (value.type === 'cos.unsupported-message.v1') {
     return '[unsupported message]';

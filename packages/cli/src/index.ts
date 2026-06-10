@@ -140,6 +140,8 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
         await runChat(client, {
           plainLog: context.args.includes('--plain-log'),
           syncOnOpen: !context.args.includes('--no-sync-on-open'),
+          readReceipts: readConfig().readReceipts ?? true,
+          onReadReceiptsChange: (value) => writeConfig({ ...readConfig(), readReceipts: value }),
         });
         return 0;
       }

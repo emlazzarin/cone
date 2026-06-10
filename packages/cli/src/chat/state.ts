@@ -1,4 +1,13 @@
-import type { ConeClient, ConeConversation, ConeIdentity, Contact, IdentityRef } from '@cone/core';
+import {
+  formatConversationPreview,
+  isVisibleChatMessage,
+  type ConeClient,
+  type ConeConversation,
+  type ConeIdentity,
+  type ConeMessage,
+  type Contact,
+  type IdentityRef,
+} from '@cone/core';
 
 import type { ChatState, ContactEditForm } from './types';
 
@@ -7,16 +16,23 @@ export function createChatState(
   conversations: ConeConversation[] = [],
   contacts: Contact[] = [],
 ): ChatState {
-  return {
+  const state: ChatState = {
     contacts,
     conversations,
     draftsByConversation: {},
     editForm: null,
+    filter: '',
+    filterActive: false,
     helpVisible: false,
     identity,
     input: '',
+    lastAckedByConversation: {},
+    lastMessageAtByConversation: {},
     messages: [],
     mode: 'chat-select',
+    pendingMessages: [],
+    previewByConversation: {},
+    readReceipts: true,
     selectedContactIndex: 0,
     selectedIndex: 0,
     status: conversations.length === 0 ? 'waiting for messages' : 'live',
@@ -25,6 +41,55 @@ export function createChatState(
     transcriptScroll: 0,
     unreadByConversation: {},
   };
+  sortConversations(state);
+  return state;
+}
+
+// Builds last-message previews and activity times from the full local message
+// list, then keeps conversations sorted by most recent activity (same order
+// and preview format as the PWA).
+export function applyConversationMeta(state: ChatState, messages: ConeMessage[]): void {
+  const previews: Record<string, string> = {};
+  const lastAt: Record<string, string> = {};
+  for (const message of messages) {
+    if (!isVisibleChatMessage(message)) {
+      continue;
+    }
+    const current = lastAt[message.conversationId];
+    if (!current || message.sentAt > current) {
+      lastAt[message.conversationId] = message.sentAt;
+      previews[message.conversationId] = formatConversationPreview(message);
+    }
+  }
+  state.previewByConversation = previews;
+  state.lastMessageAtByConversation = lastAt;
+  sortConversations(state);
+}
+
+export function conversationActivityAt(state: ChatState, conversation: ConeConversation): string {
+  const lastMessageAt = state.lastMessageAtByConversation[conversation.conversationId];
+  const updatedAt = conversation.updatedAt ?? '';
+  return lastMessageAt && lastMessageAt > updatedAt ? lastMessageAt : updatedAt;
+}
+
+export function visibleConversations(state: ChatState): ConeConversation[] {
+  const query = state.filter.trim().toLocaleLowerCase();
+  if (!query) {
+    return state.conversations;
+  }
+  return state.conversations.filter(
+    (conversation) =>
+      conversation.title.toLocaleLowerCase().includes(query) ||
+      conversation.peerInboxId.toLocaleLowerCase().includes(query),
+  );
+}
+
+function sortConversations(state: ChatState): void {
+  state.conversations.sort((left, right) => {
+    const leftAt = conversationActivityAt(state, left);
+    const rightAt = conversationActivityAt(state, right);
+    return leftAt < rightAt ? 1 : leftAt > rightAt ? -1 : 0;
+  });
 }
 
 export function enterChatSelect(state: ChatState): void {
@@ -74,7 +139,8 @@ export function enterChatForSelectedContact(state: ChatState): void {
     state.status = 'no contact selected';
     return;
   }
-  const conversationIndex = state.conversations.findIndex((conversation) => conversation.peerInboxId === contact.inboxId);
+  clearFilter(state);
+  const conversationIndex = visibleConversations(state).findIndex((conversation) => conversation.peerInboxId === contact.inboxId);
   if (conversationIndex >= 0) {
     state.selectedIndex = conversationIndex;
     state.activeContactId = undefined;
@@ -85,16 +151,47 @@ export function enterChatForSelectedContact(state: ChatState): void {
   enterChatTalk(state);
 }
 
+export function clearFilter(state: ChatState): void {
+  const selectedId = selectedConversation(state)?.conversationId;
+  state.filter = '';
+  state.filterActive = false;
+  if (selectedId) {
+    preserveSelection(state, selectedId, undefined);
+  }
+  clampSelections(state);
+}
+
 export async function refreshMessages(client: ConeClient, state: ChatState): Promise<void> {
   const conversation = selectedConversation(state);
   state.messages = conversation && !state.activeContactId ? await client.listMessages(conversation.conversationId) : [];
   if (conversation && state.transcriptScroll === 0) {
     delete state.unreadByConversation[conversation.conversationId];
+    maybeSendReadReceipt(client, state, conversation);
   }
 }
 
+// Viewing the latest of a conversation = reading it. When read receipts are on,
+// acknowledge the newest inbound message to the peer, deduped so we only send
+// when something new has actually arrived.
+function maybeSendReadReceipt(client: ConeClient, state: ChatState, conversation: ConeConversation): void {
+  if (!state.readReceipts) {
+    return;
+  }
+  let newestInbound = '';
+  for (const message of state.messages) {
+    if (message.direction === 'inbound' && isVisibleChatMessage(message) && message.sentAt > newestInbound) {
+      newestInbound = message.sentAt;
+    }
+  }
+  if (!newestInbound || (state.lastAckedByConversation[conversation.conversationId] ?? '') >= newestInbound) {
+    return;
+  }
+  state.lastAckedByConversation[conversation.conversationId] = newestInbound;
+  void client.sendReadReceipt(conversation.peerInboxId);
+}
+
 export function selectedConversation(state: ChatState): ConeConversation | undefined {
-  return state.activeContactId ? undefined : state.conversations[state.selectedIndex];
+  return state.activeContactId ? undefined : visibleConversations(state)[state.selectedIndex];
 }
 
 export function selectedContact(state: ChatState): Contact | undefined {
@@ -109,7 +206,7 @@ export function activeContact(state: ChatState): Contact | undefined {
 
 export function selectConversation(state: ChatState, delta: number): void {
   state.activeContactId = undefined;
-  state.selectedIndex = clampIndex(state.selectedIndex + delta, state.conversations.length);
+  state.selectedIndex = clampIndex(state.selectedIndex + delta, visibleConversations(state).length);
   state.transcriptScroll = 0;
   loadDraft(state);
 }
@@ -119,7 +216,7 @@ export function selectContact(state: ChatState, delta: number): void {
 }
 
 export function clampSelections(state: ChatState): void {
-  state.selectedIndex = clampIndex(state.selectedIndex, state.conversations.length);
+  state.selectedIndex = clampIndex(state.selectedIndex, visibleConversations(state).length);
   state.selectedContactIndex = clampIndex(state.selectedContactIndex, state.contacts.length);
 }
 
@@ -137,7 +234,7 @@ export function loadDraft(state: ChatState): void {
 
 export function preserveSelection(state: ChatState, conversationId: string | undefined, contactId: string | undefined): void {
   if (conversationId) {
-    const index = state.conversations.findIndex((conversation) => conversation.conversationId === conversationId);
+    const index = visibleConversations(state).findIndex((conversation) => conversation.conversationId === conversationId);
     if (index >= 0) {
       state.selectedIndex = index;
     }
@@ -158,7 +255,7 @@ export function promoteActiveContactConversation(state: ChatState): void {
   if (!contact) {
     return;
   }
-  const index = state.conversations.findIndex((conversation) => conversation.peerInboxId === contact.inboxId);
+  const index = visibleConversations(state).findIndex((conversation) => conversation.peerInboxId === contact.inboxId);
   if (index >= 0) {
     state.selectedIndex = index;
     state.activeContactId = undefined;
@@ -181,13 +278,19 @@ export function isContactsMode(state: ChatState): boolean {
   return state.mode === 'contacts-select' || state.mode === 'contacts-edit';
 }
 
-function draftKey(state: ChatState): string | undefined {
+// Shared by drafts and optimistic sends: the stable key for "what the
+// composer is pointed at" — a conversation, or a contact with no chat yet.
+export function composerKey(state: ChatState): string | undefined {
   const contact = activeContact(state);
   const conversation = selectedConversation(state);
   if (contact) {
     return `contact:${contact.contactId}`;
   }
   return conversation?.conversationId;
+}
+
+function draftKey(state: ChatState): string | undefined {
+  return composerKey(state);
 }
 
 function clampIndex(index: number, count: number): number {

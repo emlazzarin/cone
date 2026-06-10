@@ -42,12 +42,27 @@ export function accent(value: string): string {
   return `${ESC}33m${value}${ESC}0m`;
 }
 
+export function danger(value: string): string {
+  return `${ESC}31m${value}${ESC}0m`;
+}
+
+export function success(value: string): string {
+  return `${ESC}32m${value}${ESC}0m`;
+}
+
 export function inputField(value: string): string {
   return `${ESC}30;47m${value}${ESC}0m`;
 }
 
 export function stripAnsi(value: string): string {
   return value.replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+}
+
+export function ellipsize(value: string, max: number): string {
+  if (max <= 0) {
+    return '';
+  }
+  return value.length > max ? `${value.slice(0, Math.max(0, max - 1))}…` : value;
 }
 
 export function tailLine(value: string, width: number): string {

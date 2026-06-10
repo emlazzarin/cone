@@ -12,6 +12,9 @@ import {
 } from './forms';
 import {
   activeContact,
+  clampSelections,
+  clearFilter,
+  composerKey,
   enterChatForSelectedContact,
   enterChatSelect,
   enterChatTalk,
@@ -25,8 +28,9 @@ import {
   sendTargetForState,
   startChatCompose,
   startContactsEdit,
+  visibleConversations,
 } from './state';
-import type { ChatState, ContactEditForm, RefreshChat, SyncNow } from './types';
+import type { ChatState, ContactEditForm, PendingMessage, RefreshChat, SyncNow } from './types';
 import { deleteLastWord, errorMessage, isChatsShortcut, isContactsShortcut, isPrintableInput, shortId } from './text';
 
 export async function handleInput(
@@ -94,6 +98,21 @@ async function handleChatSelectInput(
   syncNow: SyncNow,
   quit: () => Promise<void>,
 ): Promise<void> {
+  if (state.filterActive) {
+    await handleFilterInput(input, client, state);
+    return;
+  }
+  if (input === '/') {
+    state.filterActive = true;
+    state.status = 'type to filter chats';
+    return;
+  }
+  if (input === '\u001b' && state.filter) {
+    clearFilter(state);
+    state.status = 'filter cleared';
+    await refreshMessages(client, state);
+    return;
+  }
   if (input === 'q') {
     await quit();
     return;
@@ -101,6 +120,10 @@ async function handleChatSelectInput(
   if (input === '?') {
     state.helpVisible = true;
     state.status = 'help';
+    return;
+  }
+  if (input === 'R') {
+    toggleReadReceipts(state);
     return;
   }
   if (input === 'n') {
@@ -139,8 +162,65 @@ async function handleChatSelectInput(
   }
 }
 
+// Live chat filter: printable keys narrow the list, arrows move within the
+// matches, Enter keeps the filter, Esc clears it.
+async function handleFilterInput(input: string, client: ConeClient, state: ChatState): Promise<void> {
+  if (input === '\u001b') {
+    clearFilter(state);
+    state.status = 'filter cleared';
+    await refreshMessages(client, state);
+    return;
+  }
+  if (input === '\r' || input === '\n') {
+    state.filterActive = false;
+    const matches = visibleConversations(state).length;
+    state.status = state.filter ? `filter: ${state.filter} (${matches} match${matches === 1 ? '' : 'es'})` : 'filter cleared';
+    return;
+  }
+  if (input === '\u001b[A') {
+    selectConversation(state, -1);
+    await refreshMessages(client, state);
+    return;
+  }
+  if (input === '\u001b[B') {
+    selectConversation(state, 1);
+    await refreshMessages(client, state);
+    return;
+  }
+  if (input === '\u0015') {
+    state.filter = '';
+    state.selectedIndex = 0;
+    clampSelections(state);
+    await refreshMessages(client, state);
+    return;
+  }
+  if (input === '\u007f') {
+    state.filter = state.filter.slice(0, -1);
+    state.selectedIndex = 0;
+    clampSelections(state);
+    await refreshMessages(client, state);
+    return;
+  }
+  if (isPrintableInput(input)) {
+    state.filter += input;
+    state.selectedIndex = 0;
+    clampSelections(state);
+    await refreshMessages(client, state);
+  }
+}
+
 function canRetrySync(state: ChatState): boolean {
   return state.syncState === 'stale' || state.streamState === 'offline';
+}
+
+// Symmetric toggle: turning receipts off stops sending them and hides peer read
+// state. runChat persists the new value to CLI config.
+function toggleReadReceipts(state: ChatState): void {
+  state.readReceipts = !state.readReceipts;
+  if (!state.readReceipts) {
+    state.lastAckedByConversation = {};
+  }
+  state.status = `read receipts ${state.readReceipts ? 'on' : 'off'}`;
 }
 
 async function handleChatTalkInput(
@@ -175,21 +255,40 @@ async function handleChatTalkInput(
   if (input === '\r' || input === '\n') {
     const text = state.input.trim();
     const target = sendTargetForState(state);
-    if (!text || !target) {
+    const key = composerKey(state);
+    if (!text || !target || !key) {
       return;
     }
     state.input = '';
     saveDraft(state);
+    // Optimistic: the message lands in the transcript immediately. A retried
+    // send supersedes any earlier failed row for the same target.
+    const pending: PendingMessage = {
+      id: `pending-${Date.now()}-${(pendingSequence += 1)}`,
+      key,
+      sentAt: new Date().toISOString(),
+      status: 'sending',
+      text,
+    };
+    state.pendingMessages = [...state.pendingMessages.filter((entry) => !(entry.key === key && entry.status === 'failed')), pending];
     state.status = `sending to ${selectedConversation(state)?.title ?? activeContact(state)?.name}`;
     void client.sendText(target, text)
       .then(async () => {
+        state.pendingMessages = state.pendingMessages.filter((entry) => entry.id !== pending.id);
         state.status = `sent to ${selectedConversation(state)?.title ?? activeContact(state)?.name}`;
         await refresh();
       })
       .catch(async (error: unknown) => {
-        state.input = text;
-        saveDraft(state);
-        state.status = `send failed: ${errorMessage(error)}`;
+        state.pendingMessages = state.pendingMessages.map((entry) =>
+          entry.id === pending.id ? { ...entry, status: 'failed' as const } : entry,
+        );
+        // Restore for retry only if the composer is still empty and pointed
+        // at the same chat — never clobber newer typing.
+        if (!state.input && composerKey(state) === key) {
+          state.input = text;
+          saveDraft(state);
+        }
+        state.status = `send failed: ${errorMessage(error)} — Enter retries`;
         await refresh({ preserveScroll: true });
       });
     return;
@@ -199,6 +298,8 @@ async function handleChatTalkInput(
     saveDraft(state);
   }
 }
+
+let pendingSequence = 0;
 
 async function handleChatComposeInput(
   input: string,
@@ -249,6 +350,10 @@ async function handleContactsSelectInput(
   if (input === '?') {
     state.helpVisible = true;
     state.status = 'help';
+    return;
+  }
+  if (input === 'R') {
+    toggleReadReceipts(state);
     return;
   }
   if (input === 'a') {
@@ -413,9 +518,10 @@ async function submitNewMessage(client: ConeClient, state: ChatState, refresh: R
   const sent = await client.sendText(to, text);
   state.status = `sent to ${to}`;
   enterChatSelect(state);
+  clearFilter(state);
   await refresh();
   if (sent.conversationId) {
-    const conversationIndex = state.conversations.findIndex((conversation) => conversation.conversationId === sent.conversationId);
+    const conversationIndex = visibleConversations(state).findIndex((conversation) => conversation.conversationId === sent.conversationId);
     if (conversationIndex >= 0) {
       state.selectedIndex = conversationIndex;
       await refreshMessages(client, state);

@@ -110,6 +110,17 @@ describe('ConeClient', () => {
     expect(message?.json).toMatchObject({ type: 'cos.pair.confirm.v1' });
   });
 
+  test('sendReadReceipt publishes a cos.read.v1 envelope without persisting it locally', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+
+    await client.sendReadReceipt({ inboxId: 'inbox-peer' });
+
+    expect(adapter.sent.at(-1)).toEqual({ inboxId: 'inbox-peer', text: JSON.stringify({ type: 'cos.read.v1' }) });
+    // Our own receipts are fire-and-forget; only the peer's receipts matter.
+    expect(await client.listMessages()).toHaveLength(0);
+  });
+
   test('sync persists conversations and messages into the local read model', async () => {
     const adapter = new FakeAdapter();
     adapter.conversations = [{

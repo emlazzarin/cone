@@ -248,6 +248,10 @@ class MockClient implements ConeClient {
     return Promise.resolve({ messageId: 'msg-json', sentAt: new Date().toISOString() });
   }
 
+  sendReadReceipt(): Promise<void> {
+    return Promise.resolve();
+  }
+
   sync(): Promise<SyncResult> {
     this.synced = true;
     return Promise.resolve({

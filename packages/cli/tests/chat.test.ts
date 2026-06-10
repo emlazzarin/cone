@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import type { ConeClient, SentMessage } from '@cone/core';
 
 import {
+  applyConversationMeta,
   createAddContactForm,
   createChatState,
   createDeleteContactForm,
@@ -14,6 +15,7 @@ import {
   InputDecoder,
   messageBody,
   renderChat,
+  visibleConversations,
   wrapText,
 } from '../src/chat';
 
@@ -41,18 +43,19 @@ describe('cos chat', () => {
 
     const output = renderChat(state, 100, 24);
 
-    expect(output).toContain('Cone of Silence');
+    expect(output).toContain('Cone of Silence ·dev');
     expect(output).toContain('1 Chats');
     expect(output).toContain('2 Contacts');
-    expect(output).toContain('Chats select');
+    expect(output).toContain('live');
     expect(output).toContain('PWA Tester');
-    expect(output).toContain('acct inbox-...long');
-    expect(output).toContain('0 unread');
+    expect(output).toContain('you inbox-...long');
     expect(output).toContain("16:39 - PWA Tester: hey what's your name");
     expect(output).toContain('Enter talk');
     expect(output).toContain('n new message');
-    expect(output).toContain('d delete local chat');
-    expect(output).toContain('2 contacts');
+    expect(output).toContain('/ filter');
+    expect(output).toContain('d delete');
+    expect(output).not.toContain('unread');
+    expect(output).not.toContain('Chats select');
     expect(output).not.toContain('s sync');
     expect(output).not.toContain('Chat(select)');
     expect(output).not.toContain('sync:idle stream:online');
@@ -74,13 +77,12 @@ describe('cos chat', () => {
 
     const output = renderChat(state, 80, 20);
 
-    expect(output).toContain('Chat talk');
     expect(output).toContain('Bob');
     expect(output).toContain('Message:');
     expect(output).toContain('jk are text here');
     expect(output).toContain('█');
-    expect(output).toContain('Esc chat list');
-    expect(output).toContain('2 contacts');
+    expect(output).toContain('Enter send');
+    expect(output).toContain('Esc back');
     expect(output).not.toContain('message Bob:');
     expect(output).not.toContain('Tab focus');
     expect(output).not.toContain('[p] pair');
@@ -107,7 +109,7 @@ describe('cos chat', () => {
     expect(output).toContain('[contacts]');
     expect(output).toContain('[contact]');
     expect(output).toContain('Bob');
-    expect(output).toContain('Inbox ID: inbox-bob-long');
+    expect(output).toContain('XMTP inbox ID: inbox-bob-long');
     expect(output).toContain('EVM address: 0x1111111111111111111111111111111111111111');
     expect(output).toContain('Source: paired');
     expect(output).toContain('Created: 2026-01-01T00:00:00.000Z');
@@ -128,8 +130,8 @@ describe('cos chat', () => {
     const output = renderChat(state, 100, 20);
 
     expect(output).toContain('[Add contact]');
-    expect(output).toContain('> Local display name: Dana Laptop');
-    expect(output).toContain('Inbox ID or EVM address: inbox-dana');
+    expect(output).toContain('> Name: Dana Laptop');
+    expect(output).toContain('XMTP inbox ID or EVM address: inbox-dana');
     expect(output).toContain('Tab next field');
     expect(output).toContain('Shift+Tab previous');
     expect(output).not.toContain('name | inbox-or-address');
@@ -157,9 +159,10 @@ describe('cos chat', () => {
     expect(renderChat(deleteState, 90, 18)).toContain('Type DELETE to confirm');
     expect(renderChat(pairState, 90, 18)).toContain('Handshake code');
     expect(renderChat(pairState, 90, 18)).not.toContain('blank creates one');
-    expect(renderChat(pairState, 90, 18)).toContain('Share name (optional)');
-    expect(renderChat(pairState, 90, 18)).toContain('Save peer as (optional)');
+    expect(renderChat(pairState, 90, 18)).toContain('Share my name (optional)');
+    expect(renderChat(pairState, 90, 18)).toContain('Save the other side as (optional)');
     expect(renderChat(codeState, 90, 18)).toContain('forest-wormhole-direction');
+    expect(renderChat(codeState, 90, 18)).toContain('Code expires at');
     expect(renderChat(codeState, 90, 18)).toContain('CLI: cos pair forest-wormhole-direction');
   });
 
@@ -247,6 +250,116 @@ describe('cos chat', () => {
     expect(refreshes).toBe(1);
   });
 
+  test('renders optimistic outbound rows instantly and marks failures with retry', async () => {
+    const conversation = {
+      conversationId: 'dm-bob',
+      peerInboxId: 'inbox-bob',
+      title: 'Bob',
+    };
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
+    state.mode = 'chat-talk';
+    state.input = 'hello optimism';
+    let rejectSend: ((error: Error) => void) | undefined;
+    const client = stubClient({
+      sendText: () => new Promise<SentMessage>((_resolve, reject) => {
+        rejectSend = reject;
+      }),
+    });
+
+    await handleInput('\n', client, state, async () => {}, async () => {}, async () => {});
+
+    // The row is in the transcript before the network resolves, unmarked.
+    const optimistic = renderChat(state, 100, 24);
+    expect(optimistic).toContain('me: hello optimism');
+    expect(optimistic).not.toContain('✗');
+    expect(state.input).toBe('');
+
+    rejectSend?.(new Error('network down'));
+    await delay(0);
+
+    // Failure marks the row and restores the text for an instant retry.
+    const failed = renderChat(state, 100, 24);
+    expect(failed).toContain('✗');
+    expect(failed).toContain('hello optimism');
+    expect(state.input).toBe('hello optimism');
+    expect(state.status).toContain('send failed');
+
+    // Retrying supersedes the failed row; on success the pending row is
+    // dropped and refresh surfaces the delivered copy from the store.
+    const retryClient = stubClient();
+    const refreshWithDelivered = async () => {
+      state.messages = [{
+        conversationId: 'dm-bob',
+        direction: 'outbound' as const,
+        kind: 'text' as const,
+        messageId: 'real-1',
+        senderInboxId: 'inbox-alice',
+        sentAt: new Date().toISOString(),
+        text: 'hello optimism',
+      }];
+    };
+    await handleInput('\n', retryClient, state, refreshWithDelivered, async () => {}, async () => {});
+    await delay(0);
+    const retried = renderChat(state, 100, 24);
+    expect(retried).toContain('me: hello optimism');
+    expect(retried).not.toContain('✗');
+    expect(state.pendingMessages).toHaveLength(0);
+  });
+
+  test('shows a single ✓✓ Read marker on the latest read outbound message', () => {
+    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
+    state.messages = [
+      { conversationId: 'dm-bob', direction: 'outbound', kind: 'text', messageId: 'o1', senderInboxId: 'inbox-alice', sentAt: '2026-01-01T10:00:00.000Z', text: 'first' },
+      { conversationId: 'dm-bob', direction: 'outbound', kind: 'text', messageId: 'o2', senderInboxId: 'inbox-alice', sentAt: '2026-01-01T10:01:00.000Z', text: 'second' },
+      { conversationId: 'dm-bob', direction: 'inbound', kind: 'control', messageId: 'r1', senderInboxId: 'inbox-bob', sentAt: '2026-01-01T10:02:00.000Z', json: { type: 'cos.read.v1' } },
+    ];
+
+    const output = renderChat(state, 80, 16);
+    expect(output).toContain('✓✓ Read');
+    // The read receipt itself is never shown as a transcript line.
+    expect(output).not.toContain('[read]');
+    // Exactly one marker.
+    expect(output.match(/Read/g)?.length).toBe(1);
+  });
+
+  test('hides read state and the receipt line when read receipts are off', () => {
+    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
+    state.readReceipts = false;
+    state.messages = [
+      { conversationId: 'dm-bob', direction: 'outbound', kind: 'text', messageId: 'o1', senderInboxId: 'inbox-alice', sentAt: '2026-01-01T10:00:00.000Z', text: 'first' },
+      { conversationId: 'dm-bob', direction: 'inbound', kind: 'control', messageId: 'r1', senderInboxId: 'inbox-bob', sentAt: '2026-01-01T10:02:00.000Z', json: { type: 'cos.read.v1' } },
+    ];
+
+    const output = renderChat(state, 80, 16);
+    expect(output).not.toContain('✓✓ Read');
+    expect(output).toContain('receipts off');
+  });
+
+  test('R toggles read receipts and sends one when viewing new inbound messages', async () => {
+    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
+    const receipts: string[] = [];
+    const client = stubClient({
+      listMessages: async () => [
+        { conversationId: 'dm-bob', direction: 'inbound', kind: 'text', messageId: 'i1', senderInboxId: 'inbox-bob', sentAt: '2026-01-01T10:00:00.000Z', text: 'hi' },
+      ],
+      sendReadReceipt: async (to) => { receipts.push(String(to)); },
+    });
+
+    // Viewing the conversation acknowledges the newest inbound message once.
+    await handleInput('j', client, state, async () => {}, async () => {}, async () => {});
+    expect(receipts).toEqual(['inbox-bob']);
+    await handleInput('j', client, state, async () => {}, async () => {}, async () => {});
+    expect(receipts).toEqual(['inbox-bob']); // deduped — nothing new arrived
+
+    // Turning receipts off stops sending and is reflected in the top bar.
+    await handleInput('R', client, state, async () => {}, async () => {}, async () => {});
+    expect(state.readReceipts).toBe(false);
+    expect(state.status).toContain('read receipts off');
+  });
+
   test('renders structured new-message form with target suggestions', () => {
     const state = createChatState(
       { env: 'dev', inboxId: 'inbox-alice' },
@@ -294,6 +407,78 @@ describe('cos chat', () => {
 
     expect(output).toContain('> Chat 29');
     expect(output).not.toContain('Chat 0');
+  });
+
+  test('sorts chats by recency and shows previews, times, and unread badges', () => {
+    const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+    const state = createChatState(
+      { env: 'dev', inboxId: 'inbox-alice' },
+      [
+        { conversationId: 'dm-old', peerInboxId: 'inbox-old', title: 'Old Chat', updatedAt: minutesAgo(60 * 24 * 2) },
+        { conversationId: 'dm-new', peerInboxId: 'inbox-new', title: 'Fresh Chat', updatedAt: minutesAgo(60) },
+      ],
+    );
+    applyConversationMeta(state, [
+      {
+        conversationId: 'dm-old',
+        direction: 'outbound',
+        kind: 'text',
+        messageId: 'm-old',
+        senderInboxId: 'inbox-alice',
+        sentAt: minutesAgo(60 * 24 * 2),
+        text: 'see you tomorrow',
+      },
+      {
+        conversationId: 'dm-new',
+        direction: 'inbound',
+        kind: 'text',
+        messageId: 'm-new',
+        senderInboxId: 'inbox-new',
+        sentAt: minutesAgo(2),
+        text: 'are you around?',
+      },
+    ]);
+    state.unreadByConversation['dm-new'] = 2;
+
+    expect(state.conversations[0]?.conversationId).toBe('dm-new');
+    const output = renderChat(state, 100, 24);
+    expect(output).toContain('Fresh Chat');
+    expect(output).toContain('are you around?');
+    expect(output).toContain('you: see you tomorrow');
+    expect(output).toContain('2m');
+    expect(output).toContain('●2');
+    expect(output).toContain('2 new');
+  });
+
+  test('filters chats live with / and clears with Esc', async () => {
+    const client = stubClient();
+    const refresh = async () => {};
+    const syncNow = async () => {};
+    const quit = async () => {};
+    const state = createChatState(
+      { env: 'dev', inboxId: 'inbox-alice' },
+      [
+        { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' },
+        { conversationId: 'dm-codex', peerInboxId: 'inbox-codex', title: 'Codex' },
+      ],
+    );
+
+    await handleInput('/', client, state, refresh, syncNow, quit);
+    expect(state.filterActive).toBe(true);
+
+    await handleInput('c', client, state, refresh, syncNow, quit);
+    await handleInput('o', client, state, refresh, syncNow, quit);
+    expect(state.filter).toBe('co');
+    expect(visibleConversations(state).map((conversation) => conversation.title)).toEqual(['Codex']);
+    expect(renderChat(state, 100, 24)).toContain('[chats /co 1/2]');
+
+    await handleInput('\r', client, state, refresh, syncNow, quit);
+    expect(state.filterActive).toBe(false);
+    expect(state.filter).toBe('co');
+
+    await handleInput('\u001b', client, state, refresh, syncNow, quit);
+    expect(state.filter).toBe('');
+    expect(visibleConversations(state)).toHaveLength(2);
   });
 
   test('humanizes Cone JSON envelopes instead of dumping protocol wrappers', () => {
@@ -426,6 +611,7 @@ function stubClient(overrides: Partial<ConeClient> = {}): ConeClient {
       address: input.address,
     }),
     sendJson: async () => ({ messageId: 'sent-json', sentAt: '2026-01-01T00:00:00.000Z' }),
+    sendReadReceipt: async () => {},
     sendText: async () => ({ conversationId: 'dm-peer', messageId: 'sent-text', sentAt: '2026-01-01T00:00:00.000Z' }),
     streamMessages: async () => () => {},
     sync: async () => ({

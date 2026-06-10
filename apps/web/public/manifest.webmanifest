@@ -4,8 +4,8 @@
   "description": "XMTP messaging from a portable Cone secret key.",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f6f2e8",
-  "theme_color": "#103b36",
+  "background_color": "#0a0c0a",
+  "theme_color": "#0a0c0a",
   "icons": [
     {
       "src": "/icon.svg",

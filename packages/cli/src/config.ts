@@ -7,6 +7,7 @@ import { defaultConfigPath } from './paths';
 
 export interface CliConfig {
   secretKey?: string;
+  readReceipts?: boolean;
 }
 
 export function readConfig(path = defaultConfigPath()): CliConfig {

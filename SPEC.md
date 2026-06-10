@@ -29,7 +29,17 @@ By default, the CLI uses one remembered secret and one local state database. `CO
 
 CLI output is JSON by default for agent use. `--plain` switches supported commands to human-readable output.
 
-`cos inbox sync`, `cos inbox`, and `cos inbox read <conversationId|contactName|inboxId>` provide non-TUI validation surfaces for the local inbox read model. `cos chat` opens a lightweight terminal UI with four primary modes: `Chat(select)`, `Chat(talk)`, `Contacts(select)`, and `Contacts(edit)`. `Chat(select)` also exposes `n` for a structured new-message form with contact/conversation suggestions. Contacts expose explicit pairing actions: `c` creates a code and `p` joins a code.
+`cos inbox sync`, `cos inbox`, and `cos inbox read <conversationId|contactName|inboxId>` provide non-TUI validation surfaces for the local inbox read model. `cos chat` opens a lightweight terminal UI with four primary modes: `Chat(select)`, `Chat(talk)`, `Contacts(select)`, and `Contacts(edit)`. The chat list is sorted by most recent activity and shows last-message previews, relative times, and unread counts (shared formatting with the PWA via `@cone/core`). `Chat(select)` exposes `n` for a structured new-message form with contact/conversation suggestions and `/` for a live chat filter. Contacts expose explicit pairing actions: `c` creates a code and `p` joins a code.
+
+## PWA Interaction
+
+The PWA is pointer- and touch-native with TUI-parity accelerators. It has no explicit select/talk modes; focus expresses the mode (typing in the composer vs. navigating). `1–5` switch sections (Chats, Contacts, Pair, Backup, Settings), `j/k` move the chat selection, `Enter` opens the selected chat (or starts a new message when none is selected), `n` composes a new message, `/` filters chats, `?` toggles a help overlay, `Esc` leaves typing. Conversation rows show avatar, last-message preview, relative time, and unread count; transcript lines share the CLI `HH:MM - sender: body` format. Read markers are stored locally per account.
+
+Both surfaces render outbound sends optimistically: the message is appended to the transcript and the composer clears before the network round-trip resolves. A delivered message is reconciled against the optimistic row (matched by body and a five-minute send-time window); a failed send is marked and offers an immediate retry. Optimistic rows are local-only and never persisted.
+
+## Read Receipts
+
+Read receipts are a Cone control message (`cos.read.v1`) sent into a conversation, riding the same envelope channel as pairing confirmations rather than the XMTP-native read-receipt content type — so they require no adapter changes and interoperate only between Cone clients. They are hidden from the transcript. When a conversation is viewed with read receipts enabled, the client sends one receipt acknowledging the newest inbound message, deduped so repeated views don't re-send. `latestReadOutboundId` derives, from the peer's most recent receipt, the single most recent outbound message at or before it; both surfaces show one `✓✓ Read` marker there. The setting defaults on, persists per surface (PWA: localStorage per account; CLI: `readReceipts` in config), and is symmetric: when off, the client neither sends receipts nor shows peer read state, and only failed sends are marked.
 
 ## Pairing
 
