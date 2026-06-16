@@ -8,6 +8,7 @@ import {
   deriveAccount,
   MemoryStore,
   secretKeyFromHexSeed,
+  type ConeConsentState,
   type ConeConversation,
   type ConeIdentity,
   type IncomingMessage,
@@ -151,6 +152,54 @@ class PairingAdapter implements XmtpAdapter {
 
   listMessages(): Promise<IncomingMessage[]> {
     return Promise.resolve([]);
+  }
+
+  setConsent(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  getConsent(): Promise<ConeConsentState> {
+    return Promise.resolve('unknown');
+  }
+
+  setGroupConsent(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  sendToConversation(): Promise<SentMessage> {
+    return Promise.resolve({ messageId: crypto.randomUUID(), sentAt: new Date().toISOString() });
+  }
+
+  createGroup(): Promise<ConeConversation> {
+    return Promise.reject(new Error('groups unsupported in pairing tests'));
+  }
+
+  getGroupInfo(): Promise<ConeConversation | null> {
+    return Promise.resolve(null);
+  }
+
+  listGroupMembers(): Promise<never[]> {
+    return Promise.resolve([]);
+  }
+
+  addGroupMembers(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  removeGroupMembers(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  leaveGroup(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  setRetention(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  getRetention(): Promise<null> {
+    return Promise.resolve(null);
   }
 }
 

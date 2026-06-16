@@ -1,4 +1,4 @@
-import { Client, IdentifierKind, type ClientOptions, type Identifier, type XmtpEnv as SdkXmtpEnv } from '@xmtp/browser-sdk';
+import { Client, ConsentEntityType, ConsentState, ConversationType, GroupPermissionsOptions, IdentifierKind, PermissionLevel, type ClientOptions, type Identifier, type XmtpEnv as SdkXmtpEnv } from '@xmtp/browser-sdk';
 import { hexToBytes, type DerivedAccount, type XmtpAdapter } from '@cone/core';
 import { createSdkXmtpAdapter, type SdkClient, type SdkDm } from '@cone/core/xmtp';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -36,6 +36,21 @@ export async function createBrowserXmtpAdapter(options: BrowserXmtpAdapterOption
     env: options.account.env,
     address,
     ethereumIdentifierKind: IdentifierKind.Ethereum,
+    consent: {
+      unknown: ConsentState.Unknown,
+      allowed: ConsentState.Allowed,
+      denied: ConsentState.Denied,
+      inboxEntityType: ConsentEntityType.InboxId,
+      groupEntityType: ConsentEntityType.GroupId,
+    },
+    permissionLevels: {
+      member: PermissionLevel.Member,
+      admin: PermissionLevel.Admin,
+      superAdmin: PermissionLevel.SuperAdmin,
+    },
+    adminOnlyPermissions: GroupPermissionsOptions.AdminOnly,
+    dmConversationType: ConversationType.Dm,
+    groupConversationType: ConversationType.Group,
     // peerInboxId is an async method on browser-sdk DMs.
     peerInboxId: (dm: SdkDm) => (dm as unknown as { peerInboxId(): Promise<string> }).peerInboxId(),
   });

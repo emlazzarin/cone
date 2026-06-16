@@ -1,12 +1,15 @@
 import {
+  GROUP_UPDATE_TYPE,
   PAIR_CONFIRM_TYPE,
   READ_RECEIPT_TYPE,
   UNSUPPORTED_MESSAGE_TYPE,
   envelopeType,
   isAppJsonEnvelope,
   isControlEnvelope,
+  isGroupUpdateEnvelope,
+  type GroupUpdateEnvelope,
 } from './envelope';
-import type { ConeMessage, MessageDeliveryStatus, SyncResult } from './types';
+import type { ConeConsentState, ConeConversation, ConeMessage, MessageDeliveryStatus, SyncResult } from './types';
 
 export type ConeConnectionStatus = 'catching-up' | 'connecting' | 'live' | 'offline' | 'stale';
 
@@ -93,6 +96,59 @@ export function errorMessage(error: unknown): string {
 
 export function isVisibleChatMessage(message: Pick<ConeMessage, 'json' | 'kind'>): boolean {
   return message.kind !== 'control' && !isControlEnvelope(message.json);
+}
+
+// Main inbox: allowed conversations. Requests: unknown inbound conversations.
+// Denied is excluded from both — only a managed blocked list surfaces it.
+export function isAllowedConversation(conversation: Pick<ConeConversation, 'consentState'>): boolean {
+  return conversation.consentState === 'allowed';
+}
+
+export function isRequestConversation(conversation: Pick<ConeConversation, 'consentState'>): boolean {
+  return conversation.consentState === 'unknown';
+}
+
+export function isDeniedConversation(conversation: Pick<ConeConversation, 'consentState'>): boolean {
+  return conversation.consentState === 'denied';
+}
+
+// Rows stored before groups existed lack `kind`; they are all DMs, so group
+// branches must test positively.
+export function isGroupConversation(conversation: Pick<ConeConversation, 'kind'>): boolean {
+  return conversation.kind === 'group';
+}
+
+// Attributed system lines for a group update ("Alice added Bob", "Carol
+// renamed the group to Crew"). `resolveName` maps inbox IDs to display names
+// (contacts-first); pass-through by default.
+export function formatGroupUpdate(
+  update: GroupUpdateEnvelope,
+  resolveName: (inboxId: string) => string = (inboxId) => inboxId,
+): string[] {
+  const actor = resolveName(update.initiatedByInboxId);
+  const names = (inboxIds: string[]) => inboxIds.map(resolveName).join(', ');
+  const lines: string[] = [];
+  if (update.added.length > 0) {
+    lines.push(`${actor} added ${names(update.added)}`);
+  }
+  if (update.removed.length > 0) {
+    lines.push(`${actor} removed ${names(update.removed)}`);
+  }
+  if (update.left.length > 0) {
+    lines.push(`${names(update.left)} left`);
+  }
+  for (const change of update.metadataChanges) {
+    if (change.field === 'group_name') {
+      lines.push(change.newValue ? `${actor} renamed the group to ${change.newValue}` : `${actor} cleared the group name`);
+    } else if (change.field === 'description') {
+      lines.push(`${actor} updated the group description`);
+    } else if (change.field === 'group_image_url_square') {
+      lines.push(`${actor} updated the group image`);
+    } else if (change.field === 'message_disappear_in_ns' || change.field === 'message_disappear_from_ns') {
+      lines.push(`${actor} changed the disappearing-messages timer`);
+    }
+  }
+  return lines.length > 0 ? lines : [`${actor} updated the group`];
 }
 
 export function isReadReceipt(message: Pick<ConeMessage, 'json'>): boolean {
@@ -198,7 +254,7 @@ function payloadBody(text: string | undefined, json: unknown): string {
       return humanizeValue(parsed.value);
     }
     if (isControlEnvelope(parsed)) {
-      return humanizeControl(envelopeType(parsed)!);
+      return humanizeControl(envelopeType(parsed)!, parsed);
     }
     return text;
   }
@@ -206,12 +262,12 @@ function payloadBody(text: string | undefined, json: unknown): string {
     return humanizeValue(json.value);
   }
   if (isControlEnvelope(json)) {
-    return humanizeControl(envelopeType(json)!);
+    return humanizeControl(envelopeType(json)!, json);
   }
   return humanizeValue(json);
 }
 
-function humanizeControl(type: string): string {
+function humanizeControl(type: string, value?: unknown): string {
   if (type === PAIR_CONFIRM_TYPE) {
     return '[pair confirmed]';
   }
@@ -220,6 +276,9 @@ function humanizeControl(type: string): string {
   }
   if (type === UNSUPPORTED_MESSAGE_TYPE) {
     return '[unsupported message]';
+  }
+  if (type === GROUP_UPDATE_TYPE && isGroupUpdateEnvelope(value)) {
+    return `[${formatGroupUpdate(value).join('; ')}]`;
   }
   return `[${type}]`;
 }

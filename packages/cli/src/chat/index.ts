@@ -37,12 +37,37 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
 
   let unsubscribe: Unsubscribe | undefined;
   let syncTimer: ReturnType<typeof setInterval> | undefined;
+  let expiryTimer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
 
   const render = () => {
     if (!closed) {
       process.stdout.write(renderChat(state, process.stdout.columns ?? 100, process.stdout.rows ?? 30));
     }
+  };
+
+  // Disappearing messages drop from an open transcript the moment they expire,
+  // not at the next sync: re-list right after the earliest visible expiry.
+  // listMessages filters expired rows, so each refresh reschedules naturally.
+  const scheduleExpiryRefresh = () => {
+    if (expiryTimer) {
+      clearTimeout(expiryTimer);
+      expiryTimer = undefined;
+    }
+    let nextAtMs: number | undefined;
+    for (const message of state.messages) {
+      const at = message.expiresAt ? Date.parse(message.expiresAt) : Number.NaN;
+      if (!Number.isNaN(at) && (nextAtMs === undefined || at < nextAtMs)) {
+        nextAtMs = at;
+      }
+    }
+    if (nextAtMs === undefined || closed) {
+      return;
+    }
+    const delay = Math.min(Math.max(50, nextAtMs - Date.now() + 50), 2_147_000_000);
+    expiryTimer = setTimeout(() => {
+      void refresh({ preserveScroll: true }).catch(() => undefined);
+    }, delay);
   };
 
   const refresh = async (refreshOptions: RefreshOptions = {}) => {
@@ -65,6 +90,7 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
     if (!refreshOptions.preserveScroll) {
       state.transcriptScroll = 0;
     }
+    scheduleExpiryRefresh();
     render();
   };
 
@@ -98,12 +124,16 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
     if (syncTimer) {
       clearInterval(syncTimer);
     }
+    if (expiryTimer) {
+      clearTimeout(expiryTimer);
+    }
     await unsubscribe?.();
     restoreTerminal();
   };
 
   setupTerminal();
   try {
+    scheduleExpiryRefresh();
     render();
 
     if (options.syncOnOpen !== false) {
@@ -114,6 +144,8 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
     }
 
     try {
+      // Human surface: stream allowed + unknown so the Requests sub-surface
+      // updates live. (Denied is never streamed; agents get allowed-only.)
       unsubscribe = await client.streamMessages(async (message) => {
         const activeConversationId = selectedConversation(state)?.conversationId;
         const isActiveAtBottom = message.conversationId === activeConversationId && state.transcriptScroll === 0;
@@ -123,7 +155,7 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
         state.streamState = 'online';
         state.status = message.conversationId === activeConversationId ? 'new message' : 'new message in another chat';
         await refresh({ preserveScroll: message.conversationId !== activeConversationId || state.transcriptScroll > 0 });
-      });
+      }, { consentStates: ['allowed', 'unknown'] });
       state.streamState = 'online';
       state.status = 'live';
       render();
@@ -229,6 +261,7 @@ export {
   createPairCreateResultForm,
   createPairJoinForm,
   createRenameContactForm,
+  createTimerForm,
 } from './forms';
 export { renderChat } from './render';
 export { handleInput } from './input';

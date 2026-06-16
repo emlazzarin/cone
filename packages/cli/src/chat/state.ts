@@ -1,5 +1,7 @@
 import {
   formatConversationPreview,
+  isAllowedConversation,
+  isRequestConversation,
   isVisibleChatMessage,
   latestInboundAt,
   type ConeClient,
@@ -31,6 +33,7 @@ export function createChatState(
     lastMessageAtByConversation: {},
     messages: [],
     mode: 'chat-select',
+    scope: 'chats',
     pendingMessages: [],
     previewByConversation: {},
     readReceipts: true,
@@ -73,16 +76,28 @@ export function conversationActivityAt(state: ChatState, conversation: ConeConve
   return lastMessageAt && lastMessageAt > updatedAt ? lastMessageAt : updatedAt;
 }
 
+// Conversations for the current scope: the allowed inbox, or the unknown-sender
+// Requests sub-surface. Denied conversations appear in neither.
+export function scopedConversations(state: ChatState): ConeConversation[] {
+  return state.conversations.filter(state.scope === 'requests' ? isRequestConversation : isAllowedConversation);
+}
+
+// scopedConversations narrowed by the live text filter.
 export function visibleConversations(state: ChatState): ConeConversation[] {
+  const inScope = scopedConversations(state);
   const query = state.filter.trim().toLocaleLowerCase();
   if (!query) {
-    return state.conversations;
+    return inScope;
   }
-  return state.conversations.filter(
+  return inScope.filter(
     (conversation) =>
       conversation.title.toLocaleLowerCase().includes(query) ||
-      conversation.peerInboxId.toLocaleLowerCase().includes(query),
+      (conversation.peerInboxId ?? '').toLocaleLowerCase().includes(query),
   );
+}
+
+export function requestCount(state: ChatState): number {
+  return state.conversations.filter(isRequestConversation).length;
 }
 
 function sortConversations(state: ChatState): void {
@@ -152,6 +167,17 @@ export function enterChatForSelectedContact(state: ChatState): void {
   enterChatTalk(state);
 }
 
+// Toggle the Chats pane between the allowed inbox and the Requests sub-surface.
+export function toggleScope(state: ChatState): void {
+  state.scope = state.scope === 'requests' ? 'chats' : 'requests';
+  state.pendingBlockId = undefined;
+  clearFilter(state);
+  state.selectedIndex = 0;
+  state.activeContactId = undefined;
+  clampSelections(state);
+  state.status = state.scope === 'requests' ? 'requests' : 'chats';
+}
+
 export function clearFilter(state: ChatState): void {
   const selectedId = selectedConversation(state)?.conversationId;
   state.filter = '';
@@ -175,7 +201,10 @@ export async function refreshMessages(client: ConeClient, state: ChatState): Pro
 // acknowledge the newest inbound message to the peer, deduped so we only send
 // when something new has actually arrived.
 function maybeSendReadReceipt(client: ConeClient, state: ChatState, conversation: ConeConversation): void {
-  if (!state.readReceipts) {
+  // Never acknowledge a Request: previewing an unknown (or denied) sender must
+  // not tell them you read it. Receipts are only for allowed conversations,
+  // and DM-only — in a group they would broadcast to every member.
+  if (!state.readReceipts || !isAllowedConversation(conversation) || conversation.kind === 'group' || !conversation.peerInboxId) {
     return;
   }
   const newestInbound = latestInboundAt(state.messages);

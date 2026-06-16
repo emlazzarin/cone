@@ -87,6 +87,12 @@ export class IndexedDbStore implements ConeStore {
     return this.memory.listMessages(conversationId);
   }
 
+  async deleteMessage(messageId: string): Promise<void> {
+    await this.load();
+    await this.memory.deleteMessage(messageId);
+    await this.save();
+  }
+
   async markMessageProcessed(messageId: string): Promise<boolean> {
     await this.load();
     const isNew = await this.memory.markMessageProcessed(messageId);

@@ -1,14 +1,23 @@
-import { errorMessage, type ConeClient, type Contact } from '@cone/core';
+import {
+  RETENTION_PRESETS_MS,
+  errorMessage,
+  formatRetention,
+  parseRetention,
+  type ConeClient,
+  type Contact,
+} from '@cone/core';
 
 import { KEY, isChatsShortcut, isContactsShortcut, isEnter } from './keys';
 import {
   createAddContactForm,
   createDeleteContactForm,
   createDeleteConversationForm,
+  createNamePeerForm,
   createNewMessageForm,
   createPairCreateResultForm,
   createPairJoinForm,
   createRenameContactForm,
+  createTimerForm,
   formValue,
 } from './forms';
 import {
@@ -29,6 +38,7 @@ import {
   sendTargetForState,
   startChatCompose,
   startContactsEdit,
+  toggleScope,
   visibleConversations,
 } from './state';
 import type { ChatState, ContactEditForm, PendingMessage, RefreshChat, SyncNow } from './types';
@@ -74,7 +84,7 @@ export async function handleInput(
   }
 
   if (state.mode === 'chat-select') {
-    await handleChatSelectInput(input, client, state, syncNow, quit);
+    await handleChatSelectInput(input, client, state, refresh, syncNow, quit);
     return;
   }
   if (state.mode === 'chat-talk') {
@@ -96,6 +106,7 @@ async function handleChatSelectInput(
   input: string,
   client: ConeClient,
   state: ChatState,
+  refresh: RefreshChat,
   syncNow: SyncNow,
   quit: () => Promise<void>,
 ): Promise<void> {
@@ -127,6 +138,53 @@ async function handleChatSelectInput(
     toggleReadReceipts(state);
     return;
   }
+  // 't' toggles the Requests sub-surface; 'a'/'b' accept/block the selected
+  // request (block is a two-press confirm). These belong to the Requests scope.
+  if (input === 't') {
+    toggleScope(state);
+    await refreshMessages(client, state);
+    return;
+  }
+  if (state.scope === 'requests' && (input === 'a' || input === 'b')) {
+    await handleRequestDecision(input, client, state, refresh);
+    return;
+  }
+  // Chats-scope actions: name the selected peer, or reach pairing (parity with
+  // the PWA's Pair tab) without first hunting through Contacts.
+  if (state.scope === 'chats' && input === 'r') {
+    const conversation = selectedConversation(state);
+    if (!conversation) {
+      state.status = 'no chat selected';
+      return;
+    }
+    if (conversation.kind === 'group') {
+      state.status = 'groups have no single peer to name';
+      return;
+    }
+    const existing = state.contacts.find((contact) => contact.inboxId === conversation.peerInboxId && contact.source !== 'self');
+    startChatCompose(state, createNamePeerForm(conversation, existing?.name ?? ''));
+    return;
+  }
+  // 'e' sets the selected chat's disappearing-messages timer (expiry).
+  if (state.scope === 'chats' && input === 'e') {
+    const conversation = selectedConversation(state);
+    if (!conversation) {
+      state.status = 'no chat selected';
+      return;
+    }
+    startChatCompose(state, createTimerForm(conversation));
+    return;
+  }
+  if (state.scope === 'chats' && input === 'c') {
+    const created = await client.createHandshakeCode();
+    startContactsEdit(state, createPairCreateResultForm(created.code, created.expiresAt));
+    state.status = 'created pairing code';
+    return;
+  }
+  if (state.scope === 'chats' && input === 'p') {
+    startContactsEdit(state, createPairJoinForm());
+    return;
+  }
   if (input === KEY.ctrlX) {
     discardFailed(state);
     return;
@@ -149,11 +207,13 @@ async function handleChatSelectInput(
     return;
   }
   if (input === KEY.up || input === 'k') {
+    state.pendingBlockId = undefined;
     selectConversation(state, -1);
     await refreshMessages(client, state);
     return;
   }
   if (input === KEY.down || input === 'j') {
+    state.pendingBlockId = undefined;
     selectConversation(state, 1);
     await refreshMessages(client, state);
     return;
@@ -165,6 +225,34 @@ async function handleChatSelectInput(
     }
     enterChatTalk(state);
   }
+}
+
+// Accept (allowed) or block (denied) the selected Request. Accept moves it to
+// the inbox; block is confirmed by pressing 'b' a second time so spam can't be
+// un-blocked by a stray keypress and a real block isn't accidental.
+async function handleRequestDecision(input: string, client: ConeClient, state: ChatState, refresh: RefreshChat): Promise<void> {
+  const conversation = selectedConversation(state);
+  if (!conversation) {
+    state.status = 'no request selected';
+    return;
+  }
+  if (input === 'a') {
+    state.pendingBlockId = undefined;
+    // Conversation-scoped: DMs allow the peer's inbox, groups allow the group.
+    await client.setConversationConsent(conversation.conversationId, 'allowed');
+    state.status = `accepted ${conversation.title}`;
+    await refresh();
+    return;
+  }
+  if (state.pendingBlockId !== conversation.conversationId) {
+    state.pendingBlockId = conversation.conversationId;
+    state.status = `press b again to block ${conversation.title}`;
+    return;
+  }
+  state.pendingBlockId = undefined;
+  await client.setConversationConsent(conversation.conversationId, 'denied');
+  state.status = `blocked ${conversation.title}`;
+  await refresh();
 }
 
 // Live chat filter: printable keys narrow the list, arrows move within the
@@ -272,9 +360,11 @@ async function handleChatTalkInput(
   }
   if (isEnter(input)) {
     const text = state.input.trim();
+    const conversation = selectedConversation(state);
+    const group = conversation?.kind === 'group' ? conversation : undefined;
     const target = sendTargetForState(state);
     const key = composerKey(state);
-    if (!text || !target || !key) {
+    if (!text || !key || (!target && !group)) {
       return;
     }
     state.input = '';
@@ -290,7 +380,8 @@ async function handleChatTalkInput(
     };
     state.pendingMessages = [...state.pendingMessages.filter((entry) => !(entry.key === key && entry.status === 'failed')), pending];
     state.status = `sending to ${selectedConversation(state)?.title ?? activeContact(state)?.name}`;
-    void client.sendText(target, text)
+    // Groups are addressed by conversation, not identity.
+    void (group ? client.sendToConversation(group.conversationId, text) : client.sendText(target!, text))
       .then(async () => {
         state.pendingMessages = state.pendingMessages.filter((entry) => entry.id !== pending.id);
         state.status = `sent to ${selectedConversation(state)?.title ?? activeContact(state)?.name}`;
@@ -336,12 +427,24 @@ async function handleChatComposeInput(
     return;
   }
   if (input === KEY.up || input === KEY.down) {
+    if (form.kind === 'timer') {
+      cycleTimerChoice(form, input === KEY.up ? -1 : 1);
+      return;
+    }
     applyMessageTargetSuggestion(form, state, input === KEY.up ? -1 : 1);
     return;
   }
   if (isEnter(input)) {
     if (form.kind === 'conversation-delete') {
       await submitDeleteConversation(client, state, refresh);
+      return;
+    }
+    if (form.kind === 'name-peer') {
+      await submitNamePeer(client, state, refresh);
+      return;
+    }
+    if (form.kind === 'timer') {
+      await submitTimer(client, state, refresh);
       return;
     }
     if (form.kind === 'message' && form.fields[form.activeField]?.key === 'to') {
@@ -353,6 +456,66 @@ async function handleChatComposeInput(
     return;
   }
   editFormField(input, form);
+}
+
+// 'off' plus the shared presets, cycled with Up/Down in the timer form. Typed
+// free text that matches a choice stays in the cycle; anything else restarts it.
+const TIMER_CHOICES = ['off', ...RETENTION_PRESETS_MS.map((durationMs) => formatRetention(durationMs))];
+
+function cycleTimerChoice(form: ContactEditForm, delta: number): void {
+  const field = form.fields[form.activeField];
+  if (!field) {
+    return;
+  }
+  const currentIndex = TIMER_CHOICES.indexOf(field.value.trim().toLowerCase());
+  const nextIndex = currentIndex === -1
+    ? (delta > 0 ? 0 : TIMER_CHOICES.length - 1)
+    : (currentIndex + delta + TIMER_CHOICES.length) % TIMER_CHOICES.length;
+  field.value = TIMER_CHOICES[nextIndex]!;
+  form.error = undefined;
+}
+
+// Apply the timer to both sides via XMTP settings (mirror-first in the client).
+async function submitTimer(client: ConeClient, state: ChatState, refresh: RefreshChat): Promise<void> {
+  const form = state.editForm;
+  if (!form || !form.targetConversationId) {
+    return;
+  }
+  let durationMs: number | null;
+  try {
+    durationMs = parseRetention(formValue(form, 'duration') || 'off');
+  } catch (error) {
+    form.error = errorMessage(error);
+    return;
+  }
+  await client.setRetention(form.targetConversationId, durationMs);
+  enterChatSelect(state);
+  state.status = durationMs === null ? 'disappearing messages off' : `disappearing messages: ${formatRetention(durationMs)}`;
+  await refresh();
+}
+
+// Save the active conversation's peer as a (named) contact. saveContact dedupes
+// by inbox, so this creates a contact or renames the existing one; the chat then
+// shows the name instead of the raw inbox ID.
+async function submitNamePeer(client: ConeClient, state: ChatState, refresh: RefreshChat): Promise<void> {
+  const form = state.editForm;
+  if (!form || !form.targetConversationId) {
+    return;
+  }
+  const conversation = state.conversations.find((candidate) => candidate.conversationId === form.targetConversationId);
+  if (!conversation) {
+    form.error = 'Chat no longer exists.';
+    return;
+  }
+  const name = formValue(form, 'name');
+  if (!name) {
+    form.error = 'Name is required.';
+    return;
+  }
+  await client.saveContact({ name, inboxId: conversation.peerInboxId, address: conversation.peerAddress, source: 'manual' });
+  state.status = `named ${name}`;
+  enterChatSelect(state);
+  await refresh();
 }
 
 async function handleContactsSelectInput(
@@ -437,6 +600,11 @@ async function handleContactsEditInput(
     state.status = 'cancelled';
     return;
   }
+  // While pairing runs in the background, the only useful key is Esc (leave);
+  // ignore everything else so a stray Enter can't re-submit.
+  if (form.pending) {
+    return;
+  }
   if (isEnter(input)) {
     await submitContactEditForm(client, state, refresh);
     return;
@@ -518,7 +686,7 @@ async function submitContactEditForm(client: ConeClient, state: ChatState, refre
     enterContactsSelect(state);
     return;
   }
-  await submitPairJoin(client, state, refresh);
+  submitPairJoin(client, state, refresh);
 }
 
 async function submitNewMessage(client: ConeClient, state: ChatState, refresh: RefreshChat): Promise<void> {
@@ -623,9 +791,12 @@ async function submitDeleteContact(client: ConeClient, state: ChatState, refresh
   await refresh();
 }
 
-async function submitPairJoin(client: ConeClient, state: ChatState, refresh: RefreshChat): Promise<void> {
+// Pairing blocks on the rendezvous for up to a minute. We must NOT await it in
+// the input handler — that would freeze the whole TUI. Instead we kick it off
+// in the background, show a waiting line, and reconcile when it settles.
+function submitPairJoin(client: ConeClient, state: ChatState, refresh: RefreshChat): void {
   const form = state.editForm;
-  if (!form) {
+  if (!form || form.pending) {
     return;
   }
 
@@ -635,24 +806,43 @@ async function submitPairJoin(client: ConeClient, state: ChatState, refresh: Ref
     return;
   }
 
-  const result = await client.pairWithCode(code, { proposedName: formValue(form, 'shareName') || undefined });
+  const shareName = formValue(form, 'shareName') || undefined;
   const saveAs = formValue(form, 'saveAs');
-  const contact = saveAs
-    ? await client.saveContact({
-        address: result.contact.address,
-        inboxId: result.contact.inboxId,
-        name: saveAs,
-        source: 'paired',
-      })
-    : result.contact;
+  form.pending = true;
+  form.error = undefined;
+  state.status = 'pairing… waiting for the other side (up to 60s)';
 
-  form.resultLines = [
-    `Paired with ${contact.name}.`,
-    `Inbox ${shortId(contact.inboxId)}`,
-    `Confirmation sent: ${result.sentConfirmation ? 'yes' : 'no'}`,
-  ];
-  state.status = `paired with ${contact.name}`;
-  await refresh();
+  void client.pairWithCode(code, { proposedName: shareName })
+    .then(async (result) => {
+      const contact = saveAs
+        ? await client.saveContact({
+            address: result.contact.address,
+            inboxId: result.contact.inboxId,
+            name: saveAs,
+            source: 'paired',
+          })
+        : result.contact;
+      // The user may have left the form while we waited; only touch it if it's
+      // still the same one. The pairing (and saved contact) stands regardless.
+      if (state.editForm === form) {
+        form.pending = false;
+        form.resultLines = [
+          `Paired with ${contact.name}.`,
+          `Inbox ${shortId(contact.inboxId)}`,
+          `Confirmation sent: ${result.sentConfirmation ? 'yes' : 'no'}`,
+        ];
+      }
+      state.status = `paired with ${contact.name}`;
+      await refresh();
+    })
+    .catch(async (error: unknown) => {
+      if (state.editForm === form) {
+        form.pending = false;
+        form.error = `Pairing failed: ${errorMessage(error)}`;
+      }
+      state.status = `pairing failed: ${errorMessage(error)}`;
+      await refresh();
+    });
 }
 
 function formContact(state: ChatState, contactId: string | undefined): Contact | undefined {

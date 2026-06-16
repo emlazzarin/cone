@@ -74,7 +74,7 @@ Open the interactive terminal chat client:
 bun run packages/cli/src/bin.ts chat
 ```
 
-Useful chat keys: `j/k` move, `Enter` talks, `Esc` returns to selection, `n` starts a structured new message, `/` filters chats as you type, `R` toggles read receipts, `1` opens chats, `2` opens contacts, `c` creates a pairing code from Contacts, and `p` joins a pairing code from Contacts.
+Useful chat keys: `j/k` move, `Enter` talks, `Esc` returns to selection, `n` starts a structured new message, `/` filters chats as you type, `e` sets the selected chat's disappearing-messages timer, `R` toggles read receipts, `1` opens chats, `2` opens contacts, `c` creates a pairing code from Contacts, and `p` joins a pairing code from Contacts.
 
 Read receipts are on by default. When on, the agent sends a `cos.read.v1` acknowledgement when it views a conversation, and a `✓✓ Read` marker shows on the most recent message the peer has read. Toggle with `R` (persists to config); when off, no receipts are sent or shown.
 
@@ -84,11 +84,36 @@ Send to an inbox ID, EVM address, or saved contact name:
 bun run packages/cli/src/bin.ts send --to <identity> --text "hello"
 ```
 
+Show or set a conversation's disappearing-messages timer (`off`, or a duration with s/m/h/d/w units like `30s`, `1h`, `6d`, `4w`):
+
+```sh
+bun run packages/cli/src/bin.ts timer <conversationId|contactName|inboxId>
+bun run packages/cli/src/bin.ts timer <conversationId|contactName|inboxId> 1h
+bun run packages/cli/src/bin.ts timer <conversationId|contactName|inboxId> off
+```
+
+Timers ride XMTP's native disappearing-messages settings, so either participant can change them and compliant clients honor them. Messages sent while a timer is on are hidden from `inbox read`/`listMessages` after they expire and purged from local storage on sync; `inbox read` JSON includes each message's `expiresAt`. Deletion is cooperative, not cryptographic — a non-compliant peer client can keep its copies.
+
 Listen for inbound messages:
 
 ```sh
 bun run packages/cli/src/bin.ts listen
 ```
+
+`listen` streams **allowed senders only** — this is the agent trust boundary. A message from someone you haven't accepted will never reach your agent loop, so an unknown sender cannot trigger tools, file actions, or responses. Accepting a request is the explicit gate before any of that runs.
+
+## Requests
+
+Unknown senders are held as requests, never delivered to `listen` and never added to contacts. Review and decide explicitly:
+
+```sh
+bun run packages/cli/src/bin.ts requests                 # list unknown senders (JSON)
+bun run packages/cli/src/bin.ts requests accept <conversationId|inboxId> --save-as "Peer"
+bun run packages/cli/src/bin.ts requests block <conversationId|inboxId>
+bun run packages/cli/src/bin.ts requests --denied         # list blocked senders
+```
+
+Accepting marks the sender allowed (so future messages reach `listen`) and optionally saves a named contact. Blocking denies their inbox. Pairing and sending to someone both imply consent automatically.
 
 ## Contacts
 

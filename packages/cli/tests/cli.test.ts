@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { generateSecretKey, type ConeClient, type ConeConversation, type ConeIdentity, type ConeMessage, type Contact, type IncomingMessage, type MessageHandler, type SecretKey, type SentMessage, type SyncResult, type Unsubscribe, type XmtpEnv } from '@cone/core';
+import { generateSecretKey, type ConeClient, type ConeConsentState, type ConeConversation, type ConeGroupMember, type ConeIdentity, type ConeMessage, type Contact, type IncomingMessage, type MessageHandler, type SecretKey, type SentMessage, type SyncResult, type Unsubscribe, type XmtpEnv } from '@cone/core';
 
 import { runCli, type CliIo } from '../src/index';
 
@@ -154,7 +154,7 @@ describe('CLI', () => {
     client.conversations = [{
       conversationId: 'dm-cli',
       contactId: 'contact-alice',
-      peerInboxId: 'inbox-alice',
+      kind: 'dm' as const, peerInboxId: 'inbox-alice', consentState: 'allowed',
       title: 'Alice',
       updatedAt: '2026-01-01T00:00:00.000Z',
     }];
@@ -184,6 +184,174 @@ describe('CLI', () => {
 
     expect(await runCli(['chat', '--secret-stdin'], io, { createClient: async () => client })).toBe(1);
     expect(io.err.join('')).toContain('requires an interactive TTY');
+  });
+
+  test('inbox list hides requests and points to cos requests', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'dm-allowed', kind: 'dm' as const, peerInboxId: 'inbox-allowed', title: 'Allowed', consentState: 'allowed' },
+      { conversationId: 'dm-req', kind: 'dm' as const, peerInboxId: 'inbox-stranger', title: 'inbox-stranger', consentState: 'unknown' },
+    ];
+
+    expect(await runCli(['inbox', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    const output = io.out.join('');
+    expect(output).toContain('Allowed');
+    expect(output).not.toContain('inbox-stranger');
+    expect(output).toContain('1 request');
+  });
+
+  test('requests list shows only unknown senders', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'dm-allowed', kind: 'dm' as const, peerInboxId: 'inbox-allowed', title: 'Allowed', consentState: 'allowed' },
+      { conversationId: 'dm-req', kind: 'dm' as const, peerInboxId: 'inbox-stranger', title: 'inbox-stranger', consentState: 'unknown' },
+    ];
+
+    expect(await runCli(['requests', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    const output = io.out.join('');
+    expect(output).toContain('inbox-stranger');
+    expect(output).not.toContain('Allowed');
+  });
+
+  test('requests accept marks the peer allowed and can save a contact', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'dm-req', kind: 'dm' as const, peerInboxId: 'inbox-stranger', title: 'inbox-stranger', consentState: 'unknown' },
+    ];
+
+    expect(await runCli(['requests', 'accept', 'dm-req', '--save-as', 'Stranger', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.consentCalls).toContainEqual({ to: 'inbox-stranger', state: 'allowed' });
+    expect(client.conversations.find((c) => c.conversationId === 'dm-req')?.consentState).toBe('allowed');
+    expect(client.contacts.some((contact) => contact.name === 'Stranger' && contact.inboxId === 'inbox-stranger')).toBe(true);
+  });
+
+  test('requests block denies the peer inbox', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'dm-req', kind: 'dm' as const, peerInboxId: 'inbox-stranger', title: 'inbox-stranger', consentState: 'unknown' },
+    ];
+
+    expect(await runCli(['requests', 'block', 'inbox-stranger', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.consentCalls.at(-1)).toEqual({ to: 'inbox-stranger', state: 'denied' });
+    expect(client.conversations.find((c) => c.conversationId === 'dm-req')?.consentState).toBe('denied');
+  });
+
+  test('group create resolves members and reports the new group', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+
+    expect(await runCli(
+      ['group', 'create', '--secret-stdin', '--member', 'Alice', '--member', 'inbox-bob', '--name', 'Crew', '--locked'],
+      io,
+      { createClient: async () => client },
+    )).toBe(0);
+
+    expect(client.groupCreates[0]).toEqual({ name: 'Crew', members: ['Alice', 'inbox-bob'], locked: true });
+    const output = JSON.parse(io.out.join('')) as { kind?: string; title?: string };
+    expect(output.kind).toBe('group');
+    expect(output.title).toBe('Crew');
+  });
+
+  test('group create requires at least one member', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+
+    expect(await runCli(['group', 'create', '--secret-stdin', '--name', 'Crew'], io, { createClient: async () => client })).toBe(1);
+    expect(io.err.join('')).toContain('usage: cos group create');
+  });
+
+  test('group info, add, send, and leave resolve a group by name', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'group-crew', kind: 'group', title: 'Crew', groupName: 'Crew', consentState: 'allowed' },
+      { conversationId: 'dm-alice', kind: 'dm', peerInboxId: 'inbox-alice', title: 'Alice', consentState: 'allowed' },
+    ];
+    client.groupMembers = [
+      { inboxId: 'inbox-cli', level: 'superAdmin', consentState: 'allowed' },
+      { inboxId: 'inbox-bob', level: 'member', consentState: 'allowed' },
+    ];
+
+    expect(await runCli(['group', 'info', 'Crew', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(io.out.join('')).toContain('inbox-cli [superAdmin]');
+
+    expect(await runCli(['group', 'add', 'Crew', '--member', 'inbox-dana', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.groupMemberAdds).toEqual([{ conversationId: 'group-crew', members: ['inbox-dana'] }]);
+
+    expect(await runCli(['group', 'send', 'Crew', '--text', 'hello crew', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.sentToConversation).toEqual([{ conversationId: 'group-crew', text: 'hello crew' }]);
+
+    expect(await runCli(['group', 'leave', 'Crew', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.leftGroups).toEqual(['group-crew']);
+  });
+
+  test('group commands reject DM targets and unknown groups', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'dm-alice', kind: 'dm', peerInboxId: 'inbox-alice', title: 'Alice', consentState: 'allowed' },
+    ];
+
+    expect(await runCli(['group', 'info', 'Alice', '--secret-stdin'], io, { createClient: async () => client })).toBe(1);
+    expect(io.err.join('')).toContain('group not found');
+  });
+
+  test('requests accept and block on a group target the group conversation', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'group-req', kind: 'group', title: 'Mystery Crew', consentState: 'unknown' },
+    ];
+
+    expect(await runCli(['requests', 'accept', 'group-req', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.consentCalls).toContainEqual({ to: 'group-req', state: 'allowed' });
+    expect(client.conversations[0]?.consentState).toBe('allowed');
+
+    expect(await runCli(['requests', 'block', 'group-req', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.consentCalls.at(-1)).toEqual({ to: 'group-req', state: 'denied' });
+    // Accept's --save-as is DM-only; a group accept never creates a contact.
+    expect(client.contacts).toHaveLength(0);
+  });
+
+  test('timer sets, shows, and clears the disappearing-messages duration', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'dm-alice', kind: 'dm' as const, peerInboxId: 'inbox-alice', title: 'Alice', consentState: 'allowed' },
+    ];
+
+    expect(await runCli(['timer', 'Alice', '1h', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.retentionCalls.at(-1)).toEqual({ conversationId: 'dm-alice', durationMs: 3_600_000 });
+    expect(io.out.join('')).toContain('Disappearing messages in Alice: 1h.');
+
+    expect(await runCli(['timer', 'dm-alice', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(io.out.at(-1)).toContain('Disappearing messages in Alice: 1h.');
+
+    expect(await runCli(['timer', 'inbox-alice', 'off', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.retentionCalls.at(-1)).toEqual({ conversationId: 'dm-alice', durationMs: null });
+    expect(io.out.at(-1)).toContain('Disappearing messages off in Alice.');
+  });
+
+  test('timer rejects unknown targets and junk durations', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'dm-alice', kind: 'dm' as const, peerInboxId: 'inbox-alice', title: 'Alice', consentState: 'allowed' },
+    ];
+
+    expect(await runCli(['timer', '--secret-stdin'], io, { createClient: async () => client })).toBe(1);
+    expect(io.err.join('')).toContain('usage: cos timer');
+
+    expect(await runCli(['timer', 'Nobody', '1h', '--secret-stdin'], io, { createClient: async () => client })).toBe(1);
+    expect(io.err.join('')).toContain('not found');
+
+    expect(await runCli(['timer', 'Alice', 'banana', '--secret-stdin'], io, { createClient: async () => client })).toBe(1);
+    expect(io.err.join('')).toContain('invalid duration');
+    expect(client.retentionCalls).toHaveLength(0);
   });
 });
 
@@ -215,6 +383,13 @@ class MockClient implements ConeClient {
   messages: ConeMessage[] = [];
   pairRequests: Array<{ code: string; proposedName?: string }> = [];
   sent: Array<{ to: string; text: string }> = [];
+  sentToConversation: Array<{ conversationId: string; text: string }> = [];
+  consentCalls: Array<{ to: string; state: ConeConsentState }> = [];
+  groupCreates: Array<{ name?: string; members: unknown[]; locked?: boolean }> = [];
+  groupMemberAdds: Array<{ conversationId: string; members: unknown[] }> = [];
+  leftGroups: string[] = [];
+  groupMembers: ConeGroupMember[] = [];
+  retentionCalls: Array<{ conversationId: string; durationMs: number | null }> = [];
   synced = false;
   closed = false;
   unsubscribed = false;
@@ -250,6 +425,85 @@ class MockClient implements ConeClient {
 
   sendReadReceipt(): Promise<void> {
     return Promise.resolve();
+  }
+
+  setConsent(to: unknown, state: ConeConsentState): Promise<void> {
+    const inboxId = typeof to === 'object' && to !== null && 'inboxId' in to ? String((to as { inboxId: string }).inboxId) : String(to);
+    this.consentCalls.push({ to: inboxId, state });
+    this.conversations = this.conversations.map((conversation) =>
+      conversation.peerInboxId === inboxId ? { ...conversation, consentState: state } : conversation,
+    );
+    return Promise.resolve();
+  }
+
+  // Mirrors the real client: DM rows record peer-inbox consent, groups record
+  // the conversation id.
+  setConversationConsent(conversationId: string, state: ConeConsentState): Promise<void> {
+    const conversation = this.conversations.find((entry) => entry.conversationId === conversationId);
+    if (conversation?.kind !== 'group' && conversation?.peerInboxId) {
+      return this.setConsent({ inboxId: conversation.peerInboxId }, state);
+    }
+    this.consentCalls.push({ to: conversationId, state });
+    this.conversations = this.conversations.map((entry) =>
+      entry.conversationId === conversationId ? { ...entry, consentState: state } : entry,
+    );
+    return Promise.resolve();
+  }
+
+  sendToConversation(conversationId: string, text: string): Promise<SentMessage> {
+    this.sentToConversation.push({ conversationId, text });
+    return Promise.resolve({ conversationId, messageId: 'msg-conv', sentAt: new Date().toISOString() });
+  }
+
+  createGroup(input: { name?: string; members: unknown[]; locked?: boolean }): Promise<ConeConversation> {
+    this.groupCreates.push({ name: input.name, members: input.members, locked: input.locked });
+    const conversation: ConeConversation = {
+      conversationId: `group-${this.groupCreates.length}`,
+      kind: 'group',
+      title: input.name ?? 'Group',
+      groupName: input.name,
+      memberCount: input.members.length + 1,
+      consentState: 'allowed',
+    };
+    this.conversations.push(conversation);
+    return Promise.resolve(conversation);
+  }
+
+  listGroupMembers(): Promise<ConeGroupMember[]> {
+    return Promise.resolve(this.groupMembers);
+  }
+
+  addGroupMembers(conversationId: string, members: unknown[]): Promise<void> {
+    this.groupMemberAdds.push({ conversationId, members });
+    return Promise.resolve();
+  }
+
+  removeGroupMembers(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  leaveGroup(conversationId: string): Promise<void> {
+    this.leftGroups.push(conversationId);
+    return Promise.resolve();
+  }
+
+  setRetention(conversationId: string, durationMs: number | null): Promise<void> {
+    this.retentionCalls.push({ conversationId, durationMs });
+    this.conversations = this.conversations.map((conversation) =>
+      conversation.conversationId === conversationId
+        ? {
+            ...conversation,
+            retention: durationMs !== null && durationMs > 0
+              ? { durationMs, fromAt: new Date().toISOString() }
+              : undefined,
+          }
+        : conversation,
+    );
+    return Promise.resolve();
+  }
+
+  purgeExpiredMessages(): Promise<number> {
+    return Promise.resolve(0);
   }
 
   sync(): Promise<SyncResult> {

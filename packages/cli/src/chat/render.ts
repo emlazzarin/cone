@@ -1,5 +1,6 @@
 import {
   formatConnectionStatus,
+  formatRetention,
   formatTranscriptTime,
   isVisibleChatMessage,
   latestReadOutboundId,
@@ -10,9 +11,16 @@ import {
   type ConeConversation,
 } from '@cone/core';
 
-import { activeContact, composerKey, conversationActivityAt, isContactsMode, selectedContact, selectedConversation, visibleConversations } from './state';
+import { activeContact, composerKey, conversationActivityAt, isContactsMode, requestCount, scopedConversations, selectedContact, selectedConversation, visibleConversations } from './state';
 import type { ChatMode, ChatState } from './types';
-import { CSI, accent, danger, dim, ellipsize, highlight, inputField, inverse, pad, shortId, stripAnsi, success, tailLine, wrapText } from './text';
+import { CSI, accent, danger, dim, ellipsize, highlight, inputField, inverse, pad, shortId, stripAnsi, success, wrapText } from './text';
+
+// An unnamed peer's conversation title is its raw XMTP inbox ID (60+ chars),
+// which is unreadable in a list. Show a short form until the peer is named
+// (via a contact). Named conversations keep their contact name.
+function convTitle(conversation: Pick<ConeConversation, 'title' | 'peerInboxId'>): string {
+  return conversation.title === conversation.peerInboxId ? shortId(conversation.peerInboxId) : conversation.title;
+}
 
 export function renderChat(state: ChatState, width: number, height: number): string {
   if (width < 50 || height < 10) {
@@ -52,11 +60,13 @@ function topBar(state: ChatState, width: number): string {
       : activeContact(state)?.name ?? selectedConversation(state)?.title ?? 'chats';
   const unread = Object.values(state.unreadByConversation).reduce((sum, count) => sum + count, 0);
   const connection = formatConnectionStatus(connectionStatusForState(state));
+  const requests = requestCount(state);
   const parts = [
     `Cone of Silence ·${state.identity.env}`,
     '1 Chats',
     '2 Contacts',
     unread > 0 ? `${connection} · ${unread} new` : connection,
+    ...(requests > 0 ? [`${requests} request${requests === 1 ? '' : 's'}`] : []),
     ...(state.readReceipts ? [] : ['receipts off']),
     context,
     `you ${shortId(state.identity.inboxId)}`,
@@ -68,16 +78,19 @@ function topBar(state: ChatState, width: number): string {
 // message preview + unread count.
 function renderConversationRow(state: ChatState, row: number, width: number, bodyHeight: number): string {
   const conversations = visibleConversations(state);
+  const label = state.scope === 'requests' ? 'requests' : 'chats';
   if (row === 0) {
     const heading = state.filter || state.filterActive
-      ? `[chats /${state.filter} ${conversations.length}/${state.conversations.length}]`
-      : '[chats]';
+      ? `[${label} /${state.filter} ${conversations.length}/${scopedConversations(state).length}]`
+      : `[${label}]`;
     return pad(heading, width);
   }
   if (conversations.length === 0) {
     const empty = state.filter
-      ? ['no chats match', 'Esc clears the filter']
-      : ['no chats yet', 'n new message', '2 contacts + pairing'];
+      ? [`no ${label} match`, 'Esc clears the filter']
+      : state.scope === 'requests'
+        ? ['no requests', 't back to chats']
+        : ['no chats yet', 'n new message', '2 contacts + pairing'];
     return pad(dim(empty[row - 1] ?? ''), width);
   }
 
@@ -93,7 +106,7 @@ function renderConversationRow(state: ChatState, row: number, width: number, bod
   if ((row - 1) % 2 === 0) {
     const time = relativeTime(conversationActivityAt(state, conversation) || undefined);
     const nameWidth = Math.max(1, width - time.length - 3);
-    const name = ellipsize(conversation.title, nameWidth).padEnd(nameWidth);
+    const name = ellipsize(convTitle(conversation), nameWidth).padEnd(nameWidth);
     const marker = selected ? '>' : ' ';
     if (selected) {
       return highlight(pad(`${marker} ${name} ${time}`, width));
@@ -148,8 +161,17 @@ function renderThreadRow(state: ChatState, row: number, width: number, bodyHeigh
   const contact = activeContact(state);
   if (row === 0) {
     const unread = conversation ? state.unreadByConversation[conversation.conversationId] ?? 0 : 0;
+    // When the title is already the peer's inbox ID, don't repeat it dimmed.
+    // Groups show their member count instead of a peer id.
+    const peerSuffix = conversation?.kind === 'group'
+      ? ` ${dim(conversation.memberCount ? `group · ${conversation.memberCount}` : 'group')}`
+      : conversation?.peerInboxId && conversation.title !== conversation.peerInboxId
+        ? ` ${dim(shortId(conversation.peerInboxId))}`
+        : '';
+    // Active disappearing-messages timer, ASCII so padded rows never overflow.
+    const timer = conversation?.retention ? ` ${accent(`timer ${formatRetention(conversation.retention.durationMs)}`)}` : '';
     const title = conversation
-      ? `${conversation.title} ${dim(shortId(conversation.peerInboxId))}`
+      ? `${convTitle(conversation)}${peerSuffix}${timer}`
       : contact
         ? `${contact.name} ${dim('new chat')}`
         : 'no chat selected';
@@ -207,13 +229,29 @@ function renderEditFormRow(state: ChatState, row: number, width: number): string
   if (row === 0) {
     return pad(`[${form.title}]`, width);
   }
+  if (form.pending) {
+    const lines = ['Waiting for the other side to enter the same code (up to 60s)…', 'Esc to leave — pairing keeps running in the background.'];
+    return pad(dim(lines[row - 1] ?? ''), width);
+  }
   if (form.resultLines && row <= form.resultLines.length) {
     return pad(form.resultLines[row - 1] ?? '', width);
   }
   const field = form.fields[row - 1];
   if (field) {
-    const active = row - 1 === form.activeField ? '>' : ' ';
-    return pad(`${active} ${field.label}: ${field.value}`, width);
+    const isActive = row - 1 === form.activeField;
+    const label = `${isActive ? '>' : ' '} ${field.label}: `;
+    if (!isActive) {
+      return pad(`${label}${field.value}`, width);
+    }
+    // Cursor sits in the selected field. Long values (e.g. an inbox ID) scroll
+    // so the caret stays visible instead of overflowing the pane.
+    const avail = Math.max(4, width - label.length - 2);
+    const shown = field.value.length > avail ? field.value.slice(field.value.length - avail) : field.value;
+    return pad(`${label}${shown}${accent('█')}`, width);
+  }
+
+  if (form.kind === 'pair-join' && row === form.fields.length + 1) {
+    return pad(dim('No code yet? Esc, then press c to create one to share.'), width);
   }
 
   const suggestions = form.kind === 'message' ? messageTargetSuggestions(state) : [];
@@ -243,11 +281,9 @@ function inputLine(state: ChatState, width: number): string {
     return inputBox('Filter: ', state.filter, width);
   }
   if (state.mode === 'contacts-edit' || state.mode === 'chat-compose') {
-    const field = state.editForm?.fields[state.editForm.activeField];
-    if (!field) {
-      return `status: ${state.status}`.slice(0, width);
-    }
-    return tailLine(`${field.label}: ${field.value}`, width);
+    // The active field carries the cursor in the form itself (main pane), so the
+    // bottom line just shows status.
+    return `status: ${state.status}`.slice(0, width);
   }
   return `status: ${state.status}`.slice(0, width);
 }
@@ -261,10 +297,18 @@ function footerLine(state: ChatState, width: number): string {
   const retrySync = state.syncState === 'stale' || state.streamState === 'offline';
   const filterHint = state.filter ? '/ edit filter | Esc clear filter' : '/ filter';
   const failedHere = state.pendingMessages.some((entry) => entry.status === 'failed' && entry.key === composerKey(state));
+  const requests = requestCount(state);
+  // In the Requests sub-surface, the footer carries accept/block; otherwise the
+  // normal chat keys plus a toggle into Requests when any exist.
+  const requestsHint = state.scope === 'requests'
+    ? ' t chats'
+    : requests > 0 ? ` | t requests (${requests})` : '';
   const text = state.mode === 'chat-select'
     ? state.filterActive
       ? ' type to filter | Up/Down move | Enter keep | Esc clear '
-      : ` j/k move | Enter talk | n new message | ${filterHint} | d delete${failedHere ? ' | Ctrl+X delete failed' : ''}${retrySync ? ' | s retry sync' : ''} | ? help | q quit `
+      : state.scope === 'requests'
+        ? ` j/k move | Enter preview | a accept | b block${state.pendingBlockId ? ' (again to confirm)' : ''} | ${filterHint} |${requestsHint} | ? help | q quit `
+        : ` j/k move | Enter talk | n new | r name | e timer | c/p pair | ${filterHint} | d delete${failedHere ? ' | Ctrl+X delete failed' : ''}${retrySync ? ' | s retry sync' : ''}${requestsHint} | ? help | q quit `
     : state.mode === 'chat-talk'
       ? failedHere
         ? ' Enter retry | Ctrl+X delete failed | Esc back | Ctrl+U clear '
@@ -272,7 +316,7 @@ function footerLine(state: ChatState, width: number): string {
     : state.mode === 'chat-compose'
         ? chatComposeFooter(state)
         : state.mode === 'contacts-select'
-          ? ' j/k move | Enter talk | a add | r rename | d delete | c code | p join code | ? help | q quit '
+          ? ' j/k move | Enter talk | a add | r rename | d delete | c create code | p join code | ? help | q quit '
           : state.editForm?.resultLines?.length
             ? ' Enter done | Esc done '
             : ` Tab next field | Shift+Tab previous | Enter ${state.editForm?.submitLabel ?? 'save'} | Esc cancel `;
@@ -316,25 +360,42 @@ function transcriptRows(
   }
 
   const rows: string[] = [];
-  const pushEntry = (sentAt: string, sender: string, body: string, failed: boolean) => {
+  const readLabel = '✓✓ Read';
+  // Outbound rows reserve a right gutter (when receipts are on) so the read
+  // marker sits in a fixed column on the message's last row — it never spawns a
+  // separate line that reflows the transcript, and never crowds wrapping text.
+  const gutter = state.readReceipts ? readLabel.length + 1 : 0;
+  const pushEntry = (sentAt: string, sender: string, body: string, options: { failed?: boolean; outbound?: boolean; read?: boolean }) => {
+    const failed = options.failed ?? false;
     const marker = failed ? `${danger('✗')} ` : '';
     const prefix = `${marker}${formatTranscriptTime(sentAt)} - ${sender}: `;
     const indent = stripAnsi(prefix).length;
-    const wrapped = wrapText(body, Math.max(10, width - indent));
-    rows.push(`${prefix}${failed ? danger(wrapped[0] ?? '') : wrapped[0] ?? ''}`);
+    const reserve = options.outbound ? gutter : 0;
+    const wrapped = wrapText(body, Math.max(10, width - indent - reserve));
+    const built = [`${prefix}${failed ? danger(wrapped[0] ?? '') : wrapped[0] ?? ''}`];
     for (const continuation of wrapped.slice(1)) {
-      rows.push(`${' '.repeat(indent)}${failed ? danger(continuation) : continuation}`);
+      built.push(`${' '.repeat(indent)}${failed ? danger(continuation) : continuation}`);
+    }
+    if (options.read) {
+      const last = built.length - 1;
+      const lastRow = built[last] ?? '';
+      const pad = Math.max(1, width - stripAnsi(lastRow).length - readLabel.length);
+      built[last] = `${lastRow}${' '.repeat(pad)}${success(readLabel)}`;
+    }
+    for (const row of built) {
+      rows.push(row);
     }
   };
+  const peerLabel = conversation ? convTitle(conversation) : 'peer';
   for (const message of messages) {
-    pushEntry(message.sentAt, message.direction === 'outbound' ? 'me' : conversation?.title ?? 'peer', messageBody(message), false);
-    if (message.messageId === readMarkerId) {
-      const label = '✓✓ Read';
-      rows.push(`${' '.repeat(Math.max(0, width - label.length - 1))}${success(label)}`);
-    }
+    const outbound = message.direction === 'outbound';
+    pushEntry(message.sentAt, outbound ? 'me' : peerLabel, messageBody(message), {
+      outbound,
+      read: message.messageId === readMarkerId,
+    });
   }
   for (const entry of pending) {
-    pushEntry(entry.sentAt, 'me', entry.text, entry.status === 'failed');
+    pushEntry(entry.sentAt, 'me', entry.text, { failed: entry.status === 'failed', outbound: true });
   }
   return rows;
 }
@@ -354,7 +415,12 @@ function renderHelpRow(state: ChatState, row: number, width: number): string {
     '  see ✓✓ Read on your last message they read; off sends and shows neither.',
     'Messages send instantly; a successful send is silent. A send that fails to',
     '  publish shows ✗ — Enter retries, Ctrl+X deletes it.',
-    'Chats: d deletes the local cached chat after confirmation.',
+    't toggles Requests (unknown senders). There: a accepts, b blocks (twice to',
+    '  confirm). Accepting moves them to your inbox; only allowed chats send receipts.',
+    'Chats: r names the selected peer (saves a contact); d deletes the local chat.',
+    'e sets the disappearing-messages timer for the selected chat (off, 5m…30d).',
+    '  Both sides see it; messages sent under a timer vanish after it elapses.',
+    'c creates a pairing code, p joins one — from Chats or Contacts.',
     'Contacts: a add, r rename, d delete, c create code, p join code.',
     'Realtime stream stays on; s only appears when sync/stream needs retry.',
   ];
@@ -420,7 +486,8 @@ function messageTargetSuggestions(state: ChatState): string[] {
     entries.set(contact.name.toLocaleLowerCase(), `${contact.name} ${dim(`contact ${shortId(contact.inboxId)}`)}`);
   }
   for (const conversation of state.conversations) {
-    entries.set(conversation.title.toLocaleLowerCase(), `${conversation.title} ${dim(`chat ${shortId(conversation.peerInboxId)}`)}`);
+    const meta = conversation.kind === 'group' ? 'group' : `chat ${shortId(conversation.peerInboxId ?? conversation.conversationId)}`;
+    entries.set(conversation.title.toLocaleLowerCase(), `${conversation.title} ${dim(meta)}`);
   }
   return Array.from(entries.entries())
     .filter(([key]) => !query || key.includes(query))

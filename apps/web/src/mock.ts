@@ -4,11 +4,14 @@
 
 import {
   READ_RECEIPT_TYPE,
+  isExpiredMessage,
   type ConeClient,
   type ConeConversation,
+  type ConeGroupMember,
   type ConeIdentity,
   type ConeMessage,
   type Contact,
+  type CreateGroupInput,
   type HandshakeCode,
   type IdentityRef,
   type MessageHandler,
@@ -41,13 +44,39 @@ export function createMockBootstrap(options: MockOptions = {}) {
     contact('self-me', 'Me', ME, '0x9f2c4d7b1a3e6f8c0d2b4a6e8f1c3d5b7a9e0c2d', 'self'),
     contact('c-alice', 'Alice', ALICE, '0x3a9f1c2d4e6b8a0c2d4f6b8a1c3e5d7f9b0a2c4e', 'paired'),
     contact('c-codex', 'Codex', CODEX, undefined, 'paired'),
-    contact('c-bob', 'bob.eth', BOB, '0x5d7f9b1a3c5e7d9f1b3a5c7e9d1f3b5a7c9e1d3f', 'inbound'),
+    contact('c-bob', 'bob.eth', BOB, '0x5d7f9b1a3c5e7d9f1b3a5c7e9d1f3b5a7c9e1d3f', 'manual'),
   ];
 
+  const STRANGER = '0x1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff0011';
+  const SPAMMER = '0x99aa88bb77cc66dd55ee44ff33001122334455667788990011223344556677ab';
+  const groupMembers: ConeGroupMember[] = [
+    { inboxId: ME, level: 'superAdmin', consentState: 'allowed' },
+    { inboxId: ALICE, level: 'member', consentState: 'allowed' },
+    { inboxId: BOB, level: 'member', consentState: 'allowed' },
+  ];
   const conversations: ConeConversation[] = [
-    conversation('dm:alice', ALICE, '0x3a9f1c2d4e6b8a0c2d4f6b8a1c3e5d7f9b0a2c4e', 'Alice', minutesAgo(2)),
-    conversation('dm:codex', CODEX, undefined, 'Codex', minutesAgo(64)),
-    conversation('dm:bob', BOB, '0x5d7f9b1a3c5e7d9f1b3a5c7e9d1f3b5a7c9e1d3f', 'bob.eth', minutesAgo(60 * 24 * 3)),
+    conversation('dm:alice', ALICE, '0x3a9f1c2d4e6b8a0c2d4f6b8a1c3e5d7f9b0a2c4e', 'Alice', minutesAgo(2), 'allowed'),
+    // Codex has a custom (non-preset) disappearing-messages timer, as if set
+    // via TUI free text — previews exercise the ⌛ chip and the header select
+    // acknowledging a custom value.
+    { ...conversation('dm:codex', CODEX, undefined, 'Codex', minutesAgo(64), 'allowed'), retention: { durationMs: 6 * 24 * 60 * 60_000, fromAt: minutesAgo(90) } },
+    conversation('dm:bob', BOB, '0x5d7f9b1a3c5e7d9f1b3a5c7e9d1f3b5a7c9e1d3f', 'bob.eth', minutesAgo(60 * 24 * 3), 'allowed'),
+    // A group chat — previews exercise multi-sender transcripts and the
+    // group header/meta rendering.
+    {
+      conversationId: 'group:crew',
+      kind: 'group',
+      title: 'Cone Crew',
+      groupName: 'Cone Crew',
+      memberCount: groupMembers.length,
+      members: groupMembers,
+      updatedAt: minutesAgo(15),
+      consentState: 'allowed',
+    },
+    // An unknown sender — appears in the Requests sub-surface, not the inbox.
+    conversation('dm:stranger', STRANGER, undefined, STRANGER, minutesAgo(8), 'unknown'),
+    // A blocked sender — hidden everywhere except the Settings blocked list.
+    conversation('dm:spammer', SPAMMER, undefined, SPAMMER, minutesAgo(120), 'denied'),
   ];
 
   const messages: ConeMessage[] = [
@@ -59,6 +88,10 @@ export function createMockBootstrap(options: MockOptions = {}) {
     text('m5', 'dm:codex', CODEX, ME, 'inbound', 'sync complete: 3 conversations, 41 messages', minutesAgo(70)),
     text('m6', 'dm:codex', ME, CODEX, 'outbound', 'thanks, listening for new messages now', minutesAgo(64)),
     text('m7', 'dm:bob', BOB, ME, 'inbound', 'gm', minutesAgo(60 * 24 * 3)),
+    text('m8', 'dm:stranger', STRANGER, ME, 'inbound', 'hey, are you the dev behind Cone?', minutesAgo(8)),
+    groupText('g1', 'group:crew', ALICE, 'pushed the new pairing flow to dev', minutesAgo(40)),
+    groupText('g2', 'group:crew', BOB, 'nice — trying it now', minutesAgo(30)),
+    groupText('g3', 'group:crew', ME, 'ship it', minutesAgo(15)),
   ];
 
   let handshake = 0;
@@ -87,7 +120,75 @@ export function createMockBootstrap(options: MockOptions = {}) {
       return { messageId: `s${messages.length}`, conversationId, sentAt };
     },
     sendJson: async () => ({ messageId: 'json', conversationId: 'dm:alice', sentAt: new Date().toISOString() }),
+    sendToConversation: async (conversationId: string, body: string): Promise<SentMessage> => {
+      if (options.sendDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, options.sendDelayMs));
+      }
+      if (options.failSend) {
+        throw new Error('XMTP unreachable (mock failure)');
+      }
+      const sentAt = new Date().toISOString();
+      messages.push(text(`s${messages.length}`, conversationId, ME, ALICE, 'outbound', body, sentAt));
+      const conversation = conversations.find((entry) => entry.conversationId === conversationId);
+      if (conversation) {
+        conversation.updatedAt = sentAt;
+      }
+      return { messageId: `s${messages.length}`, conversationId, sentAt };
+    },
     sendReadReceipt: async () => undefined,
+    createGroup: async (input: CreateGroupInput): Promise<ConeConversation> => {
+      const created: ConeConversation = {
+        conversationId: `group:${conversations.length}`,
+        kind: 'group',
+        title: input.name ?? 'Group',
+        groupName: input.name,
+        groupDescription: input.description,
+        memberCount: input.members.length + 1,
+        members: groupMembers,
+        updatedAt: new Date().toISOString(),
+        consentState: 'allowed',
+      };
+      conversations.push(created);
+      return created;
+    },
+    listGroupMembers: async () => groupMembers.map((member) => ({ ...member })),
+    addGroupMembers: async () => undefined,
+    removeGroupMembers: async () => undefined,
+    leaveGroup: async () => undefined,
+    setConsent: async (to: IdentityRef, state) => {
+      const inboxId = typeof to === 'string' ? to : to.inboxId;
+      for (const conversation of conversations) {
+        if (conversation.peerInboxId === inboxId) {
+          conversation.consentState = state;
+        }
+      }
+    },
+    setConversationConsent: async (conversationId: string, state) => {
+      const conversation = conversations.find((entry) => entry.conversationId === conversationId);
+      if (conversation) {
+        conversation.consentState = state;
+      }
+    },
+    setRetention: async (conversationId: string, durationMs: number | null) => {
+      const conversation = conversations.find((entry) => entry.conversationId === conversationId);
+      if (conversation) {
+        conversation.retention = durationMs !== null && durationMs > 0
+          ? { durationMs, fromAt: new Date().toISOString() }
+          : undefined;
+      }
+    },
+    purgeExpiredMessages: async () => {
+      const retentionByConversation = new Map(conversations.map((entry) => [entry.conversationId, entry.retention]));
+      const now = Date.now();
+      const before = messages.length;
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index]!;
+        if (isExpiredMessage(message, retentionByConversation.get(message.conversationId), now)) {
+          messages.splice(index, 1);
+        }
+      }
+      return before - messages.length;
+    },
     sync: async (): Promise<SyncResult> => ({
       completedAt: new Date().toISOString(),
       conversationsSynced: conversations.length,
@@ -145,8 +246,20 @@ function contact(contactId: string, name: string, inboxId: string, address: stri
   return { contactId, name, inboxId, address, source, createdAt: minutesAgo(9999), updatedAt: minutesAgo(2) };
 }
 
-function conversation(conversationId: string, peerInboxId: string, peerAddress: string | undefined, title: string, updatedAt: string): ConeConversation {
-  return { conversationId, peerInboxId, peerAddress, title, updatedAt };
+function conversation(conversationId: string, peerInboxId: string, peerAddress: string | undefined, title: string, updatedAt: string, consentState: ConeConversation['consentState']): ConeConversation {
+  return { conversationId, kind: 'dm', peerInboxId, peerAddress, title, updatedAt, consentState };
+}
+
+function groupText(messageId: string, conversationId: string, senderInboxId: string, body: string, sentAt: string): ConeMessage {
+  return {
+    messageId,
+    conversationId,
+    senderInboxId,
+    sentAt,
+    kind: 'text',
+    direction: senderInboxId === ME ? 'outbound' : 'inbound',
+    text: body,
+  };
 }
 
 function text(

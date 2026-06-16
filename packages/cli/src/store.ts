@@ -33,7 +33,7 @@ export class BunSQLiteStore implements ConeStore {
       )
       .run(
         conversation.conversationId,
-        conversation.peerInboxId,
+        conversation.peerInboxId ?? null,
         conversation.title,
         conversation.updatedAt ?? null,
         JSON.stringify(conversation),
@@ -134,6 +134,13 @@ export class BunSQLiteStore implements ConeStore {
     return Promise.resolve((rows as DataRow[]).map(parseDataRow<StoredMessage>));
   }
 
+  // Deletes the stored payload only; the processed_messages marker is kept so
+  // the message cannot be re-ingested on a later sync.
+  deleteMessage(messageId: string): Promise<void> {
+    this.db.query(`delete from messages where message_id = ?`).run(messageId);
+    return Promise.resolve();
+  }
+
   markMessageProcessed(messageId: string): Promise<boolean> {
     const result = this.db
       .query(`insert or ignore into processed_messages (message_id, processed_at) values (?, ?)`)
@@ -149,6 +156,8 @@ export class BunSQLiteStore implements ConeStore {
         metadata.lastSyncedAt = row.value;
       } else if (row.key === 'lastStreamStartedAt') {
         metadata.lastStreamStartedAt = row.value;
+      } else if (row.key === 'deniedInboxIds') {
+        metadata.deniedInboxIds = parseStringArray(row.value);
       }
     }
     return Promise.resolve(metadata);
@@ -159,9 +168,11 @@ export class BunSQLiteStore implements ConeStore {
       if (value === undefined) {
         continue;
       }
+      // Non-string values (the denied-inbox list) are stored as JSON.
+      const stored = typeof value === 'string' ? value : JSON.stringify(value);
       this.db
         .query(`insert into metadata (key, value) values (?, ?) on conflict(key) do update set value = excluded.value`)
-        .run(key, String(value));
+        .run(key, stored);
     }
   }
 
@@ -221,7 +232,7 @@ export class BunSQLiteStore implements ConeStore {
 
       create table if not exists conversations (
         conversation_id text primary key,
-        peer_inbox_id text not null,
+        peer_inbox_id text,
         title text not null,
         updated_at text,
         data text not null
@@ -246,6 +257,32 @@ export class BunSQLiteStore implements ConeStore {
         value text not null
       );
     `);
+    this.relaxPeerInboxConstraint();
+  }
+
+  // Databases created before groups have `peer_inbox_id text not null`; group
+  // rows have no peer, so the column must accept NULL. SQLite cannot drop a
+  // NOT NULL constraint in place — rebuild the table once if needed.
+  private relaxPeerInboxConstraint(): void {
+    const columns = this.db.query(`pragma table_info(conversations)`).all() as Array<{ name: string; notnull: number }>;
+    const peerColumn = columns.find((column) => column.name === 'peer_inbox_id');
+    if (!peerColumn || peerColumn.notnull === 0) {
+      return;
+    }
+    this.db.exec(`
+      begin;
+      alter table conversations rename to conversations_legacy;
+      create table conversations (
+        conversation_id text primary key,
+        peer_inbox_id text,
+        title text not null,
+        updated_at text,
+        data text not null
+      );
+      insert into conversations select conversation_id, peer_inbox_id, title, updated_at, data from conversations_legacy;
+      drop table conversations_legacy;
+      commit;
+    `);
   }
 
   private readContact(whereClause: string, value: string): Contact | null {
@@ -260,4 +297,13 @@ interface DataRow {
 
 function parseDataRow<T>(row: DataRow): T {
   return JSON.parse(row.data) as T;
+}
+
+function parseStringArray(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === 'string') : [];
+  } catch {
+    return [];
+  }
 }

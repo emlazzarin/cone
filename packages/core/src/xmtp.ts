@@ -8,14 +8,22 @@
 // `@cone/core` entry.
 
 import { normalizeDeliveryStatus } from './display';
+import { GROUP_UPDATE_TYPE, type GroupUpdateEnvelope } from './envelope';
 import { isEvmAddress } from './validation';
 import type {
+  ConeConsentState,
   ConeConversation,
+  ConeGroupMember,
   ConeIdentity,
+  ConsentFilter,
+  ConversationKind,
+  CreateGroupOptions,
+  GroupMemberLevel,
   IdentityRef,
   IncomingMessage,
   MessageHandler,
   MessageListOptions,
+  MessageRetention,
   ResolvedIdentity,
   SentMessage,
   Unsubscribe,
@@ -31,15 +39,63 @@ export interface SdkIdentifier {
   identifierKind: unknown;
 }
 
-// Structural view of an SDK DM conversation. peerInboxId is intentionally
-// absent: it is a property on node DMs and an async method on browser DMs,
-// so the bridge resolves it.
-export interface SdkDm {
+// One XMTP consent record, identical in shape across both SDK bindings.
+export interface SdkConsentRecord {
+  entityType: unknown;
+  state: unknown;
+  entity: string;
+}
+
+// The SDK's MessageDisappearingSettings: fromNs is the epoch-ns timestamp the
+// rule starts, inNs the retention duration. Fields typed unknown because the
+// bindings hand back bigint (node) and have used number elsewhere; nsToIso/
+// nsToMs normalize both.
+export interface SdkDisappearingSettings {
+  fromNs: unknown;
+  inNs: unknown;
+}
+
+// Structural view of the conversation surface shared by SDK DMs and groups.
+// consentState and messageDisappearingSettings are sync on node, async on
+// browser.
+export interface SdkConversation {
   id: string;
   topic?: string;
   createdAt?: Date;
   sendText(text: string): Promise<string>;
   messages(options?: Record<string, unknown>): Promise<unknown[]>;
+  consentState(): MaybePromise<unknown>;
+  messageDisappearingSettings(): MaybePromise<SdkDisappearingSettings | null | undefined>;
+  updateMessageDisappearingSettings(fromNs: bigint, inNs: bigint): Promise<void>;
+  removeMessageDisappearingSettings(): Promise<void>;
+}
+
+// Structural view of an SDK DM conversation. peerInboxId is intentionally
+// absent: it is a property on node DMs and an async method on browser DMs,
+// so the bridge resolves it.
+export interface SdkDm extends SdkConversation {}
+
+// One group member as both bindings shape it ({ inboxId, permissionLevel,
+// consentState, installationIds }); enum values stay unknown and are mapped
+// via injected values.
+export interface SdkGroupMember {
+  inboxId: string;
+  permissionLevel: unknown;
+  consentState: unknown;
+}
+
+// Structural view of an SDK group. The metadata accessors are sync getter
+// properties on both SDKs (browser reads a cached snapshot and may yield
+// undefined until a sync). addMembers/removeMembers take canonical inbox IDs;
+// requestRemoval is "leave".
+export interface SdkGroup extends SdkConversation {
+  readonly name?: string;
+  readonly description?: string;
+  readonly addedByInboxId?: string;
+  members(): Promise<SdkGroupMember[]>;
+  addMembers(inboxIds: string[]): Promise<void>;
+  removeMembers(inboxIds: string[]): Promise<void>;
+  requestRemoval(): Promise<void>;
 }
 
 // Structural view of the SDK client surface this adapter uses. Methods that
@@ -51,18 +107,47 @@ export interface SdkClient {
     streamAllMessages(handlers: {
       onValue: (message: unknown) => void;
       onError: (error: unknown) => void;
+      consentStates?: unknown[];
+      conversationType?: unknown;
     }): Promise<{ return(): unknown }>;
-    syncAll(): Promise<unknown>;
-    listDms(): MaybePromise<SdkDm[]>;
-    getConversationById(conversationId: string): MaybePromise<SdkDm | null | undefined>;
+    syncAll(consentStates?: unknown[]): Promise<unknown>;
+    listDms(options?: { consentStates?: unknown[] }): MaybePromise<SdkDm[]>;
+    listGroups(options?: { consentStates?: unknown[] }): MaybePromise<SdkGroup[]>;
+    createGroup(inboxIds: string[], options?: Record<string, unknown>): Promise<SdkGroup>;
+    getConversationById(conversationId: string): MaybePromise<SdkConversation | null | undefined>;
     fetchDmByIdentifier(identifier: SdkIdentifier): MaybePromise<SdkDm | null | undefined>;
     createDmWithIdentifier(identifier: SdkIdentifier): Promise<SdkDm>;
     getDmByInboxId(inboxId: string): MaybePromise<SdkDm | null | undefined>;
     createDm(inboxId: string): Promise<SdkDm>;
   };
+  preferences: {
+    setConsentStates(records: SdkConsentRecord[]): Promise<void>;
+    getConsentState(entityType: unknown, entity: string): Promise<unknown>;
+  };
   fetchInboxIdByIdentifier(identifier: SdkIdentifier): MaybePromise<string | null | undefined>;
   canMessage(identifiers: SdkIdentifier[]): Promise<Map<string, boolean>>;
   close(): MaybePromise<unknown>;
+}
+
+// The SDK's ConsentState enum values keyed by our union, plus its
+// ConsentEntityType values for inbox- and group-level consent. Injected by the
+// adapter packages (like ethereumIdentifierKind) so core never imports a
+// specific SDK build. The values are XMTP protocol integers
+// (Unknown=0/Allowed=1/Denied=2; GroupId=0/InboxId=1) that the native layer
+// reads and returns directly.
+export interface SdkConsent {
+  unknown: unknown;
+  allowed: unknown;
+  denied: unknown;
+  inboxEntityType: unknown;
+  groupEntityType: unknown;
+}
+
+// The SDK's PermissionLevel enum values (Member=0/Admin=1/SuperAdmin=2).
+export interface SdkPermissionLevels {
+  member: unknown;
+  admin: unknown;
+  superAdmin: unknown;
 }
 
 export interface SdkXmtpAdapterOptions {
@@ -72,6 +157,21 @@ export interface SdkXmtpAdapterOptions {
   address: string;
   /** The SDK's IdentifierKind.Ethereum value. */
   ethereumIdentifierKind: unknown;
+  /** The SDK's ConsentState enum values + ConsentEntityType values. */
+  consent: SdkConsent;
+  /** The SDK's GroupMember PermissionLevel enum values. */
+  permissionLevels: SdkPermissionLevels;
+  /** The SDK's GroupPermissionsOptions.AdminOnly value (the "locked" preset). */
+  adminOnlyPermissions: unknown;
+  /**
+   * The SDK's ConversationType.Dm and ConversationType.Group values. The
+   * message stream is opened once per type so every delivered message is
+   * tagged with its conversation kind — a group message must never be
+   * mistaken for a DM (it would be persisted as a DM-shaped conversation
+   * keyed to whoever spoke first).
+   */
+  dmConversationType: unknown;
+  groupConversationType: unknown;
   /** Resolves a DM's peer inbox ID (property on node, async method on browser). */
   peerInboxId(dm: SdkDm): MaybePromise<string>;
 }
@@ -137,37 +237,157 @@ class SdkXmtpAdapter implements XmtpAdapter {
     };
   }
 
-  async streamMessages(handler: MessageHandler): Promise<Unsubscribe> {
-    const stream = await this.client.conversations.streamAllMessages({
-      onValue: (message: unknown) => {
-        if (isDelivered(message)) {
-          void handler(toIncomingMessage(message));
-        }
-      },
-      onError: (error: unknown) => {
-        console.error(error);
-      },
-    });
+  // One SDK stream per conversation type, so every message is tagged with its
+  // kind. The unsubscribe closes both.
+  async streamMessages(handler: MessageHandler, filter?: ConsentFilter): Promise<Unsubscribe> {
+    const consentStates = this.consentFilter(filter);
+    const open = (conversationType: unknown, kind: ConversationKind) =>
+      this.client.conversations.streamAllMessages({
+        onValue: (message: unknown) => {
+          if (isDelivered(message)) {
+            void handler(toIncomingMessage(message, kind));
+          }
+        },
+        onError: (error: unknown) => {
+          console.error(error);
+        },
+        conversationType,
+        ...(consentStates ? { consentStates } : {}),
+      });
+
+    const [dmStream, groupStream] = await Promise.all([
+      open(this.options.dmConversationType, 'dm'),
+      open(this.options.groupConversationType, 'group'),
+    ]);
 
     return () => {
-      void stream.return();
+      void dmStream.return();
+      void groupStream.return();
     };
   }
 
-  async sync(): Promise<XmtpSyncResult> {
-    await this.client.conversations.syncAll();
-    const dms = await this.client.conversations.listDms();
-    const conversations = await Promise.all(dms.map((dm) => this.toConeConversation(dm)));
-    const messages = (await Promise.all(dms.map((dm) => dm.messages())))
-      .flat()
-      .filter(isDelivered)
-      .map(toIncomingMessage);
+  async sync(filter?: ConsentFilter): Promise<XmtpSyncResult> {
+    const consentStates = this.consentFilter(filter);
+    await this.client.conversations.syncAll(consentStates);
+    const listOptions = consentStates ? { consentStates } : undefined;
+    const dms = await this.client.conversations.listDms(listOptions);
+    const groups = await this.client.conversations.listGroups(listOptions);
+    const conversations = await Promise.all([
+      ...dms.map((dm) => this.toDmConversation(dm)),
+      ...groups.map((group) => this.toGroupConversation(group)),
+    ]);
+    const messagesOf = async (conversation: SdkConversation, kind: ConversationKind) =>
+      (await conversation.messages()).filter(isDelivered).map((message) => toIncomingMessage(message, kind));
+    const messages = (await Promise.all([
+      ...dms.map((dm) => messagesOf(dm, 'dm')),
+      ...groups.map((group) => messagesOf(group, 'group')),
+    ])).flat();
     return { conversations, messages };
   }
 
-  async listConversations(): Promise<ConeConversation[]> {
-    const dms = await this.client.conversations.listDms();
-    return Promise.all(dms.map((dm) => this.toConeConversation(dm)));
+  async listConversations(filter?: ConsentFilter): Promise<ConeConversation[]> {
+    const consentStates = this.consentFilter(filter);
+    const listOptions = consentStates ? { consentStates } : undefined;
+    const dms = await this.client.conversations.listDms(listOptions);
+    const groups = await this.client.conversations.listGroups(listOptions);
+    return Promise.all([
+      ...dms.map((dm) => this.toDmConversation(dm)),
+      ...groups.map((group) => this.toGroupConversation(group)),
+    ]);
+  }
+
+  async setConsent(inboxId: string, state: ConeConsentState): Promise<void> {
+    await this.client.preferences.setConsentStates([{
+      entityType: this.options.consent.inboxEntityType,
+      state: this.options.consent[state],
+      entity: inboxId,
+    }]);
+  }
+
+  async getConsent(inboxId: string): Promise<ConeConsentState> {
+    return this.fromSdkConsent(await this.client.preferences.getConsentState(this.options.consent.inboxEntityType, inboxId));
+  }
+
+  // Group consent is keyed by the conversation id (XMTP ConsentEntityType.GroupId).
+  async setGroupConsent(conversationId: string, state: ConeConsentState): Promise<void> {
+    await this.client.preferences.setConsentStates([{
+      entityType: this.options.consent.groupEntityType,
+      state: this.options.consent[state],
+      entity: conversationId,
+    }]);
+  }
+
+  async createGroup(memberInboxIds: string[], options: CreateGroupOptions = {}): Promise<ConeConversation> {
+    const group = await this.client.conversations.createGroup(memberInboxIds, {
+      ...(options.name ? { groupName: options.name } : {}),
+      ...(options.description ? { groupDescription: options.description } : {}),
+      ...(options.locked ? { permissions: this.options.adminOnlyPermissions } : {}),
+    });
+    return this.toGroupConversation(group);
+  }
+
+  async getGroupInfo(conversationId: string): Promise<ConeConversation | null> {
+    const conversation = await this.client.conversations.getConversationById(conversationId);
+    if (!conversation || !isSdkGroup(conversation)) {
+      return null;
+    }
+    return this.toGroupConversation(conversation);
+  }
+
+  async listGroupMembers(conversationId: string): Promise<ConeGroupMember[]> {
+    return this.groupMembers(await this.getGroup(conversationId));
+  }
+
+  async addGroupMembers(conversationId: string, memberInboxIds: string[]): Promise<void> {
+    await (await this.getGroup(conversationId)).addMembers(memberInboxIds);
+  }
+
+  async removeGroupMembers(conversationId: string, memberInboxIds: string[]): Promise<void> {
+    await (await this.getGroup(conversationId)).removeMembers(memberInboxIds);
+  }
+
+  async leaveGroup(conversationId: string): Promise<void> {
+    await (await this.getGroup(conversationId)).requestRemoval();
+  }
+
+  async sendToConversation(conversationId: string, text: string): Promise<SentMessage> {
+    const conversation = await this.client.conversations.getConversationById(conversationId);
+    if (!conversation) {
+      throw new Error(`conversation not found: ${conversationId}`);
+    }
+    const messageId = await conversation.sendText(text);
+    return {
+      messageId,
+      conversationId,
+      sentAt: new Date().toISOString(),
+      deliveryStatus: 'published',
+    };
+  }
+
+  // Writes the conversation's native XMTP disappearing-messages settings,
+  // which propagate to the peer (and other compliant clients) as a metadata
+  // update. null removes the settings (timer off).
+  async setRetention(conversationId: string, retention: MessageRetention | null): Promise<void> {
+    const conversation = await this.client.conversations.getConversationById(conversationId);
+    if (!conversation) {
+      throw new Error(`conversation not found: ${conversationId}`);
+    }
+    if (retention) {
+      await conversation.updateMessageDisappearingSettings(
+        isoToNs(retention.fromAt),
+        BigInt(retention.durationMs) * 1_000_000n,
+      );
+    } else {
+      await conversation.removeMessageDisappearingSettings();
+    }
+  }
+
+  async getRetention(conversationId: string): Promise<MessageRetention | null> {
+    const conversation = await this.client.conversations.getConversationById(conversationId);
+    if (!conversation) {
+      return null;
+    }
+    return fromSdkRetention(await conversation.messageDisappearingSettings()) ?? null;
   }
 
   async listMessages(conversationId: string, options?: MessageListOptions): Promise<IncomingMessage[]> {
@@ -175,8 +395,9 @@ class SdkXmtpAdapter implements XmtpAdapter {
     if (!conversation) {
       return [];
     }
+    const kind: ConversationKind = isSdkGroup(conversation) ? 'group' : 'dm';
     const messages = await conversation.messages(toSdkMessageOptions(options ?? {}));
-    return messages.filter(isDelivered).map(toIncomingMessage);
+    return messages.filter(isDelivered).map((message) => toIncomingMessage(message, kind));
   }
 
   async close(): Promise<void> {
@@ -201,14 +422,79 @@ class SdkXmtpAdapter implements XmtpAdapter {
       await this.client.conversations.createDm(identity.inboxId);
   }
 
-  private async toConeConversation(dm: SdkDm): Promise<ConeConversation> {
+  private async getGroup(conversationId: string): Promise<SdkGroup> {
+    const conversation = await this.client.conversations.getConversationById(conversationId);
+    if (!conversation || !isSdkGroup(conversation)) {
+      throw new Error(`group not found: ${conversationId}`);
+    }
+    return conversation;
+  }
+
+  private async toDmConversation(dm: SdkDm): Promise<ConeConversation> {
     const peerInboxId = await this.options.peerInboxId(dm);
     return {
       conversationId: dm.id,
+      kind: 'dm',
       peerInboxId,
       title: peerInboxId,
       updatedAt: dm.createdAt?.toISOString(),
+      consentState: this.fromSdkConsent(await dm.consentState()),
+      retention: fromSdkRetention(await dm.messageDisappearingSettings()),
     };
+  }
+
+  private async toGroupConversation(group: SdkGroup): Promise<ConeConversation> {
+    const members = await this.groupMembers(group);
+    const name = group.name?.trim() || undefined;
+    return {
+      conversationId: group.id,
+      kind: 'group',
+      title: name ?? `Group (${members.length})`,
+      groupName: name,
+      groupDescription: group.description?.trim() || undefined,
+      memberCount: members.length,
+      addedByInboxId: group.addedByInboxId,
+      members,
+      updatedAt: group.createdAt?.toISOString(),
+      consentState: this.fromSdkConsent(await group.consentState()),
+      retention: fromSdkRetention(await group.messageDisappearingSettings()),
+    };
+  }
+
+  private async groupMembers(group: SdkGroup): Promise<ConeGroupMember[]> {
+    const members = await group.members();
+    return members.map((member) => ({
+      inboxId: member.inboxId,
+      level: this.fromSdkPermissionLevel(member.permissionLevel),
+      consentState: this.fromSdkConsent(member.consentState),
+    }));
+  }
+
+  private fromSdkPermissionLevel(value: unknown): GroupMemberLevel {
+    if (value === this.options.permissionLevels.superAdmin) {
+      return 'superAdmin';
+    }
+    if (value === this.options.permissionLevels.admin) {
+      return 'admin';
+    }
+    return 'member';
+  }
+
+  // No filter => undefined => the SDK returns everything; the ConeClient always
+  // passes an explicit filter (allowed-only by default), so policy lives there
+  // and the adapter stays mechanism.
+  private consentFilter(filter?: ConsentFilter): unknown[] | undefined {
+    return filter?.consentStates?.map((state) => this.options.consent[state]);
+  }
+
+  private fromSdkConsent(value: unknown): ConeConsentState {
+    if (value === this.options.consent.allowed) {
+      return 'allowed';
+    }
+    if (value === this.options.consent.denied) {
+      return 'denied';
+    }
+    return 'unknown';
   }
 }
 
@@ -219,11 +505,11 @@ function isDelivered(message: unknown): boolean {
   return normalizeDeliveryStatus((message as { deliveryStatus?: unknown }).deliveryStatus) === 'published';
 }
 
-function toIncomingMessage(message: unknown): IncomingMessage {
+function toIncomingMessage(message: unknown, kind: ConversationKind = 'dm'): IncomingMessage {
   const record = message as Record<string, unknown>;
   const content = record.content;
-  let json: unknown;
-  if (typeof content === 'string') {
+  let json: unknown = decodeGroupUpdate(record);
+  if (json === undefined && typeof content === 'string') {
     try {
       const parsed = JSON.parse(content) as unknown;
       if (typeof parsed === 'object' && parsed !== null) {
@@ -237,6 +523,7 @@ function toIncomingMessage(message: unknown): IncomingMessage {
   return {
     messageId: String(record.id ?? crypto.randomUUID()),
     conversationId: String(record.conversationId ?? record.topic ?? 'unknown'),
+    conversationKind: kind,
     senderInboxId: String(record.senderInboxId ?? record.sender ?? 'unknown'),
     senderAddress: typeof record.senderAddress === 'string' ? record.senderAddress : undefined,
     sentAt: record.sentAt instanceof Date ? record.sentAt.toISOString() : nsToIso(record.sentAtNs) ?? new Date().toISOString(),
@@ -250,6 +537,64 @@ function toIncomingMessage(message: unknown): IncomingMessage {
   };
 }
 
+// XMTP delivers membership/metadata changes as GroupUpdated system messages
+// (contentType typeId 'group_updated', content decoded by the bindings).
+// Normalize them into Cone's control envelope so they store and render like
+// any other cos.* control message.
+function decodeGroupUpdate(record: Record<string, unknown>): GroupUpdateEnvelope | undefined {
+  const contentType = record.contentType as { typeId?: unknown } | null | undefined;
+  if (contentType?.typeId !== 'group_updated') {
+    return undefined;
+  }
+  const content = (record.content ?? {}) as {
+    initiatedByInboxId?: unknown;
+    addedInboxes?: unknown;
+    removedInboxes?: unknown;
+    leftInboxes?: unknown;
+    metadataFieldChanges?: unknown;
+  };
+  return {
+    type: GROUP_UPDATE_TYPE,
+    initiatedByInboxId: String(content.initiatedByInboxId ?? 'unknown'),
+    added: inboxIdList(content.addedInboxes),
+    removed: inboxIdList(content.removedInboxes),
+    left: inboxIdList(content.leftInboxes),
+    metadataChanges: metadataChangeList(content.metadataFieldChanges),
+  };
+}
+
+function inboxIdList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => (entry as { inboxId?: unknown })?.inboxId)
+    .filter((inboxId): inboxId is string => typeof inboxId === 'string');
+}
+
+function metadataChangeList(value: unknown): GroupUpdateEnvelope['metadataChanges'] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((entry) => {
+    const change = entry as { fieldName?: unknown; oldValue?: unknown; newValue?: unknown } | null;
+    if (typeof change?.fieldName !== 'string') {
+      return [];
+    }
+    return [{
+      field: change.fieldName,
+      oldValue: typeof change.oldValue === 'string' ? change.oldValue : undefined,
+      newValue: typeof change.newValue === 'string' ? change.newValue : undefined,
+    }];
+  });
+}
+
+// Groups carry membership methods; DMs do not. This is how the union returned
+// by getConversationById is narrowed without importing SDK classes.
+function isSdkGroup(conversation: SdkConversation): conversation is SdkGroup {
+  return typeof (conversation as { addMembers?: unknown }).addMembers === 'function';
+}
+
 function nsToIso(value: unknown): string | null {
   if (typeof value === 'bigint') {
     return new Date(Number(value / 1_000_000n)).toISOString();
@@ -258,6 +603,29 @@ function nsToIso(value: unknown): string | null {
     return new Date(value / 1_000_000).toISOString();
   }
   return null;
+}
+
+function nsToMs(value: unknown): number | null {
+  if (typeof value === 'bigint') {
+    return Number(value / 1_000_000n);
+  }
+  if (typeof value === 'number') {
+    return value / 1_000_000;
+  }
+  return null;
+}
+
+// Absent settings or a non-positive duration both mean the timer is off.
+function fromSdkRetention(settings: SdkDisappearingSettings | null | undefined): MessageRetention | undefined {
+  if (!settings) {
+    return undefined;
+  }
+  const fromAt = nsToIso(settings.fromNs);
+  const durationMs = nsToMs(settings.inNs);
+  if (!fromAt || !durationMs || durationMs <= 0) {
+    return undefined;
+  }
+  return { durationMs, fromAt };
 }
 
 function toSdkMessageOptions(options: MessageListOptions): Record<string, unknown> {

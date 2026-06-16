@@ -90,10 +90,77 @@ try {
     'Alice local read model did not include Bob message',
   );
 
+  // --- Groups: create, welcome consent policy, fan-out, request flow ---
+  const carolSecret = generateSecretKey();
+  await assertCommand(['login', '--secret-stdin', '--remember'], { actor: 'carol', stdin: carolSecret });
+  const carolIdentity = JSON.parse((await assertCommand(['whoami'], { actor: 'carol' })).stdout) as { inboxId: string };
+
+  // Alice creates a group with Bob (her contact) and Carol (a stranger to both).
+  const group = JSON.parse((await assertCommand(
+    ['group', 'create', '--name', 'Live Crew', '--member', 'bob', '--member', carolIdentity.inboxId],
+    { actor: 'alice' },
+  )).stdout) as { conversationId: string; kind: string };
+  assertEqual(group.kind, 'group', 'created conversation is not a group');
+
+  await sleep(5_000); // welcome propagation
+
+  // Bob knows Alice (address-book contact) -> the toggle (default on) auto-allows on sync.
+  await assertCommand(['inbox', 'sync'], { actor: 'bob' });
+  const bobInbox = JSON.parse((await assertCommand(['inbox'], { actor: 'bob' })).stdout) as {
+    conversations: Array<{ conversationId: string; kind?: string; consentState: string }>;
+  };
+  const bobGroup = bobInbox.conversations.find((conversation) => conversation.conversationId === group.conversationId);
+  if (!bobGroup) {
+    throw new Error('Bob did not auto-allow the group added by his contact Alice');
+  }
+  assertEqual(bobGroup.kind ?? 'missing', 'group', 'Bob stored the group as a non-group conversation');
+
+  // Carol does not know Alice -> the group lands in Requests until accepted.
+  await assertCommand(['inbox', 'sync'], { actor: 'carol' });
+  const carolRequests = JSON.parse((await assertCommand(['requests'], { actor: 'carol' })).stdout) as Array<{ conversationId: string }>;
+  if (!carolRequests.some((conversation) => conversation.conversationId === group.conversationId)) {
+    throw new Error('Carol did not see the unknown-adder group as a Request');
+  }
+  await assertCommand(['requests', 'accept', group.conversationId], { actor: 'carol' });
+
+  // Fan-out: Alice sends once; Bob and Carol both receive it on live streams.
+  const bobGroupListen = runCommand(['listen', '--once', '--timeout-ms', '120000'], { actor: 'bob' });
+  const carolGroupListen = runCommand(['listen', '--once', '--timeout-ms', '120000'], { actor: 'carol' });
+  await sleep(5_000);
+  const groupSent = JSON.parse((await assertCommand(
+    ['group', 'send', group.conversationId, '--text', 'live group hello'],
+    { actor: 'alice' },
+  )).stdout) as { messageId: string };
+  const bobGroupMessage = parseJsonLine((await assertResult(await bobGroupListen)).stdout) as {
+    messageId: string;
+    conversationKind?: string;
+    senderInboxId: string;
+  };
+  const carolGroupMessage = parseJsonLine((await assertResult(await carolGroupListen)).stdout) as { messageId: string };
+  assertEqual(bobGroupMessage.messageId, groupSent.messageId, 'Bob received a different group message id');
+  assertEqual(carolGroupMessage.messageId, groupSent.messageId, 'Carol received a different group message id');
+  assertEqual(bobGroupMessage.senderInboxId, aliceIdentity.inboxId, 'Bob saw the wrong group sender');
+  assertEqual(bobGroupMessage.conversationKind ?? 'missing', 'group', 'group message was not tagged with its kind');
+
+  // Membership and roles: three members, creator is super admin.
+  const groupInfo = JSON.parse((await assertCommand(['group', 'info', group.conversationId], { actor: 'alice' })).stdout) as {
+    members: Array<{ inboxId: string; level: string }>;
+  };
+  if (groupInfo.members.length !== 3) {
+    throw new Error(`expected 3 group members, got ${groupInfo.members.length}`);
+  }
+  assertEqual(
+    groupInfo.members.find((member) => member.inboxId === aliceIdentity.inboxId)?.level ?? 'missing',
+    'superAdmin',
+    'group creator is not super admin',
+  );
+
   console.log(JSON.stringify({
     alice: aliceIdentity.inboxId,
     bob: bobIdentity.inboxId,
-    messages: [sentToBob.messageId, sentToAlice.messageId],
+    carol: carolIdentity.inboxId,
+    group: group.conversationId,
+    messages: [sentToBob.messageId, sentToAlice.messageId, groupSent.messageId],
     ok: true,
     runDir,
   }, null, 2));

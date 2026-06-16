@@ -8,6 +8,10 @@ import { defaultConfigPath } from './paths';
 export interface CliConfig {
   secretKey?: string;
   readReceipts?: boolean;
+  // "Allow contacts to add you to groups" (default true): a group add from an
+  // address-book contact lands directly in Chats; off routes every add to
+  // Requests. Adds from blocked inboxes are always discarded silently.
+  groupAutoAllow?: boolean;
 }
 
 export function readConfig(path = defaultConfigPath()): CliConfig {

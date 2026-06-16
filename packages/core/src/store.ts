@@ -85,6 +85,14 @@ export class MemoryStore implements ConeStore {
     );
   }
 
+  // Deletes the stored payload only; the processed-message marker is kept so
+  // the message cannot be re-ingested (e.g. an expired message still present
+  // in the XMTP-level DB on the next sync).
+  deleteMessage(messageId: string): Promise<void> {
+    this.messagesById.delete(messageId);
+    return Promise.resolve();
+  }
+
   markMessageProcessed(messageId: string): Promise<boolean> {
     if (this.processedMessageIds.has(messageId)) {
       return Promise.resolve(false);

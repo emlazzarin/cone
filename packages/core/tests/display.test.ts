@@ -86,3 +86,37 @@ describe('delivery status', () => {
     expect(normalizeDeliveryStatus('weird')).toBe('published');
   });
 });
+
+describe('group updates', () => {
+  const update = {
+    type: 'cos.group.update.v1' as const,
+    initiatedByInboxId: 'inbox-alice',
+    added: ['inbox-bob'],
+    removed: [] as string[],
+    left: ['inbox-carol'],
+    metadataChanges: [{ field: 'group_name', oldValue: 'Old', newValue: 'Crew' }],
+  };
+
+  test('formatGroupUpdate renders attributed system lines', async () => {
+    const { formatGroupUpdate } = await import('../src/index');
+    const names: Record<string, string> = { 'inbox-alice': 'Alice', 'inbox-bob': 'Bob', 'inbox-carol': 'Carol' };
+    expect(formatGroupUpdate(update, (inboxId) => names[inboxId] ?? inboxId)).toEqual([
+      'Alice added Bob',
+      'Carol left',
+      'Alice renamed the group to Crew',
+    ]);
+  });
+
+  test('an empty update still yields an attributed line', async () => {
+    const { formatGroupUpdate } = await import('../src/index');
+    expect(formatGroupUpdate({ ...update, added: [], left: [], metadataChanges: [] })).toEqual([
+      'inbox-alice updated the group',
+    ]);
+  });
+
+  test('group updates are control messages, hidden from transcripts but humanized in previews', async () => {
+    const { messageBody } = await import('../src/index');
+    expect(isVisibleChatMessage({ kind: 'control', json: update })).toBe(false);
+    expect(messageBody({ json: update })).toBe('[inbox-alice added inbox-bob; inbox-carol left; inbox-alice renamed the group to Crew]');
+  });
+});

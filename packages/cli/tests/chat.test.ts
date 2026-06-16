@@ -25,7 +25,7 @@ describe('cos chat', () => {
       { env: 'dev', inboxId: 'inbox-alice-long' },
       [{
         conversationId: 'dm-bob',
-        peerInboxId: 'inbox-bob-long',
+        kind: 'dm' as const, peerInboxId: 'inbox-bob-long', consentState: 'allowed' as const,
         title: 'PWA Tester',
         updatedAt: '2026-01-01T00:00:00.000Z',
       }],
@@ -51,7 +51,9 @@ describe('cos chat', () => {
     expect(output).toContain('you inbox-...long');
     expect(output).toContain("16:39 - PWA Tester: hey what's your name");
     expect(output).toContain('Enter talk');
-    expect(output).toContain('n new message');
+    expect(output).toContain('n new');
+    expect(output).toContain('r name');
+    expect(output).toContain('c/p pair');
     expect(output).toContain('/ filter');
     expect(output).toContain('d delete');
     expect(output).not.toContain('unread');
@@ -60,7 +62,6 @@ describe('cos chat', () => {
     expect(output).not.toContain('Chat(select)');
     expect(output).not.toContain('sync:idle stream:online');
     expect(output).not.toContain('send/run');
-    expect(output).not.toContain('p pair');
   });
 
   test('renders chat mode as an insert-like message composer', () => {
@@ -68,7 +69,7 @@ describe('cos chat', () => {
       { env: 'dev', inboxId: 'inbox-alice-long' },
       [{
         conversationId: 'dm-bob',
-        peerInboxId: 'inbox-bob-long',
+        kind: 'dm' as const, peerInboxId: 'inbox-bob-long', consentState: 'allowed' as const,
         title: 'Bob',
       }],
     );
@@ -116,7 +117,7 @@ describe('cos chat', () => {
     expect(output).toContain('Updated: 2026-01-01T00:00:00.000Z');
     expect(output).toContain('r rename');
     expect(output).toContain('d delete');
-    expect(output).toContain('c code');
+    expect(output).toContain('c create code');
     expect(output).toContain('p join code');
   });
 
@@ -159,8 +160,8 @@ describe('cos chat', () => {
     expect(renderChat(deleteState, 90, 18)).toContain('Type DELETE to confirm');
     expect(renderChat(pairState, 90, 18)).toContain('Handshake code');
     expect(renderChat(pairState, 90, 18)).not.toContain('blank creates one');
-    expect(renderChat(pairState, 90, 18)).toContain('Share my name (optional)');
-    expect(renderChat(pairState, 90, 18)).toContain('Save the other side as (optional)');
+    expect(renderChat(pairState, 90, 18)).toContain('Offer them a name for you (optional)');
+    expect(renderChat(pairState, 90, 18)).toContain('Save their name as (optional)');
     expect(renderChat(codeState, 90, 18)).toContain('forest-wormhole-direction');
     expect(renderChat(codeState, 90, 18)).toContain('Code expires at');
     expect(renderChat(codeState, 90, 18)).toContain('CLI: cos pair forest-wormhole-direction');
@@ -169,7 +170,7 @@ describe('cos chat', () => {
   test('renders local chat deletion as a structured confirmation form', () => {
     const conversation = {
       conversationId: 'dm-bob',
-      peerInboxId: 'inbox-bob',
+      kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const,
       title: 'Bob',
     };
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
@@ -186,7 +187,7 @@ describe('cos chat', () => {
   test('starts local chat deletion from Chat(select) and submits after confirmation', async () => {
     const conversation = {
       conversationId: 'dm-bob',
-      peerInboxId: 'inbox-bob',
+      kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const,
       title: 'Bob',
     };
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
@@ -214,7 +215,7 @@ describe('cos chat', () => {
   test('chat Enter clears the composer before network send resolves', async () => {
     const conversation = {
       conversationId: 'dm-bob',
-      peerInboxId: 'inbox-bob',
+      kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const,
       title: 'Bob',
     };
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
@@ -253,7 +254,7 @@ describe('cos chat', () => {
   test('renders optimistic outbound rows instantly and marks failures with retry', async () => {
     const conversation = {
       conversationId: 'dm-bob',
-      peerInboxId: 'inbox-bob',
+      kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const,
       title: 'Bob',
     };
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
@@ -307,7 +308,7 @@ describe('cos chat', () => {
   });
 
   test('shows a single ✓✓ Read marker on the latest read outbound message', () => {
-    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const conversation = { conversationId: 'dm-bob', kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const, title: 'Bob' };
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
     state.messages = [
       { conversationId: 'dm-bob', direction: 'outbound', kind: 'text', messageId: 'o1', senderInboxId: 'inbox-alice', sentAt: '2026-01-01T10:00:00.000Z', text: 'first' },
@@ -321,10 +322,14 @@ describe('cos chat', () => {
     expect(output).not.toContain('[read]');
     // Exactly one marker.
     expect(output.match(/Read/g)?.length).toBe(1);
+    // It is appended inline to its message's row (no separate, jumpy line).
+    const markerLine = output.split('\n').find((line) => line.includes('✓✓ Read'));
+    expect(markerLine).toContain('second');
+    expect(markerLine).not.toContain('first');
   });
 
   test('hides read state and the receipt line when read receipts are off', () => {
-    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const conversation = { conversationId: 'dm-bob', kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const, title: 'Bob' };
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
     state.readReceipts = false;
     state.messages = [
@@ -338,7 +343,7 @@ describe('cos chat', () => {
   });
 
   test('R toggles read receipts and sends one when viewing new inbound messages', async () => {
-    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const conversation = { conversationId: 'dm-bob', kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const, title: 'Bob' };
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
     const receipts: string[] = [];
     const client = stubClient({
@@ -361,7 +366,7 @@ describe('cos chat', () => {
   });
 
   test('Ctrl+X discards a failed message instead of retrying it', async () => {
-    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const conversation = { conversationId: 'dm-bob', kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const, title: 'Bob' };
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
     state.mode = 'chat-talk';
     state.input = 'doomed';
@@ -380,7 +385,7 @@ describe('cos chat', () => {
   });
 
   test('Ctrl+X also discards a failed message from the chat list', async () => {
-    const conversation = { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' };
+    const conversation = { conversationId: 'dm-bob', kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const, title: 'Bob' };
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
     state.mode = 'chat-talk';
     state.input = 'doomed';
@@ -404,7 +409,7 @@ describe('cos chat', () => {
       { env: 'dev', inboxId: 'inbox-alice' },
       [{
         conversationId: 'dm-bob',
-        peerInboxId: 'inbox-bob',
+        kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const,
         title: 'Bob',
       }],
       [{
@@ -436,8 +441,9 @@ describe('cos chat', () => {
       { env: 'dev', inboxId: 'inbox-alice' },
       Array.from({ length: 30 }, (_, index) => ({
         conversationId: `dm-${index}`,
-        peerInboxId: `inbox-${index}`,
+        kind: 'dm' as const, peerInboxId: `inbox-${index}`,
         title: `Chat ${index}`,
+        consentState: 'allowed' as const,
       })),
     );
     state.selectedIndex = 29;
@@ -448,13 +454,55 @@ describe('cos chat', () => {
     expect(output).not.toContain('Chat 0');
   });
 
+  test('joining a pairing code never blocks the UI and shows a waiting state', async () => {
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' });
+    let pairCalls = 0;
+    const client = stubClient({
+      // Pairing polls the rendezvous for up to a minute; simulate that it never
+      // settles. handleInput must still resolve promptly (no UI freeze).
+      pairWithCode: () => {
+        pairCalls += 1;
+        return new Promise<never>(() => {});
+      },
+    });
+    const noop = async () => {};
+
+    await handleInput('2', client, state, noop, noop, noop);
+    await handleInput('p', client, state, noop, noop, noop);
+    expect(state.editForm?.kind).toBe('pair-join');
+    state.editForm!.fields[0]!.value = 'anchor-beacon-cedar-drift-ember';
+
+    // Enter submits and returns immediately even though pairing hangs.
+    await handleInput('\r', client, state, noop, noop, noop);
+    expect(pairCalls).toBe(1);
+    expect(state.editForm?.pending).toBe(true);
+    expect(state.status).toContain('pairing');
+    expect(renderChat(state, 90, 20)).toContain('Waiting for the other side');
+
+    // A second Enter while pending must not kick off another pairing.
+    await handleInput('\r', client, state, noop, noop, noop);
+    expect(pairCalls).toBe(1);
+  });
+
+  test('shows a short form for an unnamed peer whose title is the raw inbox id', () => {
+    const longId = 'inbox-0123456789abcdef0123456789abcdef0123456789';
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [
+      { conversationId: 'dm-x', kind: 'dm' as const, peerInboxId: longId, title: longId, consentState: 'allowed' as const },
+    ]);
+
+    const output = renderChat(state, 100, 20);
+
+    expect(output).not.toContain(longId);
+    expect(output).toContain('inbox-...6789');
+  });
+
   test('sorts chats by recency and shows previews, times, and unread badges', () => {
     const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
     const state = createChatState(
       { env: 'dev', inboxId: 'inbox-alice' },
       [
-        { conversationId: 'dm-old', peerInboxId: 'inbox-old', title: 'Old Chat', updatedAt: minutesAgo(60 * 24 * 2) },
-        { conversationId: 'dm-new', peerInboxId: 'inbox-new', title: 'Fresh Chat', updatedAt: minutesAgo(60) },
+        { conversationId: 'dm-old', kind: 'dm' as const, peerInboxId: 'inbox-old', consentState: 'allowed' as const, title: 'Old Chat', updatedAt: minutesAgo(60 * 24 * 2) },
+        { conversationId: 'dm-new', kind: 'dm' as const, peerInboxId: 'inbox-new', consentState: 'allowed' as const, title: 'Fresh Chat', updatedAt: minutesAgo(60) },
       ],
     );
     applyConversationMeta(state, [
@@ -497,8 +545,8 @@ describe('cos chat', () => {
     const state = createChatState(
       { env: 'dev', inboxId: 'inbox-alice' },
       [
-        { conversationId: 'dm-bob', peerInboxId: 'inbox-bob', title: 'Bob' },
-        { conversationId: 'dm-codex', peerInboxId: 'inbox-codex', title: 'Codex' },
+        { conversationId: 'dm-bob', kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const, title: 'Bob' },
+        { conversationId: 'dm-codex', kind: 'dm' as const, peerInboxId: 'inbox-codex', consentState: 'allowed' as const, title: 'Codex' },
       ],
     );
 
@@ -555,7 +603,7 @@ describe('cos chat', () => {
       { env: 'dev', inboxId: 'inbox-alice' },
       [{
         conversationId: 'dm-bob',
-        peerInboxId: 'inbox-bob',
+        kind: 'dm' as const, peerInboxId: 'inbox-bob', consentState: 'allowed' as const,
         title: 'Bob',
       }],
     );
@@ -606,6 +654,176 @@ describe('cos chat', () => {
     expect(state.input).toBe('2');
   });
 
+  test('Requests sub-surface lists unknown senders and accepts/blocks them', async () => {
+    const refresh = async () => {
+      state.conversations = await client.listConversations();
+    };
+    const syncNow = async () => {};
+    const quit = async () => {};
+    const consent: Array<{ conversationId: string; state: string }> = [];
+    const client = stubClient({
+      setConversationConsent: async (conversationId, value) => {
+        consent.push({ conversationId, state: value });
+        state.conversations = state.conversations.map((conversation) =>
+          conversation.conversationId === conversationId ? { ...conversation, consentState: value } : conversation,
+        );
+      },
+    });
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [
+      { conversationId: 'dm-friend', kind: 'dm' as const, peerInboxId: 'inbox-friend', title: 'Friend', consentState: 'allowed' as const },
+      { conversationId: 'dm-spam', kind: 'dm' as const, peerInboxId: 'inbox-spam', title: 'inbox-spam', consentState: 'unknown' as const },
+    ]);
+
+    // Chats scope shows only the allowed conversation; the top bar advertises the request.
+    expect(visibleConversations(state).map((c) => c.title)).toEqual(['Friend']);
+    expect(renderChat(state, 100, 24)).toContain('1 request');
+
+    // 't' switches to the Requests sub-surface, which lists the unknown sender.
+    await handleInput('t', client, state, refresh, syncNow, quit);
+    expect(state.scope).toBe('requests');
+    expect(visibleConversations(state).map((c) => c.title)).toEqual(['inbox-spam']);
+    expect(renderChat(state, 100, 24)).toContain('a accept');
+
+    // Blocking requires two presses; one press only arms it.
+    await handleInput('b', client, state, refresh, syncNow, quit);
+    expect(consent).toHaveLength(0);
+    expect(state.status).toContain('press b again');
+    await handleInput('b', client, state, refresh, syncNow, quit);
+    expect(consent).toEqual([{ conversationId: 'dm-spam', state: 'denied' }]);
+    // Blocked sender leaves the requests list.
+    expect(visibleConversations(state).map((c) => c.title)).toEqual([]);
+  });
+
+  test('accepting a request marks the sender allowed', async () => {
+    const refresh = async () => {
+      state.conversations = await client.listConversations();
+    };
+    const consent: Array<{ conversationId: string; state: string }> = [];
+    const client = stubClient({
+      setConversationConsent: async (conversationId, value) => {
+        consent.push({ conversationId, state: value });
+        state.conversations = state.conversations.map((conversation) =>
+          conversation.conversationId === conversationId ? { ...conversation, consentState: value } : conversation,
+        );
+      },
+    });
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [
+      { conversationId: 'dm-spam', kind: 'dm' as const, peerInboxId: 'inbox-spam', title: 'inbox-spam', consentState: 'unknown' as const },
+    ]);
+
+    await handleInput('t', client, state, refresh, async () => {}, async () => {});
+    await handleInput('a', client, state, refresh, async () => {}, async () => {});
+    expect(consent).toEqual([{ conversationId: 'dm-spam', state: 'allowed' }]);
+  });
+
+  test('shows a cursor on the active form field', () => {
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' });
+    state.mode = 'contacts-edit';
+    state.editForm = createAddContactForm();
+    state.editForm.fields[0]!.value = 'Alice';
+
+    const plain = renderChat(state, 100, 20).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    // The selected field carries the cursor; the inactive field does not.
+    expect(plain).toContain('> Name: Alice█');
+    expect(plain).not.toContain('XMTP inbox ID or EVM address: █');
+  });
+
+  test('r names the selected chat\'s peer and saves a contact', async () => {
+    const saved: Array<{ name: string; inboxId?: string }> = [];
+    const client = stubClient({
+      saveContact: async (input) => {
+        saved.push({ name: input.name, inboxId: input.inboxId });
+        return { contactId: 'c1', createdAt: '', inboxId: input.inboxId ?? '', name: input.name, source: 'manual', updatedAt: '' };
+      },
+    });
+    const conversation = { conversationId: 'dm-x', kind: 'dm' as const, peerInboxId: 'inbox-x', title: 'inbox-x', consentState: 'allowed' as const };
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
+    const noop = async () => {};
+
+    await handleInput('r', client, state, noop, noop, noop);
+    expect(state.editForm?.kind).toBe('name-peer');
+    state.editForm!.fields[0]!.value = 'Xavier';
+    await handleInput('\r', client, state, noop, noop, noop);
+
+    expect(saved).toEqual([{ name: 'Xavier', inboxId: 'inbox-x' }]);
+    expect(state.mode).toBe('chat-select');
+  });
+
+  test('e sets the disappearing-messages timer for the selected chat', async () => {
+    const calls: Array<{ conversationId: string; durationMs: number | null }> = [];
+    const client = stubClient({
+      setRetention: async (conversationId, durationMs) => {
+        calls.push({ conversationId, durationMs });
+      },
+    });
+    const conversation = { conversationId: 'dm-x', kind: 'dm' as const, peerInboxId: 'inbox-x', title: 'Xavier', consentState: 'allowed' as const };
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
+    const noop = async () => {};
+
+    await handleInput('e', client, state, noop, noop, noop);
+    expect(state.editForm?.kind).toBe('timer');
+    expect(state.editForm?.fields[0]?.value).toBe('off');
+
+    // Down cycles through the shared presets: off → 30s → 5m → 1h.
+    await handleInput('[B', client, state, noop, noop, noop);
+    await handleInput('[B', client, state, noop, noop, noop);
+    await handleInput('[B', client, state, noop, noop, noop);
+    expect(state.editForm?.fields[0]?.value).toBe('1h');
+
+    await handleInput('\r', client, state, noop, noop, noop);
+    expect(calls).toEqual([{ conversationId: 'dm-x', durationMs: 3_600_000 }]);
+    expect(state.mode).toBe('chat-select');
+    expect(state.status).toBe('disappearing messages: 1h');
+  });
+
+  test('the timer form rejects junk durations and stays open', async () => {
+    const client = stubClient();
+    const conversation = { conversationId: 'dm-x', kind: 'dm' as const, peerInboxId: 'inbox-x', title: 'Xavier', consentState: 'allowed' as const };
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [conversation]);
+    const noop = async () => {};
+
+    await handleInput('e', client, state, noop, noop, noop);
+    state.editForm!.fields[0]!.value = 'banana';
+    await handleInput('\r', client, state, noop, noop, noop);
+
+    expect(state.mode).toBe('chat-compose');
+    expect(state.editForm?.error).toContain('invalid duration');
+  });
+
+  test('an active timer shows in the thread header', () => {
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [{
+      conversationId: 'dm-x',
+      kind: 'dm' as const, peerInboxId: 'inbox-x',
+      title: 'Xavier',
+      consentState: 'allowed' as const,
+      retention: { durationMs: 3_600_000, fromAt: '2026-01-01T00:00:00.000Z' },
+    }]);
+
+    const plain = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    expect(plain).toContain('timer 1h');
+    expect(plain).toContain('e timer');
+  });
+
+  test('c and p reach pairing from the chats view', async () => {
+    let created = 0;
+    const client = stubClient({
+      createHandshakeCode: async () => {
+        created += 1;
+        return { code: 'anchor-beacon-cedar-drift-ember', expiresAt: '2026-06-10T12:00:00.000Z' };
+      },
+    });
+    const noop = async () => {};
+
+    const createState = createChatState({ env: 'dev', inboxId: 'inbox-alice' });
+    await handleInput('c', client, createState, noop, noop, noop);
+    expect(created).toBe(1);
+    expect(createState.editForm?.kind).toBe('pair-create');
+
+    const joinState = createChatState({ env: 'dev', inboxId: 'inbox-alice' });
+    await handleInput('p', client, joinState, noop, noop, noop);
+    expect(joinState.editForm?.kind).toBe('pair-join');
+  });
+
   test('decodes coalesced and split terminal input chunks', () => {
     const decoder = new InputDecoder();
 
@@ -654,6 +872,22 @@ function stubClient(overrides: Partial<ConeClient> = {}): ConeClient {
     sendJson: async () => ({ messageId: 'sent-json', sentAt: '2026-01-01T00:00:00.000Z' }),
     sendReadReceipt: async () => {},
     sendText: async () => ({ conversationId: 'dm-peer', messageId: 'sent-text', sentAt: '2026-01-01T00:00:00.000Z' }),
+    sendToConversation: async (conversationId) => ({ conversationId, messageId: 'sent-conv', sentAt: '2026-01-01T00:00:00.000Z' }),
+    createGroup: async (input) => ({
+      conversationId: 'group-new',
+      kind: 'group',
+      title: input.name ?? 'Group',
+      groupName: input.name,
+      consentState: 'allowed',
+    }),
+    listGroupMembers: async () => [],
+    addGroupMembers: async () => {},
+    removeGroupMembers: async () => {},
+    leaveGroup: async () => {},
+    setConsent: async () => {},
+    setConversationConsent: async () => {},
+    setRetention: async () => {},
+    purgeExpiredMessages: async () => 0,
     streamMessages: async () => () => {},
     sync: async () => ({
       completedAt: '2026-01-01T00:00:00.000Z',

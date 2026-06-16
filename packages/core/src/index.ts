@@ -35,7 +35,12 @@ export {
   formatSyncStatus,
   formatTranscriptLine,
   formatTranscriptTime,
+  formatGroupUpdate,
+  isAllowedConversation,
+  isDeniedConversation,
+  isGroupConversation,
   isReadReceipt,
+  isRequestConversation,
   isVisibleChatMessage,
   laterIso,
   latestInboundAt,
@@ -48,18 +53,28 @@ export {
 export type { ConeConnectionStatus, TranscriptLineInput } from './display';
 export {
   APP_JSON_TYPE,
+  GROUP_UPDATE_TYPE,
   PAIR_CONFIRM_TYPE,
   READ_RECEIPT_TYPE,
   envelopeType,
   isAppJsonEnvelope,
   isControlEnvelope,
+  isGroupUpdateEnvelope,
 } from './envelope';
+export type { GroupUpdateEnvelope } from './envelope';
 export {
   PAIRING_TTL_MS,
   createEncryptedPairingOffer,
   createHandshakeCode,
   decryptPeerOffer,
 } from './pairing';
+export {
+  RETENTION_PRESETS_MS,
+  formatRetention,
+  isExpiredMessage,
+  messageExpiresAt,
+  parseRetention,
+} from './retention';
 export { MemoryStore } from './store';
 export { HttpRendezvousClient } from './rendezvous';
 export {
@@ -70,18 +85,26 @@ export {
   normalizeContactName,
   normalizeIdentityRef,
 } from './validation';
+export { CONSENT_STATES } from './types';
 export type {
   ConeClient,
+  ConeConsentState,
   ConeConversation,
+  ConeGroupMember,
   ConeIdentity,
+  ConsentFilter,
   ConeMessage,
   ConeStore,
   ConeStoreMetadata,
   ConeStoreSnapshot,
   Contact,
   ContactSource,
+  ConversationKind,
   CreateConeClientOptions,
+  CreateGroupInput,
+  CreateGroupOptions,
   DerivedAccount,
+  GroupMemberLevel,
   HandshakeCode,
   IdentityRef,
   IdentityRefObject,
@@ -89,6 +112,7 @@ export type {
   MessageDeliveryStatus,
   MessageListOptions,
   MessageHandler,
+  MessageRetention,
   PairingOffer,
   PairingResult,
   RendezvousClient,

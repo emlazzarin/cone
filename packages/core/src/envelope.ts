@@ -7,6 +7,23 @@ export const READ_RECEIPT_TYPE = 'cos.read.v1';
 export const PAIR_CONFIRM_TYPE = 'cos.pair.confirm.v1';
 export const UNSUPPORTED_MESSAGE_TYPE = 'cos.unsupported-message.v1';
 export const BACKUP_TYPE = 'cos.backup.v1';
+export const GROUP_UPDATE_TYPE = 'cos.group.update.v1';
+
+// XMTP's GroupUpdated system message (membership/metadata changes), decoded by
+// the adapter into Cone's envelope shape. Stored as a control message; surfaces
+// render it as an attributed system line ("Alice added Bob").
+export interface GroupUpdateEnvelope {
+  type: typeof GROUP_UPDATE_TYPE;
+  initiatedByInboxId: string;
+  added: string[];
+  removed: string[];
+  left: string[];
+  metadataChanges: Array<{ field: string; oldValue?: string; newValue?: string }>;
+}
+
+export function isGroupUpdateEnvelope(value: unknown): value is GroupUpdateEnvelope {
+  return envelopeType(value) === GROUP_UPDATE_TYPE;
+}
 
 export function envelopeType(value: unknown): string | undefined {
   if (typeof value === 'object' && value !== null && 'type' in value) {

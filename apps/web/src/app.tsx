@@ -1,4 +1,3 @@
-import { Fragment } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 
 import {
@@ -7,9 +6,13 @@ import {
   errorMessage,
   formatConnectionStatus,
   formatConversationPreview,
+  formatRetention,
   formatTranscriptTime,
   generateSecretKey,
   HttpRendezvousClient,
+  isAllowedConversation,
+  isDeniedConversation,
+  isRequestConversation,
   isVisibleChatMessage,
   laterIso,
   latestInboundAt,
@@ -17,6 +20,7 @@ import {
   matchesPendingSend,
   messageBody,
   parseSecretKey,
+  RETENTION_PRESETS_MS,
   type ConeConnectionStatus,
   type ConeClient,
   type ConeConversation,
@@ -45,6 +49,7 @@ export interface AppBootstrap {
   selectedConversationId?: string;
   composing?: boolean;
   to?: string;
+  chatScope?: 'chats' | 'requests';
 }
 
 export interface AppProps {
@@ -67,6 +72,8 @@ interface PendingSend {
   sentAt: string;
   status: 'sending' | 'failed';
   target: string;
+  // Set for group sends: groups are addressed by conversation, not identity.
+  conversationId?: string;
   text: string;
 }
 
@@ -92,6 +99,10 @@ export function App({ bootstrap }: AppProps = {}) {
   const [messagesByConv, setMessagesByConv] = useState<Record<string, ConeMessage[]>>({});
   const [selectedConversationId, setSelectedConversationId] = useState(() => bootstrap?.selectedConversationId ?? '');
   const [composing, setComposing] = useState(() => bootstrap?.composing ?? false);
+  // Within the Chats section, the list shows the allowed inbox or the
+  // unknown-sender Requests sub-surface.
+  const [chatScope, setChatScope] = useState<'chats' | 'requests'>(() => bootstrap?.chatScope ?? 'chats');
+  const [showRequests, setShowRequests] = useState(true);
   const [filter, setFilter] = useState('');
   const [to, setTo] = useState(() => bootstrap?.to ?? '');
   const [text, setText] = useState('');
@@ -109,6 +120,10 @@ export function App({ bootstrap }: AppProps = {}) {
 
   const [status, setStatus] = useState('');
   const [statusError, setStatusError] = useState(false);
+  // Keyboard-stepped (not yet applied) value of the disappearing-messages
+  // select; Enter commits it, Esc/blur discards it. Pointer selection commits
+  // directly and never uses the draft.
+  const [timerDraft, setTimerDraft] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [helpVisible, setHelpVisible] = useState(false);
   const [pendingSends, setPendingSends] = useState<PendingSend[]>([]);
@@ -125,6 +140,7 @@ export function App({ bootstrap }: AppProps = {}) {
   const toRef = useRef<HTMLInputElement>(null);
   const messageRef = useRef<HTMLTextAreaElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const timerRef = useRef<HTMLSelectElement>(null);
 
   // ── Derived view model ────────────────────────────────────────────────
   const lastVisibleByConv = useMemo(() => {
@@ -150,21 +166,34 @@ export function App({ bootstrap }: AppProps = {}) {
     return [...conversations].sort((a, b) => time(b) - time(a));
   }, [conversations, lastVisibleByConv]);
 
+  // Consent partitions the chat list: the allowed inbox, the unknown-sender
+  // Requests sub-surface, and the blocked (denied) list managed in Settings.
+  const allowedConversations = useMemo(() => sortedConversations.filter(isAllowedConversation), [sortedConversations]);
+  const requestConversations = useMemo(() => sortedConversations.filter(isRequestConversation), [sortedConversations]);
+  const deniedConversations = useMemo(() => sortedConversations.filter(isDeniedConversation), [sortedConversations]);
+  const requestCount = requestConversations.length;
+
   const filteredConversations = useMemo(() => {
+    const base = chatScope === 'requests' ? requestConversations : allowedConversations;
     const query = filter.trim().toLowerCase();
     if (!query) {
-      return sortedConversations;
+      return base;
     }
-    return sortedConversations.filter(
+    return base.filter(
       (conversation) =>
         conversation.title.toLowerCase().includes(query) ||
-        conversation.peerInboxId.toLowerCase().includes(query),
+        (conversation.peerInboxId ?? '').toLowerCase().includes(query),
     );
-  }, [sortedConversations, filter]);
+  }, [allowedConversations, requestConversations, chatScope, filter]);
 
+  // Unread counts cover the allowed inbox only; Requests have their own badge
+  // and must not inflate the main "new" count.
   const unreadByConv = useMemo(() => {
     const map: Record<string, number> = {};
     for (const conversation of conversations) {
+      if (!isAllowedConversation(conversation)) {
+        continue;
+      }
       const seenAt = lastSeen[conversation.conversationId];
       const seenTime = seenAt ? new Date(seenAt).getTime() : 0;
       let count = 0;
@@ -200,6 +229,14 @@ export function App({ bootstrap }: AppProps = {}) {
   const readMarkerId = readReceipts ? latestReadOutboundId(messagesByConv[selectedConversationId] ?? []) : undefined;
   const nonSelfContacts = contacts.filter((contact) => contact.source !== 'self');
   const suggestions = composing ? buildTargetSuggestions(to, contacts, conversations) : [];
+  // Timer select choices: off + presets, plus the conversation's current value
+  // when it's custom (set as free text in the TUI or by another client) so a
+  // custom timer is always visible, never silently misrendered as a preset.
+  const timerValue = String(activeConversation?.retention?.durationMs ?? 0);
+  const timerOptions = ['0', ...RETENTION_PRESETS_MS.map(String)];
+  if (activeConversation?.retention && !RETENTION_PRESETS_MS.includes(activeConversation.retention.durationMs)) {
+    timerOptions.push(timerValue);
+  }
 
   // ── Latest state + actions for the global key handler ──────────────────
   // The handler is registered once per session; everything it touches goes
@@ -236,14 +273,21 @@ export function App({ bootstrap }: AppProps = {}) {
 
     setConnectionStatus('catching-up');
     void (async () => {
+      // Reconcile network state into the local mirrors before first paint:
+      // consent and disappearing-messages settings changed from other devices
+      // or by peers never ride the message stream, only sync. Best-effort so
+      // an offline open still shows the cached read model.
+      await client.sync().catch(() => undefined);
       await refresh(client);
+      // Human surface: stream allowed + unknown so Requests update live. Denied
+      // is never streamed.
       unsubscribe = await client.streamMessages(async () => {
         if (cancelled) {
           return;
         }
         setConnectionStatus('live');
         await refresh(client);
-      });
+      }, { consentStates: ['allowed', 'unknown'] });
       if (!cancelled) {
         setConnectionStatus('live');
       }
@@ -266,9 +310,29 @@ export function App({ bootstrap }: AppProps = {}) {
         });
     }, 8_000);
 
+    // Periodic network sync (TUI parity, 60s): pulls conversation-level state
+    // the stream never carries and purges expired disappearing messages.
+    const syncTimer = window.setInterval(() => {
+      void client.sync()
+        .then(async (result) => {
+          if (cancelled) {
+            return;
+          }
+          await refresh(client);
+          setConnectionStatus((previous) =>
+            result.ok ? (previous === 'stale' || previous === 'offline' ? 'live' : previous) : 'stale');
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setConnectionStatus('stale');
+          }
+        });
+    }, 60_000);
+
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      window.clearInterval(syncTimer);
       void unsubscribe?.();
     };
   }, [session]);
@@ -291,6 +355,12 @@ export function App({ bootstrap }: AppProps = {}) {
       setReadReceipts(pref === null ? true : pref === '1');
     } catch {
       setReadReceipts(true);
+    }
+    try {
+      const pref = localStorage.getItem(showRequestsKey(session.accountId));
+      setShowRequests(pref === null ? true : pref === '1');
+    } catch {
+      setShowRequests(true);
     }
   }, [session]);
 
@@ -316,7 +386,10 @@ export function App({ bootstrap }: AppProps = {}) {
 
     const conversation = conversations.find((entry) => entry.conversationId === selectedConversationId);
     const visible = typeof document === 'undefined' || document.visibilityState !== 'hidden';
-    if (readReceipts && conversation && visible) {
+    // Never acknowledge a Request: previewing an unknown sender must not tell
+    // them you read it. Receipts are only for allowed conversations, and
+    // DM-only — in a group they would broadcast to every member.
+    if (readReceipts && conversation && isAllowedConversation(conversation) && visible && conversation.kind !== 'group' && conversation.peerInboxId) {
       const newestInbound = latestInboundAt(list);
       if (newestInbound && (ackedRef.current[selectedConversationId] ?? '') < newestInbound) {
         ackedRef.current[selectedConversationId] = newestInbound;
@@ -410,6 +483,11 @@ export function App({ bootstrap }: AppProps = {}) {
         } else if (event.key === '/') {
           event.preventDefault();
           filterRef.current?.focus();
+        } else if (event.key === 'e' && ctx.selected) {
+          // TUI parity: e opens the disappearing-messages timer for the
+          // selected chat (arrows change it, change applies immediately).
+          event.preventDefault();
+          timerRef.current?.focus();
         } else if (event.key === 'Enter' && document.activeElement === document.body) {
           event.preventDefault();
           if (ctx.selected) {
@@ -512,8 +590,9 @@ export function App({ bootstrap }: AppProps = {}) {
       return;
     }
     const body = text.trim();
-    const target = activeConversation ? activeConversation.peerInboxId : to.trim();
-    if (!body || !target) {
+    const group = activeConversation?.kind === 'group' ? activeConversation : undefined;
+    const target = activeConversation ? activeConversation.peerInboxId ?? '' : to.trim();
+    if (!body || (!target && !group)) {
       return;
     }
     sendSequence.current += 1;
@@ -523,6 +602,7 @@ export function App({ bootstrap }: AppProps = {}) {
       sentAt: new Date().toISOString(),
       status: 'sending',
       target,
+      conversationId: group?.conversationId,
       text: body,
     };
     setPendingSends((previous) => [...previous, entry]);
@@ -536,7 +616,9 @@ export function App({ bootstrap }: AppProps = {}) {
       return;
     }
     try {
-      const sent = await session.client.sendText(entry.target, entry.text);
+      const sent = entry.conversationId
+        ? await session.client.sendToConversation(entry.conversationId, entry.text)
+        : await session.client.sendText(entry.target, entry.text);
       await refresh(session.client);
       let conversationId = sent.conversationId;
       if (!conversationId) {
@@ -631,6 +713,69 @@ export function App({ bootstrap }: AppProps = {}) {
     }, 'Deleting…');
   }
 
+  // Accept a Request: mark the sender allowed (moves them to the inbox) and,
+  // optionally, save a contact under a chosen name in the same flow.
+  async function acceptRequest(conversation: ConeConversation, saveName?: string) {
+    if (!session) {
+      return;
+    }
+    await run(async () => {
+      // Conversation-scoped: DMs allow the peer's inbox, groups allow the group.
+      await session.client.setConversationConsent(conversation.conversationId, 'allowed');
+      if (saveName?.trim() && conversation.kind !== 'group' && conversation.peerInboxId) {
+        await session.client.saveContact({
+          name: saveName.trim(),
+          inboxId: conversation.peerInboxId,
+          address: conversation.peerAddress,
+          source: 'manual',
+        });
+      }
+      await refresh(session.client);
+      setChatScope('chats');
+      openConversation(conversation, false);
+      note(`Accepted ${peerLabel(conversation)}`);
+    }, 'Accepting…');
+  }
+
+  async function blockRequest(conversation: ConeConversation) {
+    if (!session || !confirm(`Block ${peerLabel(conversation)}? They’ll be hidden and can’t reach you. You can unblock from Settings.`)) {
+      return;
+    }
+    await run(async () => {
+      await session.client.setConversationConsent(conversation.conversationId, 'denied');
+      if (selectedConversationId === conversation.conversationId) {
+        setSelectedConversationId('');
+      }
+      await refresh(session.client);
+      note(`Blocked ${peerLabel(conversation)}`);
+    }, 'Blocking…');
+  }
+
+  async function unblockConversation(conversation: ConeConversation) {
+    if (!session) {
+      return;
+    }
+    await run(async () => {
+      await session.client.setConversationConsent(conversation.conversationId, 'allowed');
+      await refresh(session.client);
+      note(`Unblocked ${peerLabel(conversation)}`);
+    }, 'Unblocking…');
+  }
+
+  // Set the conversation's disappearing-messages timer (0 = off). Applies to
+  // both sides via XMTP settings; expired messages are hidden immediately and
+  // purged from local storage on sync.
+  async function setTimer(conversation: ConeConversation, durationMs: number) {
+    if (!session) {
+      return;
+    }
+    await run(async () => {
+      await session.client.setRetention(conversation.conversationId, durationMs > 0 ? durationMs : null);
+      await refresh(session.client);
+      note(durationMs > 0 ? `Disappearing messages: ${formatRetention(durationMs)}` : 'Disappearing messages off');
+    }, 'Setting timer…');
+  }
+
   async function createCode() {
     if (!session) {
       return;
@@ -703,6 +848,7 @@ export function App({ bootstrap }: AppProps = {}) {
     setMessagesByConv({});
     setSelectedConversationId('');
     setComposing(false);
+    setChatScope('chats');
     setTo('');
     setText('');
     setFilter('');
@@ -885,8 +1031,9 @@ export function App({ bootstrap }: AppProps = {}) {
             <i class={`dot ${connectionDot(connectionStatus)}`} /> {connectionLabel}
           </span>
           <span class="topbar__counts">
-            <b>{conversations.length}</b> chats · <b>{nonSelfContacts.length}</b> contacts
+            <b>{allowedConversations.length}</b> chats · <b>{nonSelfContacts.length}</b> contacts
             {totalUnread > 0 ? <> · <b>{totalUnread}</b> new</> : null}
+            {requestCount > 0 ? <> · <b>{requestCount}</b> request{requestCount === 1 ? '' : 's'}</> : null}
           </span>
           <span class={`topbar__msg${statusError ? ' is-error' : ''}`}>{busy ? 'Working…' : status}</span>
           <button class="topbar__lock" type="button" aria-keyshortcuts="?" onClick={() => setHelpVisible((visible) => !visible)}>
@@ -918,6 +1065,28 @@ export function App({ bootstrap }: AppProps = {}) {
           {view === 'chats' && (
             <div class="chats" data-detail={String(detail)}>
               <aside class="list" aria-label="Chats">
+                {showRequests && (requestCount > 0 || chatScope === 'requests') && (
+                  <div class="scope-tabs" role="tablist" aria-label="Inbox or requests">
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={chatScope === 'chats'}
+                      class={chatScope === 'chats' ? 'active' : ''}
+                      onClick={() => { setChatScope('chats'); setFilter(''); setSelectedConversationId(''); }}
+                    >
+                      Chats
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={chatScope === 'requests'}
+                      class={chatScope === 'requests' ? 'active' : ''}
+                      onClick={() => { setChatScope('requests'); setFilter(''); setSelectedConversationId(''); setComposing(false); }}
+                    >
+                      Requests {requestCount > 0 ? <span class="badge">{requestCount}</span> : null}
+                    </button>
+                  </div>
+                )}
                 <div class="list__head">
                   <input
                     ref={filterRef}
@@ -930,28 +1099,58 @@ export function App({ bootstrap }: AppProps = {}) {
                         event.currentTarget.blur();
                       }
                     }}
-                    placeholder="Filter chats   /"
-                    aria-label="Filter chats"
+                    placeholder={chatScope === 'requests' ? 'Filter requests   /' : 'Filter chats   /'}
+                    aria-label={chatScope === 'requests' ? 'Filter requests' : 'Filter chats'}
                   />
                   {filter.trim() && (
                     <small class="list__count">
-                      {filteredConversations.length} of {sortedConversations.length} chats · esc clears
+                      {filteredConversations.length} of {(chatScope === 'requests' ? requestConversations : allowedConversations).length} {chatScope === 'requests' ? 'requests' : 'chats'} · esc clears
                     </small>
                   )}
                 </div>
                 <div class="list__scroll">
-                  <button
-                    type="button"
-                    class={`conv conv--new${composing ? ' active' : ''}`}
-                    onClick={beginCompose}
-                  >
-                    <span>+ New message</span>
-                    <kbd>n</kbd>
-                  </button>
+                  {chatScope === 'chats' && (
+                    <button
+                      type="button"
+                      class={`conv conv--new${composing ? ' active' : ''}`}
+                      onClick={beginCompose}
+                    >
+                      <span>+ New message</span>
+                      <kbd>n</kbd>
+                    </button>
+                  )}
                   {filteredConversations.map((conversation) => {
                     const last = lastVisibleByConv[conversation.conversationId];
                     const unread = unreadByConv[conversation.conversationId] ?? 0;
                     const preview = last ? formatConversationPreview(last) : 'No messages yet';
+                    if (chatScope === 'requests') {
+                      return (
+                        <div
+                          key={conversation.conversationId}
+                          data-conv-id={conversation.conversationId}
+                          class={`conv conv--request${conversation.conversationId === selectedConversationId ? ' active' : ''}`}
+                        >
+                          <button type="button" class="conv__open" onClick={() => openConversation(conversation, false)}>
+                            <span class="avatar" style={`--hue:${hashHue(conversation.peerInboxId ?? conversation.conversationId)}`} aria-hidden="true">
+                              {initials(conversation.title)}
+                            </span>
+                            <span class="conv__body">
+                              <span class="conv__top">
+                                <span class="conv__name">{peerLabel(conversation)}</span>
+                                <time class="conv__time">{relativeTime(laterIso(conversation.updatedAt, last?.sentAt), nowTick)}</time>
+                              </span>
+                              <span class="conv__sub">
+                                <span class="conv__preview">{preview}</span>
+                              </span>
+                            </span>
+                          </button>
+                          <span class="conv__req-actions">
+                            <button type="button" class="primary" onClick={() => void acceptRequest(conversation)}>Accept</button>
+                            <button type="button" class="ghost danger" onClick={() => void blockRequest(conversation)}>Block</button>
+                          </span>
+                        </div>
+                      );
+                    }
                     return (
                       <button
                         type="button"
@@ -961,12 +1160,15 @@ export function App({ bootstrap }: AppProps = {}) {
                         aria-current={conversation.conversationId === selectedConversationId ? 'true' : undefined}
                         onClick={() => openConversation(conversation, pointerFine())}
                       >
-                        <span class="avatar" style={`--hue:${hashHue(conversation.peerInboxId)}`} aria-hidden="true">
+                        <span class="avatar" style={`--hue:${hashHue(conversation.peerInboxId ?? conversation.conversationId)}`} aria-hidden="true">
                           {initials(conversation.title)}
                         </span>
                         <span class="conv__body">
                           <span class="conv__top">
-                            <span class="conv__name">{conversation.title}</span>
+                            <span class="conv__name">{peerLabel(conversation)}</span>
+                            {conversation.retention && (
+                              <span class="conv__timer" title={`Disappearing messages: ${formatRetention(conversation.retention.durationMs)}`} aria-label="Disappearing messages on">⌛</span>
+                            )}
                             <time class="conv__time">{relativeTime(laterIso(conversation.updatedAt, last?.sentAt), nowTick)}</time>
                           </span>
                           <span class="conv__sub">
@@ -979,7 +1181,9 @@ export function App({ bootstrap }: AppProps = {}) {
                   })}
                   {filteredConversations.length === 0 && (
                     <p class="list__empty">
-                      {filter.trim() ? 'No chats match that filter.' : 'No chats yet. Press n or + New message to start one, or pair from the Pair tab.'}
+                      {chatScope === 'requests'
+                        ? (filter.trim() ? 'No requests match that filter.' : 'No requests. Messages from people you haven’t accepted will appear here.')
+                        : (filter.trim() ? 'No chats match that filter.' : 'No chats yet. Press n or + New message to start one, or pair from the Pair tab.')}
                     </p>
                   )}
                 </div>
@@ -992,15 +1196,72 @@ export function App({ bootstrap }: AppProps = {}) {
                   </button>
                   {activeConversation ? (
                     <>
-                      <span class="avatar sm" style={`--hue:${hashHue(activeConversation.peerInboxId)}`} aria-hidden="true">
+                      <span class="avatar sm" style={`--hue:${hashHue(activeConversation.peerInboxId ?? activeConversation.conversationId)}`} aria-hidden="true">
                         {initials(activeConversation.title)}
                       </span>
-                      <span class="thread__title">{activeConversation.title}</span>
-                      <span class="thread__peer">{shortId(activeConversation.peerInboxId)}</span>
+                      <span class="thread__title">{peerLabel(activeConversation)}</span>
+                      <span class="thread__peer">
+                        {activeConversation.kind === 'group'
+                          ? `group · ${activeConversation.memberCount ?? '?'} members`
+                          : shortId(activeConversation.peerInboxId ?? '')}
+                      </span>
                       <span class="thread__spacer" />
-                      <button class="ghost danger" type="button" onClick={() => void removeConversation(activeConversation)}>
-                        Delete
-                      </button>
+                      {isRequestConversation(activeConversation) ? (
+                        <>
+                          <span class="thread__tag">request</span>
+                          <button class="primary" type="button" onClick={() => void acceptRequest(activeConversation)}>Accept</button>
+                          <button class="ghost danger" type="button" onClick={() => void blockRequest(activeConversation)}>Block</button>
+                        </>
+                      ) : (
+                        <>
+                          <label class="thread__timer" title="Disappearing messages — applies to both sides">
+                            <span aria-hidden="true">⌛</span>
+                            <select
+                              ref={timerRef}
+                              aria-label="Disappearing messages timer"
+                              aria-keyshortcuts="e"
+                              value={timerDraft ?? timerValue}
+                              onChange={(event) => {
+                                // Pointer (or native popup) selection commits immediately.
+                                const durationMs = Number(event.currentTarget.value);
+                                setTimerDraft(null);
+                                event.currentTarget.blur();
+                                void setTimer(activeConversation, durationMs);
+                              }}
+                              onKeyDown={(event) => {
+                                // App-wide vocabulary on the focused select: j/k or
+                                // arrows step a draft, Enter applies, Esc leaves.
+                                const current = timerDraft ?? timerValue;
+                                if (event.key === 'j' || event.key === 'ArrowDown' || event.key === 'k' || event.key === 'ArrowUp') {
+                                  event.preventDefault();
+                                  const delta = event.key === 'j' || event.key === 'ArrowDown' ? 1 : -1;
+                                  const index = timerOptions.indexOf(current);
+                                  setTimerDraft(timerOptions[clamp(index + delta, 0, timerOptions.length - 1)]!);
+                                } else if (event.key === 'Enter') {
+                                  event.preventDefault();
+                                  setTimerDraft(null);
+                                  event.currentTarget.blur();
+                                  if (current !== timerValue) {
+                                    void setTimer(activeConversation, Number(current));
+                                  }
+                                } else if (event.key === 'Escape') {
+                                  event.preventDefault();
+                                  setTimerDraft(null);
+                                  event.currentTarget.blur();
+                                }
+                              }}
+                              onBlur={() => setTimerDraft(null)}
+                            >
+                              {timerOptions.map((value) => (
+                                <option key={value} value={value}>{value === '0' ? 'off' : formatRetention(Number(value))}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <button class="ghost danger" type="button" onClick={() => void removeConversation(activeConversation)}>
+                            Delete
+                          </button>
+                        </>
+                      )}
                     </>
                   ) : (
                     <>
@@ -1023,31 +1284,32 @@ export function App({ bootstrap }: AppProps = {}) {
                   ) : (
                     <>
                       {visibleMessages.map((message) => (
-                        <Fragment key={message.messageId}>
-                          <MessageRow
-                            message={message}
-                            sender={message.direction === 'outbound' ? 'me' : activeConversation?.title ?? shortId(message.senderInboxId)}
-                          />
-                          {message.messageId === readMarkerId && (
-                            <p class="read-receipt" aria-label="Read by recipient">✓✓ Read</p>
-                          )}
-                        </Fragment>
+                        <MessageRow
+                          key={message.messageId}
+                          message={message}
+                          sender={message.direction === 'outbound' ? 'me' : activeConversation?.title ?? shortId(message.senderInboxId)}
+                          reserveStatus={readReceipts}
+                          readMarker={message.messageId === readMarkerId}
+                        />
                       ))}
                       {panePending.map((entry) => (
                         <article class={`msg outbound${entry.status === 'failed' ? ' failed' : ''}`} key={entry.id}>
-                          {entry.status === 'failed' && <span class="msg__fail" aria-label="Not delivered">✗ </span>}
-                          <span class="msg__time">{formatTranscriptTime(entry.sentAt)}</span>
-                          <span class="msg__sep"> - </span>
-                          <span class="msg__sender">me</span>
-                          <span class="msg__sep">: </span>
-                          <span class="msg__body">{entry.text}</span>
-                          {entry.status === 'failed' && (
-                            <span class="msg__actions">
-                              <span class="msg__fail-note">not delivered</span>
-                              <button type="button" class="retry" onClick={() => retrySend(entry)}>retry</button>
-                              <button type="button" class="discard" onClick={() => discardSend(entry)}>delete</button>
-                            </span>
-                          )}
+                          <span class="msg__content">
+                            {entry.status === 'failed' && <span class="msg__fail" aria-label="Not delivered">✗ </span>}
+                            <span class="msg__time">{formatTranscriptTime(entry.sentAt)}</span>
+                            <span class="msg__sep"> - </span>
+                            <span class="msg__sender">me</span>
+                            <span class="msg__sep">: </span>
+                            <span class="msg__body">{entry.text}</span>
+                            {entry.status === 'failed' && (
+                              <span class="msg__actions">
+                                <span class="msg__fail-note">not delivered</span>
+                                <button type="button" class="retry" onClick={() => retrySend(entry)}>retry</button>
+                                <button type="button" class="discard" onClick={() => discardSend(entry)}>delete</button>
+                              </span>
+                            )}
+                          </span>
+                          {readReceipts && <span class="msg__status" />}
                         </article>
                       ))}
                     </>
@@ -1252,11 +1514,11 @@ export function App({ bootstrap }: AppProps = {}) {
                   <button class="primary" type="button" disabled={busy || !pairCode.trim()} onClick={() => void joinCode()}>Join code <kbd>p</kbd></button>
                 </div>
                 <label class="field">
-                  <span>save the other side as</span>
+                  <span>save their name as</span>
                   <input value={pairPeerName} onInput={(event) => setPairPeerName(event.currentTarget.value)} placeholder="Alice, Codex, Agent A…" />
                 </label>
                 <label class="field">
-                  <span>share my name with them</span>
+                  <span>offer them a name for you</span>
                   <input value={pairShareName} onInput={(event) => setPairShareName(event.currentTarget.value)} placeholder="My laptop, bot1…" />
                 </label>
               </section>
@@ -1351,6 +1613,46 @@ export function App({ bootstrap }: AppProps = {}) {
                     </small>
                   </span>
                 </label>
+                <label class="toggle">
+                  <input
+                    type="checkbox"
+                    checked={showRequests}
+                    onChange={(event) => {
+                      const next = event.currentTarget.checked;
+                      setShowRequests(next);
+                      if (!next) {
+                        setChatScope('chats');
+                      }
+                      try {
+                        localStorage.setItem(showRequestsKey(session.accountId), next ? '1' : '0');
+                      } catch {
+                        /* ignore */
+                      }
+                    }}
+                  />
+                  <span class="toggle__text">
+                    <strong>Show requests</strong>
+                    <small>
+                      Messages from people you haven’t accepted wait in a separate Requests tab in Chats, shown when there
+                      are any. Turn this off to hide that tab entirely. New senders never reach your main inbox until you
+                      accept them.
+                    </small>
+                  </span>
+                </label>
+                {deniedConversations.length > 0 && (
+                  <div class="blocked">
+                    <div class="panel__head">Blocked <small class="muted">{deniedConversations.length}</small></div>
+                    {deniedConversations.map((conversation) => (
+                      <div class="blocked__row" key={conversation.conversationId}>
+                        <span class="avatar sm" style={`--hue:${hashHue(conversation.peerInboxId ?? conversation.conversationId)}`} aria-hidden="true">
+                          {initials(conversation.title)}
+                        </span>
+                        <span class="blocked__name">{peerLabel(conversation)}</span>
+                        <button type="button" class="ghost" onClick={() => void unblockConversation(conversation)}>Unblock</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <p class="lede">
                   The raw secret key is never written to localStorage or IndexedDB. Unlock again with the same secret on a
                   new browser session.
@@ -1390,8 +1692,16 @@ export function App({ bootstrap }: AppProps = {}) {
                 <span><kbd>n</kbd> · the recipient can be a contact name, XMTP inbox ID, or 0x address · <kbd>↑</kbd>/<kbd>↓</kbd> pick a suggestion</span>
               </div>
               <div class="help-row">
+                <b>Requests</b>
+                <span>Messages from people you haven’t accepted wait in the <b>Requests</b> tab in Chats, never your main inbox. Open one to preview it (no read receipt is sent), then <b>Accept</b> to move it to your inbox or <b>Block</b> to hide them. Unblock from Settings. Toggle the tab off in Settings.</span>
+              </div>
+              <div class="help-row">
+                <b>Disappearing</b>
+                <span>The ⌛ control in a chat’s header (or <kbd>e</kbd>) sets a disappearing-messages timer — off, 30s up to 4w. With it focused, <kbd>j</kbd>/<kbd>k</kbd> or arrows step, <kbd>↵</kbd> applies, <kbd>esc</kbd> leaves. Either side can change it (custom durations from other clients show as-is); messages sent while a timer is on vanish for both sides after it elapses — earlier history stays. Cooperative, not cryptographic: a client that doesn’t honor timers can keep its copies.</span>
+              </div>
+              <div class="help-row">
                 <b>Read receipts</b>
-                <span>On by default (toggle in Settings). When on, peers can see when you’ve read them and you’ll see “✓✓ Read” on the last message they’ve read. When off, you neither send nor see them — only failed sends are marked.</span>
+                <span>On by default (toggle in Settings). When on, peers can see when you’ve read them and you’ll see “✓✓ Read” on the last message they’ve read. When off, you neither send nor see them — only failed sends are marked. Requests never send receipts.</span>
               </div>
               <div class="help-row">
                 <b>Pair</b>
@@ -1409,14 +1719,29 @@ export function App({ bootstrap }: AppProps = {}) {
   );
 }
 
-function MessageRow({ message, sender }: { message: ConeMessage; sender: string }) {
+function MessageRow({
+  message,
+  sender,
+  reserveStatus,
+  readMarker,
+}: {
+  message: ConeMessage;
+  sender: string;
+  reserveStatus?: boolean;
+  readMarker?: boolean;
+}) {
   return (
     <article class={`msg ${message.direction}`}>
-      <span class="msg__time">{formatTranscriptTime(message.sentAt)}</span>
-      <span class="msg__sep"> - </span>
-      <span class="msg__sender">{sender}</span>
-      <span class="msg__sep">: </span>
-      <span class="msg__body">{messageBody(message)}</span>
+      <span class="msg__content">
+        <span class="msg__time">{formatTranscriptTime(message.sentAt)}</span>
+        <span class="msg__sep"> - </span>
+        <span class="msg__sender">{sender}</span>
+        <span class="msg__sep">: </span>
+        <span class="msg__body">{messageBody(message)}</span>
+      </span>
+      {message.direction === 'outbound' && reserveStatus && (
+        <span class="msg__status">{readMarker ? '✓✓ Read' : ''}</span>
+      )}
     </article>
   );
 }
@@ -1427,7 +1752,7 @@ function FooterHints({ view, hasSelection }: { view: View; hasSelection: boolean
   const hints: [string, string][] =
     view === 'chats'
       ? hasSelection
-        ? [['↵', 'send'], ['esc', 'navigate'], ['j/k', 'switch chat'], ['n', 'new'], ['/', 'filter'], ['?', 'help']]
+        ? [['↵', 'send'], ['esc', 'navigate'], ['j/k', 'switch chat'], ['n', 'new'], ['e', 'timer'], ['/', 'filter'], ['?', 'help']]
         : [['j/k', 'move'], ['↵', 'start message'], ['n', 'new message'], ['/', 'filter'], ['?', 'help']]
       : view === 'pair'
         ? [['c', 'create code'], ['p', 'join code'], ['?', 'help']]
@@ -1453,12 +1778,13 @@ function buildTargetSuggestions(query: string, contacts: Contact[], conversation
   // as that conversation (so we reuse the thread) rather than as a duplicate.
   const conversationInboxes = new Set(conversations.map((conversation) => conversation.peerInboxId));
   for (const conversation of conversations) {
-    if (conversation.title.toLowerCase().includes(normalized) || conversation.peerInboxId.toLowerCase().includes(normalized)) {
-      suggestions.set(`inbox:${conversation.peerInboxId}`, {
+    const isGroup = conversation.kind === 'group';
+    if (conversation.title.toLowerCase().includes(normalized) || (conversation.peerInboxId ?? '').toLowerCase().includes(normalized)) {
+      suggestions.set(isGroup ? `group:${conversation.conversationId}` : `inbox:${conversation.peerInboxId}`, {
         conversationId: conversation.conversationId,
         kind: 'conversation',
         label: conversation.title,
-        meta: `chat · ${shortId(conversation.peerInboxId)}`,
+        meta: isGroup ? `group · ${conversation.memberCount ?? '?'} members` : `chat · ${shortId(conversation.peerInboxId ?? '')}`,
         value: conversation.title,
       });
     }
@@ -1477,6 +1803,12 @@ function buildTargetSuggestions(query: string, contacts: Contact[], conversation
     }
   }
   return Array.from(suggestions.values()).slice(0, 6);
+}
+
+// An unnamed peer's conversation title is its raw XMTP inbox ID; show a short
+// form until it's named via a contact. Named conversations keep their name.
+function peerLabel(conversation: Pick<ConeConversation, 'title' | 'peerInboxId'>): string {
+  return conversation.title === conversation.peerInboxId ? shortId(conversation.peerInboxId) : conversation.title;
 }
 
 function connectionDot(status: ConeConnectionStatus): string {
@@ -1517,4 +1849,8 @@ function seenKey(accountId: string): string {
 
 function readReceiptsKey(accountId: string): string {
   return `cos:readReceipts:${accountId}`;
+}
+
+function showRequestsKey(accountId: string): string {
+  return `cos:showRequests:${accountId}`;
 }
