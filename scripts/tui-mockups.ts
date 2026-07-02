@@ -13,7 +13,7 @@
 //   transcript. Closest to the PWA desktop layout.
 //
 // All three keep the exact hotkey vocabulary and modes; only render.ts
-// changes. See SCRATCHPAD-TUI.md for the tradeoffs.
+// changes. See SCRATCHPAD.md for the shipped decisions.
 
 const WIDTH = 100;
 const color = !process.env.NO_COLOR;

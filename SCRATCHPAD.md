@@ -1,56 +1,114 @@
-# Scratchpad: Disappearing Messages
+# Scratchpad
 
-Working notes for the disappearing-messages feature. Current plan at top, journal at the bottom. (See SPEC.md for shipped behavior; this file tracks in-flight work.)
+The single working-notes file. Shipped behavior lives in SPEC.md; sequencing
+lives in TODO.md; history lives in git. This file holds only what's in flight,
+what's deliberately deferred (with the reasoning that deferred it), and the
+hard-won gotchas that will bite again if forgotten.
 
-## Current plan
+## Active — agent readiness batch (agreed with Eddy 2026-07-02)
 
-Foundation: XMTP's native conversation-level disappearing settings (`messageDisappearingSettings` / `updateMessageDisappearingSettings(fromNs, inNs)` / `removeMessageDisappearingSettings`), not a Cone control message. Native settings interop with other compliant XMTP clients, either DM participant can set them, and libxmtp's worker cleans the XMTP-level local DB. The core of the work is making Cone's own store, read model, and backups expiry-aware — XMTP's cleanup knows nothing about Cone's encrypted message snapshots.
+Groups completed 2026-07-02 (phases 0–4). Next: TODO's **agent readiness**
+batch, in this order:
 
-- [x] **Phase 1 — core model + adapter** (`@cone/core`, `@cone/core/xmtp`)
-  - `MessageRetention { durationMs, fromAt }` mirrored on `ConeConversation.retention` (consent-mirror pattern: stamp on persist, reconcile on sync, view-time filter)
-  - `XmtpAdapter.getRetention/setRetention`; `SdkDm` gains the SDK methods as `MaybePromise`; ns↔ms at the adapter boundary
-  - `ConeClient.setRetention(conversationId, durationMs | null)` — mirror-first, best-effort network write
-  - Enforcement: expired messages filtered from `listMessages`, purged from the store during `sync()` and before `exportBackup()`; `ConeStore.deleteMessage`; `ConeClient.purgeExpiredMessages()` for surfaces to call on a timer
-  - Retention helpers: presets, `formatRetention`, `parseRetention`, `messageExpiresAt`
-  - Tests: mirror stamping/reconcile, view filtering, purge, peer-initiated changes, backup excludes expired, timer-off keeps history
-- [x] **Phase 2 — CLI/agent surface**: `cone timer <target> <duration|off>`; retention + `expiresAt` in `cone inbox read` JSON
-- [x] **Phase 3 — TUI**: `e` opens preset picker (off/5m/1h/8h/1d/7d/30d); `timer <duration>` header chip; status-line confirmation; exact-expiry refresh so expired rows drop while a chat is open
-- [x] **Phase 4 — PWA**: `⌛` select in the chat header (`e` focuses it), `⌛` chip on rows with a timer, help row, footer hint; the existing 8s poll drops expired rows (listMessages filters them)
-- [x] **Phase 5 — spec + docs**: SPEC.md "Disappearing Messages" section, SKILL.md `cone timer` + chat key, TODO.md checked off
+1. **§4 — make the happy path real off this machine.** Host the rendezvous
+   service and flip `defaultRendezvousUrl()` off localhost; settle the XMTP
+   env default for real use (and make `whoami` loud about it); `cone doctor`
+   (JSON health check: secret, network, rendezvous, state DB); hosted echo
+   bot with a well-known address in SKILL.md — the concierge example *is*
+   that bot. §4 first because it unblocks everything: pairing for strangers,
+   clickable `#join=` links (with PWA hosting), and SKILL.md's "zero →
+   ping-pong in two minutes, unattended" metric.
+2. **§2 — poll-shaped read model** for turn-based agents: `cone wait`,
+   `cone messages --since <cursor>` with durable named cursors, distinct
+   "nothing new" exit code, unread counts in `cone inbox` JSON.
+3. **§1 — distribution**: npm publish (name: `cone` on npm may be taken —
+   decide), compiled binaries, hosted self-contained SKILL.md. Hard blocker:
+   pin an exact known-good XMTP nightly first.
+4. §3 (structured payloads) and §5 (MCP server, `@cone/agent` library) ride
+   behind those.
 
-## Design decisions
+## Deferred, with reasoning
 
-- **Derived expiry, not stamped.** Expiry is computed at read/purge time from `(message.sentAt, conversation.retention)`, never stored on `StoredMessage`. XMTP semantics: messages sent at/after `fromNs` expire `inNs` after send, *under the current settings* — turning the timer off (or changing `fromAt`) stops pending expirations. A stamped `expiresAt` would need restamping on every settings change; a derived one is always faithful. `ConeMessage.expiresAt` is computed in `listMessages` so UIs can show countdowns.
-- **Either peer can change the timer** (both DM members are super admins). Sync reconciles the mirror from the network — same revert-until-propagated semantics as consent.
-- **Settings changes purge first.** `setRetention` purges under the *old* settings before writing the new mirror, so a message that already hit its timer (hidden but not yet purged) can never reappear because the timer was relaxed or removed. Matches XMTP's continuously-running cleanup worker.
-- **No synthesized system messages in core (v1).** `isVisibleChatMessage` hides control messages, so a stored control envelope wouldn't render anyway. UIs observe mirror changes and render their own "Disappearing messages: 1h" line; revisit parsing XMTP `GroupUpdated` later if attribution ("who changed it") matters.
-- **`processedMessageIds` survive purge** so a still-undeleted XMTP-DB copy can't resurrect a purged message on the next sync.
-- **Honesty caveat** (for SPEC + UI copy): cooperative hygiene, not a cryptographic guarantee — a non-compliant peer client can retain anything.
-- Naming: code says `retention`; UI copy says "disappearing messages" / timer.
+- **Knock-by-default invite links** (decided with Eddy 2026-07-01): join
+  requests queueing for member approval. Deferred because it is most of the
+  async-invite complexity (queue in the room, admit UX on three surfaces) and
+  its servicing story stalls without an always-on member. Standing constraint
+  recorded then: **agents are optional group members — no administrative
+  feature may require one present or online**; any revisit designs the
+  human-only degraded mode first. Auto-admit links (shipped) remain the
+  escape hatch.
+- **In-group invite-secret distribution** (`cone.group.invite.v1`): would let
+  any authorized member service joins. Two unresolved wrinkles: MLS forward
+  secrecy means post-mint joiners can never see the control message ("any
+  member" is really "any member since mint" without re-distribution), and
+  every holder polling rendezvous is background work plus metadata the worker
+  can see. Revisit only if minter-serviced links prove unreliable.
+- **Joiner-to-joiner privacy in link rooms** relies on the cleartext `role`
+  field (worker returns join offers to the descriptor holder only). If roles
+  ever change, joiners could decrypt each other's identities under the shared
+  token key.
+- **Self-profile / share-card track** (Eddy 2026-06-12): volunteer profile
+  info as `cone.profile.v1` save-suggestions on pair / accept / group-join —
+  easy mutual saves without auto-save. Also in TODO.
+- **Group read receipts** ("Read by k" aggregation) and **local title
+  override for groups** — both deliberately out of v1 group scope.
+- **`appData` product use** (e.g. advertised invite policy): expose in the
+  adapter when a consumer exists.
+- **Retention live spike**: confirm libxmtp's cleanup worker actually runs
+  under both SDK clients as configured. Cone's own purge is independent, so
+  the worst case is stale rows in the XMTP-level DB only.
+- **TUI narrow-tier polish** after real daily use (redesign shipped
+  2026-07-02: A+B hybrid, layout kit in `chat/layout.ts`, mode chips, amber
+  focus borders; preview any render change with
+  `bun run scripts/tui-preview.ts`).
+- **PWA hosting** is the prerequisite for clickable `https://<host>/#join=`
+  links; until then tokens are pasted.
 
-## Verified facts
+## Gotchas (the classes of bug that recur)
 
-- Both pinned SDKs ship the full API; `MessageDisappearingSettings = { fromNs: bigint, inNs: bigint }` (`fromNs` = epoch-ns the rule starts, `inNs` = duration). `messageDisappearingSettings()` is sync on node / async on browser — same `MaybePromise` split the adapter already normalizes for `consentState`.
-- Both stores serialize whole objects into a JSON `data` column/snapshot → new optional fields need no migration. `IndexedDbStore` delegates to `MemoryStore`, so `deleteMessage` is a passthrough.
-- Interface implementors to update: `FakeAdapter` (core/tests/client.test.ts), `PairingAdapter` (core/tests/pairing.test.ts), `MockClient` + `stubClient` (cli/tests), web preview mock (apps/web/src/mock.ts).
+- **`decryptJson` does not authenticate the schema label** — payload type
+  discrimination must live *inside* the ciphertext (`type` fields on invite
+  payloads; pairing skips any typed payload). Same code space, no cross-flow
+  reads.
+- **Store metadata key whitelist**: BunSQLiteStore's `getMetadata` enumerates
+  keys explicitly — every new `ConeStoreMetadata` field needs a branch there
+  or it is silently dropped (bit us for `deniedInboxIds`, again for
+  `pendingGroupJoins`). MemoryStore/IndexedDB spread through for free.
+- **SQLite upserts must update every denormalized column** — `putMessage`
+  once updated only `data`, which would have silently broken re-keying
+  messages during duplicate-DM collapse.
+- **Every spawned `bun` re-loads the repo `.env`**, and `CONE_STATE_PATH`
+  beats `CONE_HOME`. Multi-actor scripts must SET state/config paths per
+  actor. Symptom of collision: `PRAGMA key or salt has incorrect value`.
+- **Rendezvous re-posts need stable participant ids** — link servicing
+  re-posts the descriptor every sync; a fresh nonce would mean "room already
+  has a descriptor" (the stable nonce lives on `GroupInviteLink`).
+- **Tokens are case-sensitive, spoken codes are not** — anything that
+  normalizes a rendezvous secret must branch on the `cone_gi_v1_` prefix.
+- **XMTP duplicate DMs**: list with `includeDuplicateDms: false` and let
+  sync fold strays; one peer must always be one thread.
+- **Terminal rendering**: U+231B `⌛` is double-width in many terminals
+  (ASCII in `pad()`-aligned rows); an Edit once smuggled a literal ESC byte
+  into a test string — check `od -c` when a "wrong" test passes.
+- **Live tests catch store bugs unit fakes cannot** — NOT NULL columns and
+  metadata whitelists both surfaced only on the dev network.
 
-## Open items / to verify
+## Shipped log
 
-- [ ] Spike on dev network: confirm libxmtp's cleanup worker actually runs under both node + browser clients as we configure them (before trusting local XMTP-DB deletion).
-- [ ] Read receipts expire like any message; `latestReadOutboundId` shifts as receipts/messages expire — believed fine (they expire on similar timelines), watch in UI phases.
-- [ ] `sync()` overwrites conversation rows with the adapter's view (pre-existing behavior); retention rides that overwrite as the authoritative network value. `persistOutbound`/`maybeCreateConversation` must preserve `existing?.retention`.
-
-## Feedback round (Eddy, 2026-06-12)
-
-1. TUI-set custom timer (6d) never showed in the PWA → root cause: **the PWA never called `client.sync()`** — its 8s poll and the stream are local-only, and settings/consent ride conversation metadata. Fixed: sync at session start + every 60s (TUI parity). This also means PWA Requests now populate from offline periods and expired messages purge in the browser.
-2. Buckets as primary vocabulary: presets now off/30s/5m/1h/8h/1d/1w/4w (added 'w' unit to format/parse). Custom durations stay legal (TUI free text); every surface must *display* a custom value as-is — PWA select grows an extra option for it, never snaps to a bucket.
-3. PWA dropdown hotkeys: with the ⌛ select focused, j/k + arrows step a draft, Enter applies, Esc/blur discards; pointer selection commits directly. Draft pattern avoids firing a network settings-write per keystroke.
-
-## Journal
-
-- **2026-06-11** — Plan agreed with Eddy: native XMTP settings as foundation, Cone-store enforcement as the real work, cooperative-deletion caveat stated honestly. Explored core/client/stores/SDK typings; confirmed API availability and the no-migration property. Settled the derived-expiry-vs-stamping question in favor of derived (see Design decisions). Starting Phase 1.
-- **2026-06-12** — **Phase 1 complete.** `MessageRetention` mirror on conversations, `retention.ts` helpers (presets, parse/format, derived expiry), adapter `get/setRetention` with ns↔ms at the boundary, `ConeClient.setRetention` (mirror-first) + `purgeExpiredMessages` (on sync, before backup, before settings changes), `ConeStore.deleteMessage` across all three stores. One refinement while writing tests: purge-before-settings-change (see Design decisions) — without it, relaxing the timer could resurrect an expired-but-unpurged message. 101 tests green, typecheck clean. Next: Phase 2 (CLI `cone timer`).
-- **2026-06-12** — **Phase 2 complete.** `cone timer <target> [<duration|off>]` (show/set/clear) resolves targets like `cone inbox read` does; `inbox read` JSON carries `retention`/`expiresAt` for free via serialization. 103 tests green. Next: Phase 3 (TUI).
-- **2026-06-12** — **Phase 3 complete.** `e` in Chat(select) opens a timer form (Up/Down cycle off+presets, free text like '45m' accepted); header chip is ASCII `timer 1h` — U+231B `⌛` is double-width in many terminals and would overflow `pad()`-aligned rows (PWA keeps the glyph). `e` is select-mode only since chat-talk routes printable keys to the composer. runChat schedules a refresh at the earliest visible `expiresAt`, so rows vanish at the exact moment, not the next sync. Deviation from plan: change notices are status-line + header chip, not transcript lines — a real transcript line needs a timestamped event (parse XMTP `GroupUpdated`), noted as follow-up. 106 tests green. Next: Phase 4 (PWA).
-- **2026-06-12** — **Phases 4 + 5 complete — feature done end to end.** PWA: native `<select>` for the timer (accessible, no popover code), `e` parity, `⌛` chips; verified visually via the preview harness (added `?selected=<conversationId>` param to it; mock gives dm:codex a 1h timer so previews exercise the chip + header control). Docs: SPEC section, SKILL.md agent docs, TODO checked. Final state: 106 tests green, typecheck clean, prod web build clean. Remaining open item: live dev-network spike to confirm libxmtp's cleanup worker runs under both SDK clients as configured (Cone's own purge is independent of it, so worst case is stale rows in the XMTP-level DB only).
-- **2026-06-12** — **Feedback round applied** (see Feedback section above): PWA sync lifecycle fixed (the real bug behind "TUI change didn't show in PWA"), bucket presets 30s→4w with weeks unit, custom values acknowledged everywhere, full j/k/arrows/Enter/Esc support on the PWA timer select. Verified custom `6d` renders in the PWA header via preview harness (mock dm:codex now carries a custom timer). 106 tests green, typecheck + prod build clean.
+- **2026-06-12** — Disappearing messages end-to-end (native XMTP settings,
+  derived expiry, purge-before-settings-change; all surfaces).
+- **2026-06-12** — Groups Phase 1: core model, kind-tagged dual streams,
+  group consent + add-policy matrix, GroupUpdated decode.
+- **2026-07-01** — Groups Phase 2: admin model, `active` mirror, group-info
+  surfaces. Phase 3b: synchronous invite codes (pairing machinery reused
+  asymmetrically, pending-join auto-allow). Product renamed to **Cone**
+  (clean wire/state break). Cleanup sweep; SPEC gained "pre-release policy:
+  no upgrade paths". Phase 3c-lite: rendezvous v2 (hashed rooms, roles,
+  revocation) + auto-admit invite links, minter-serviced on sync. Live
+  five-actor dev-network run green.
+- **2026-07-02** — TUI redesign (A+B hybrid; aggressive resize tiers; mode
+  chips + amber focus highlighting). Duplicate-DM fold + "Me" removal; PWA
+  name-a-peer; timer system line fixed. Groups Phase 4: `isAddressedTo`
+  mention helper, enriched strict-by-default `cone listen`
+  (`--auto-accept-groups-from-contacts` opt-in, senderName/groupName in
+  JSON), group-concierge example agent. **Groups complete.**

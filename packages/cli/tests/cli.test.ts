@@ -164,6 +164,69 @@ describe('CLI', () => {
     expect(client.unsubscribed).toBe(true);
   });
 
+  test('listen defaults to explicit-accept for group adds; the flag opts in', async () => {
+    const strictIo = makeIo(generateSecretKey());
+    const strictClient = new MockClient();
+    let strictOptions: { autoAllowGroupsFromContacts?: boolean } | undefined;
+    const strictExit = runCli(['listen', '--secret-stdin', '--once', '--timeout-ms', '50'], strictIo, {
+      createClient: async (_secret, options) => {
+        strictOptions = options;
+        return strictClient;
+      },
+    });
+    await strictExit;
+    expect(strictOptions?.autoAllowGroupsFromContacts).toBe(false);
+
+    const optInIo = makeIo(generateSecretKey());
+    const optInClient = new MockClient();
+    let optInOptions: { autoAllowGroupsFromContacts?: boolean } | undefined;
+    await runCli(['listen', '--secret-stdin', '--once', '--timeout-ms', '50', '--auto-accept-groups-from-contacts'], optInIo, {
+      createClient: async (_secret, options) => {
+        optInOptions = options;
+        return optInClient;
+      },
+    });
+    expect(optInOptions?.autoAllowGroupsFromContacts).toBe(true);
+  });
+
+  test('listen enriches group messages with the sender contact and group name', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.contacts = [{
+      contactId: 'contact-alice',
+      name: 'Alice',
+      inboxId: 'inbox-alice',
+      source: 'paired',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }];
+    client.conversations = [
+      { conversationId: 'group-crew', kind: 'group', title: 'Crew', groupName: 'Crew', consentState: 'allowed' },
+    ];
+
+    const exitPromise = runCli(
+      ['listen', '--secret-stdin', '--once', '--timeout-ms', '1000'],
+      io,
+      { createClient: async () => client },
+    );
+    await client.waitForHandler();
+    await client.emit({
+      conversationId: 'group-crew',
+      conversationKind: 'group',
+      messageId: 'msg-group',
+      raw: {},
+      senderInboxId: 'inbox-alice',
+      sentAt: new Date().toISOString(),
+      text: 'hello crew',
+    });
+
+    expect(await exitPromise).toBe(0);
+    const line = JSON.parse(io.out.find((entry) => entry.includes('msg-group')) ?? '{}') as Record<string, unknown>;
+    expect(line.senderName).toBe('Alice');
+    expect(line.groupName).toBe('Crew');
+    expect(line.conversationKind).toBe('group');
+  });
+
   test('inbox commands sync and read through the local read model', async () => {
     const io = makeIo(generateSecretKey());
     const client = new MockClient();

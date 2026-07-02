@@ -113,6 +113,64 @@ export function isDeniedConversation(conversation: Pick<ConeConversation, 'conse
   return conversation.consentState === 'denied';
 }
 
+// The chat-list filter matches two strings per conversation: the title (a
+// contact name, a group name, or — for an unnamed peer — the raw inbox ID
+// itself) and the DM peer's full XMTP inbox ID. Returning WHERE the query
+// matched lets surfaces show the matched characters, so a row kept by a match
+// on a string that isn't displayed (the middle of a 64-char inbox ID) can
+// reveal why it's still in the list.
+export interface ConversationFilterMatch {
+  // 'title' when a visible name matched; 'inboxId' when the peer's full inbox
+  // ID matched (including unnamed peers, whose title IS the inbox ID).
+  field: 'title' | 'inboxId';
+  // The string the query was found in: the title, or the full inbox ID.
+  value: string;
+  index: number;
+  length: number;
+}
+
+export function matchConversationFilter(
+  conversation: Pick<ConeConversation, 'title' | 'peerInboxId'>,
+  filter: string,
+): ConversationFilterMatch | null {
+  const query = filter.trim().toLocaleLowerCase();
+  if (!query) {
+    return null;
+  }
+  if (conversation.title !== conversation.peerInboxId) {
+    const index = conversation.title.toLocaleLowerCase().indexOf(query);
+    if (index >= 0) {
+      return { field: 'title', value: conversation.title, index, length: query.length };
+    }
+  }
+  const inboxId = conversation.peerInboxId ?? '';
+  const index = inboxId.toLocaleLowerCase().indexOf(query);
+  if (index >= 0) {
+    return { field: 'inboxId', value: inboxId, index, length: query.length };
+  }
+  return null;
+}
+
+// A short window around the matched characters, for showing an inbox-ID (or
+// truncated-title) match without printing the whole string. `before`/`after`
+// carry their own ellipses, so callers just concatenate before + hit + after
+// and style `hit`.
+export interface FilterMatchSnippet {
+  before: string;
+  hit: string;
+  after: string;
+}
+
+export function filterMatchSnippet(match: ConversationFilterMatch, context = 6): FilterMatchSnippet {
+  const start = match.index;
+  const end = match.index + match.length;
+  return {
+    before: `${start - context > 0 ? '…' : ''}${match.value.slice(Math.max(0, start - context), start)}`,
+    hit: match.value.slice(start, end),
+    after: `${match.value.slice(end, end + context)}${end + context < match.value.length ? '…' : ''}`,
+  };
+}
+
 // Attributed system lines for a group update ("Alice added Bob", "Carol
 // renamed the group to Crew"). `resolveName` maps inbox IDs to display names
 // (contacts-first); pass-through by default.
@@ -173,6 +231,33 @@ export function formatGroupUpdate(
 // surfaces nonetheless render as system lines in group transcripts.
 export function isGroupUpdateMessage(message: Pick<ConeMessage, 'json'>): boolean {
   return isGroupUpdateEnvelope(message.json);
+}
+
+// The mention convention: XMTP has no native mention content type, so Cone
+// uses plain "@alias" text, matched case-insensitively at token boundaries.
+// An agent in a group that responds only when addressed cannot be pulled into
+// reply loops with other agents — the guard that makes shared rooms safe.
+export function isAddressedTo(text: string | undefined, aliases: Array<string | undefined>): boolean {
+  if (!text) {
+    return false;
+  }
+  const lower = text.toLocaleLowerCase();
+  return aliases.some((alias) => {
+    const trimmed = alias?.trim().toLocaleLowerCase();
+    if (!trimmed) {
+      return false;
+    }
+    const needle = `@${trimmed}`;
+    let index = lower.indexOf(needle);
+    while (index !== -1) {
+      const after = lower[index + needle.length];
+      if (after === undefined || !/[\p{L}\p{N}_-]/u.test(after)) {
+        return true;
+      }
+      index = lower.indexOf(needle, index + 1);
+    }
+    return false;
+  });
 }
 
 // The honest MLS caveat, shown once at the top of a group transcript: a new

@@ -4,6 +4,7 @@ import {
   isRequestConversation,
   isVisibleChatMessage,
   latestInboundAt,
+  matchConversationFilter,
   type ConeClient,
   type ConeConversation,
   type ConeIdentity,
@@ -83,18 +84,15 @@ export function scopedConversations(state: ChatState): ConeConversation[] {
   return state.conversations.filter(state.scope === 'requests' ? isRequestConversation : isAllowedConversation);
 }
 
-// scopedConversations narrowed by the live text filter.
+// scopedConversations narrowed by the live text filter. Matching lives in
+// @cone/core (matchConversationFilter) so the list and the rendered match
+// highlights can never disagree about why a row is visible.
 export function visibleConversations(state: ChatState): ConeConversation[] {
   const inScope = scopedConversations(state);
-  const query = state.filter.trim().toLocaleLowerCase();
-  if (!query) {
+  if (!state.filter.trim()) {
     return inScope;
   }
-  return inScope.filter(
-    (conversation) =>
-      conversation.title.toLocaleLowerCase().includes(query) ||
-      (conversation.peerInboxId ?? '').toLocaleLowerCase().includes(query),
-  );
+  return inScope.filter((conversation) => matchConversationFilter(conversation, state.filter) !== null);
 }
 
 export function requestCount(state: ChatState): number {

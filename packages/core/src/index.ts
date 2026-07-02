@@ -18,6 +18,7 @@ export {
 export { createConeClient } from './client';
 export {
   errorMessage,
+  filterMatchSnippet,
   formatConnectionStatus,
   formatConversationPreview,
   formatMessageLine,
@@ -25,6 +26,7 @@ export {
   formatTranscriptTime,
   formatGroupUpdate,
   groupHistoryNotice,
+  isAddressedTo,
   isAllowedConversation,
   isDeniedConversation,
   isGroupUpdateMessage,
@@ -34,12 +36,13 @@ export {
   laterIso,
   latestInboundAt,
   latestReadOutboundId,
+  matchConversationFilter,
   matchesPendingSend,
   messageBody,
   normalizeDeliveryStatus,
   relativeTime,
 } from './display';
-export type { ConeConnectionStatus } from './display';
+export type { ConeConnectionStatus, ConversationFilterMatch, FilterMatchSnippet } from './display';
 export {
   GROUP_UPDATE_TYPE,
   READ_RECEIPT_TYPE,

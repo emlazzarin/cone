@@ -658,6 +658,19 @@ kbd {
   color: var(--text);
 }
 
+/* Live-filter match marks: the exact characters the filter matched, in the
+   name or in the revealed inbox-ID fragment. */
+mark {
+  background: var(--amber-soft);
+  color: var(--amber);
+  padding: 0 1px;
+  border-radius: 2px;
+}
+
+.conv__match {
+  color: var(--text-faint);
+}
+
 .badge {
   flex: none;
   display: inline-grid;
@@ -1124,7 +1137,9 @@ kbd {
 }
 
 .panel.center {
-  max-width: 560px;
+  /* Wide enough that a full 64-char XMTP inbox ID + copy button fit on one
+     line at the base 13px mono size. */
+  max-width: 640px;
   margin: 0 auto;
   width: 100%;
 }

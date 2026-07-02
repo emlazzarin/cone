@@ -56,6 +56,18 @@ export function inputField(value: string): string {
   return `${CSI}30;47m${value}${CSI}0m`;
 }
 
+// Emphasize the characters a live filter matched. Restores with non-reset
+// codes (24 = underline off, 39 = default foreground) instead of `0m`, so the
+// mark can sit inside a dim span or the amber-inverse selection bar without
+// wiping those styles for the rest of the line. On the selection bar itself
+// pass colored:false — its foreground is already amber, so only the underline
+// distinguishes the match.
+export function matchMark(value: string, options: { colored?: boolean } = {}): string {
+  return options.colored ?? true
+    ? `${CSI}4;38;5;214m${value}${CSI}24;39m`
+    : `${CSI}4m${value}${CSI}24m`;
+}
+
 export function stripAnsi(value: string): string {
   return value.replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
 }

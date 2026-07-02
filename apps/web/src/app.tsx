@@ -4,6 +4,7 @@ import {
   createConeClient,
   deriveAccount,
   errorMessage,
+  filterMatchSnippet,
   formatConnectionStatus,
   formatConversationPreview,
   formatGroupUpdate,
@@ -21,11 +22,14 @@ import {
   laterIso,
   latestInboundAt,
   latestReadOutboundId,
+  matchConversationFilter,
   matchesPendingSend,
   messageBody,
   parseSecretKey,
   RETENTION_PRESETS_MS,
   type ConeConnectionStatus,
+  type ConversationFilterMatch,
+  type FilterMatchSnippet,
   type ConeClient,
   type ConeConversation,
   type ConeGroupMember,
@@ -58,6 +62,7 @@ export interface AppBootstrap {
   composing?: boolean;
   to?: string;
   chatScope?: 'chats' | 'requests';
+  filter?: string;
 }
 
 export interface AppProps {
@@ -111,7 +116,7 @@ export function App({ bootstrap }: AppProps = {}) {
   // unknown-sender Requests sub-surface.
   const [chatScope, setChatScope] = useState<'chats' | 'requests'>(() => bootstrap?.chatScope ?? 'chats');
   const [showRequests, setShowRequests] = useState(true);
-  const [filter, setFilter] = useState('');
+  const [filter, setFilter] = useState(() => bootstrap?.filter ?? '');
   const [to, setTo] = useState(() => bootstrap?.to ?? '');
   const [text, setText] = useState('');
   const [suggestIndex, setSuggestIndex] = useState(0);
@@ -197,17 +202,14 @@ export function App({ bootstrap }: AppProps = {}) {
   const deniedConversations = useMemo(() => sortedConversations.filter(isDeniedConversation), [sortedConversations]);
   const requestCount = requestConversations.length;
 
+  // Matching lives in @cone/core (matchConversationFilter) so this list and
+  // the rendered match highlights can never disagree about why a row matched.
   const filteredConversations = useMemo(() => {
     const base = chatScope === 'requests' ? requestConversations : allowedConversations;
-    const query = filter.trim().toLowerCase();
-    if (!query) {
+    if (!filter.trim()) {
       return base;
     }
-    return base.filter(
-      (conversation) =>
-        conversation.title.toLowerCase().includes(query) ||
-        (conversation.peerInboxId ?? '').toLowerCase().includes(query),
-    );
+    return base.filter((conversation) => matchConversationFilter(conversation, filter) !== null);
   }, [allowedConversations, requestConversations, chatScope, filter]);
 
   // Unread counts cover the allowed inbox only; Requests have their own badge
@@ -479,6 +481,8 @@ export function App({ bootstrap }: AppProps = {}) {
         if (event.key === '/' && !isEditable(event.target)) {
           event.preventDefault();
           secretRef.current?.focus();
+        } else if (event.key === 'Escape' && isEditable(document.activeElement)) {
+          (document.activeElement as HTMLElement | null)?.blur();
         }
         return;
       }
@@ -1216,7 +1220,7 @@ export function App({ bootstrap }: AppProps = {}) {
           <div class="login__body">
             <div class="login__intro">
               <div class="wordmark">
-                Cone<br />of<br /><b>Silence</b>
+                <b>Cone</b>
               </div>
               <p class="muted">
                 Private XMTP messaging unlocked by a portable secret key. The raw key is held in memory for this browser
@@ -1226,6 +1230,7 @@ export function App({ bootstrap }: AppProps = {}) {
                 <li><kbd>/</kbd> focus secret key</li>
                 <li><kbd>Tab</kbd> move between fields</li>
                 <li><kbd>↵</kbd> unlock</li>
+                <li><kbd>esc</kbd> unfocus — leave the field, back to keys</li>
               </ul>
             </div>
             <form
@@ -1396,6 +1401,11 @@ export function App({ bootstrap }: AppProps = {}) {
                     const last = lastVisibleByConv[conversation.conversationId];
                     const unread = unreadByConv[conversation.conversationId] ?? 0;
                     const preview = last ? formatConversationPreview(last) : 'No messages yet';
+                    // While filtering, mark the matched characters in the name;
+                    // a match on the (not displayed) full inbox ID is revealed
+                    // in place of the preview instead.
+                    const match = filter.trim() ? matchConversationFilter(conversation, filter) : null;
+                    const idSnippet = match?.field === 'inboxId' ? filterMatchSnippet(match) : null;
                     if (chatScope === 'requests') {
                       return (
                         <div
@@ -1409,11 +1419,13 @@ export function App({ bootstrap }: AppProps = {}) {
                             </span>
                             <span class="conv__body">
                               <span class="conv__top">
-                                <span class="conv__name">{peerLabel(conversation)}</span>
+                                <span class="conv__name"><MatchedLabel conversation={conversation} match={match} /></span>
                                 <time class="conv__time">{relativeTime(laterIso(conversation.updatedAt, last?.sentAt), nowTick)}</time>
                               </span>
                               <span class="conv__sub">
-                                <span class="conv__preview">{preview}</span>
+                                <span class="conv__preview">
+                                  {idSnippet ? <MatchedSnippet snippet={idSnippet} /> : preview}
+                                </span>
                               </span>
                             </span>
                           </button>
@@ -1438,14 +1450,16 @@ export function App({ bootstrap }: AppProps = {}) {
                         </span>
                         <span class="conv__body">
                           <span class="conv__top">
-                            <span class="conv__name">{peerLabel(conversation)}</span>
+                            <span class="conv__name"><MatchedLabel conversation={conversation} match={match} /></span>
                             {conversation.retention && (
                               <span class="conv__timer" title={`Disappearing messages: ${formatRetention(conversation.retention.durationMs)}`} aria-label="Disappearing messages on">⌛</span>
                             )}
                             <time class="conv__time">{relativeTime(laterIso(conversation.updatedAt, last?.sentAt), nowTick)}</time>
                           </span>
                           <span class="conv__sub">
-                            <span class="conv__preview">{preview}</span>
+                            <span class="conv__preview">
+                              {idSnippet ? <MatchedSnippet snippet={idSnippet} /> : preview}
+                            </span>
                             {unread > 0 ? <span class="badge">{unread}</span> : null}
                           </span>
                         </span>
@@ -2112,6 +2126,11 @@ export function App({ bootstrap }: AppProps = {}) {
                     <dd><span class="kv__val">{rendezvousUrl}</span></dd>
                   </div>
                 </dl>
+                <p class="lede">
+                  The inbox ID and the address both name this account — either one reaches you. The XMTP inbox ID is
+                  your identity inside Cone; the EVM address is the wallet key that registered it, shown so people on
+                  other XMTP-based messengers can reach you by address. Cone uses it for nothing on-chain.
+                </p>
                 <label class="toggle">
                   <input
                     type="checkbox"
@@ -2199,7 +2218,7 @@ export function App({ bootstrap }: AppProps = {}) {
               </header>
               <div class="help-row">
                 <b>Navigate</b>
-                <span><kbd>1</kbd>–<kbd>5</kbd> switch sections · <kbd>j</kbd>/<kbd>k</kbd> move through chats · <kbd>↵</kbd> opens the selected chat, or starts a new message when none is selected · <kbd>esc</kbd> stops typing</span>
+                <span><kbd>1</kbd>–<kbd>5</kbd> switch sections · <kbd>j</kbd>/<kbd>k</kbd> move through chats · <kbd>↵</kbd> opens the selected chat, or starts a new message when none is selected · <kbd>esc</kbd> unfocuses the field, back to keys</span>
               </div>
               <div class="help-row">
                 <b>Write</b>
@@ -2274,11 +2293,11 @@ function FooterHints({ view, hasSelection }: { view: View; hasSelection: boolean
   const hints: [string, string][] =
     view === 'chats'
       ? hasSelection
-        ? [['↵', 'send'], ['esc', 'navigate'], ['j/k', 'switch chat'], ['n', 'new'], ['e', 'timer'], ['/', 'filter'], ['?', 'help']]
-        : [['j/k', 'move'], ['↵', 'start message'], ['n', 'new message'], ['/', 'filter'], ['?', 'help']]
+        ? [['↵', 'send'], ['esc', 'unfocus'], ['j/k', 'switch chat'], ['n', 'new'], ['e', 'timer'], ['/', 'filter'], ['?', 'help']]
+        : [['j/k', 'move'], ['↵', 'start message'], ['n', 'new message'], ['/', 'filter'], ['esc', 'unfocus'], ['?', 'help']]
       : view === 'pair'
-        ? [['c', 'create code'], ['p', 'join code'], ['?', 'help']]
-        : [['?', 'help']];
+        ? [['c', 'create code'], ['p', 'join code'], ['esc', 'unfocus'], ['?', 'help']]
+        : [['esc', 'unfocus'], ['?', 'help']];
   return (
     <>
       {hints.map(([key, label]) => (
@@ -2331,6 +2350,31 @@ function buildTargetSuggestions(query: string, contacts: Contact[], conversation
 // form until it's named via a contact. Named conversations keep their name.
 function peerLabel(conversation: Pick<ConeConversation, 'title' | 'peerInboxId'>): string {
   return conversation.title === conversation.peerInboxId ? shortId(conversation.peerInboxId) : conversation.title;
+}
+
+// The conversation name with the live filter's matched characters marked.
+// Inbox-ID matches aren't visible in the name — MatchedSnippet reveals those.
+function MatchedLabel({ conversation, match }: { conversation: ConeConversation; match: ConversationFilterMatch | null }) {
+  if (!match || match.field !== 'title') {
+    return <>{peerLabel(conversation)}</>;
+  }
+  return (
+    <>
+      {match.value.slice(0, match.index)}
+      <mark>{match.value.slice(match.index, match.index + match.length)}</mark>
+      {match.value.slice(match.index + match.length)}
+    </>
+  );
+}
+
+// Shown in place of the preview while a filter matches the peer's full inbox
+// ID: the fragment of the ID that matched, so the row explains itself.
+function MatchedSnippet({ snippet }: { snippet: FilterMatchSnippet }) {
+  return (
+    <span class="conv__match">
+      id {snippet.before}<mark>{snippet.hit}</mark>{snippet.after}
+    </span>
+  );
 }
 
 function connectionDot(status: ConeConnectionStatus): string {

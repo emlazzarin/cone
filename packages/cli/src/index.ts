@@ -40,7 +40,7 @@ export interface CliIo {
 }
 
 export interface CliDeps {
-  createClient?: (secret: SecretKey, options?: { env?: XmtpEnv }) => Promise<ConeClient>;
+  createClient?: (secret: SecretKey, options?: { env?: XmtpEnv; autoAllowGroupsFromContacts?: boolean }) => Promise<ConeClient>;
 }
 
 export async function createCliClient(
@@ -120,7 +120,12 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
         // Agent trust boundary: streamMessages defaults to allowed senders
         // only, so an unknown sender can never drive an agent's workflow.
         // Unknown senders surface only through the explicit `cone requests`.
-        const client = await getClient();
+        // Group adds are stricter still: even a contact's add waits for an
+        // explicit accept unless --auto-accept-groups-from-contacts is given.
+        activeClient = await loadClient(context, io, deps, {
+          autoAllowGroupsFromContacts: context.args.includes('--auto-accept-groups-from-contacts'),
+        });
+        const listenClient = activeClient;
         if (context.output === 'plain') {
           io.stdout('Listening for Cone messages (allowed senders only)...\n');
         }
@@ -132,8 +137,8 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
               resolveFirstMessage = resolve;
             })
           : null;
-        const unsubscribe = await client.streamMessages((message) => {
-          writeMessage(io, context, message);
+        const unsubscribe = await listenClient.streamMessages(async (message) => {
+          writeMessage(io, context, await enrichIncomingMessage(listenClient, message));
           resolveFirstMessage?.();
         });
         if (once && firstMessage) {
@@ -192,9 +197,33 @@ function printableMessage(message: IncomingMessage): Omit<IncomingMessage, 'raw'
   return rest;
 }
 
-function writeMessage(io: CliIo, context: CliContext, message: IncomingMessage): void {
+// Group context for agent consumers: the local contact name for the sender
+// and the group's name ride along, so an agent can address replies and log
+// sensibly without keeping its own address book. Reads are local-store only.
+type EnrichedMessage = IncomingMessage & { senderName?: string; groupName?: string };
+
+async function enrichIncomingMessage(client: ConeClient, message: IncomingMessage): Promise<EnrichedMessage> {
+  const enriched: EnrichedMessage = { ...message };
+  try {
+    const contacts = await client.listContacts();
+    enriched.senderName = contacts.find((contact) => contact.inboxId === message.senderInboxId)?.name;
+    if (message.conversationKind === 'group') {
+      const conversations = await client.listConversations();
+      enriched.groupName = conversations.find(
+        (conversation) => conversation.conversationId === message.conversationId,
+      )?.groupName;
+    }
+  } catch {
+    // Enrichment is best-effort; the message itself always goes out.
+  }
+  return enriched;
+}
+
+function writeMessage(io: CliIo, context: CliContext, message: EnrichedMessage): void {
   if (context.output === 'plain') {
-    io.stdout(`${formatMessageLine(message, message.senderInboxId)}\n`);
+    const sender = message.senderName ?? message.senderInboxId;
+    const prefix = message.conversationKind === 'group' ? `[${message.groupName ?? 'group'}] ` : '';
+    io.stdout(`${prefix}${formatMessageLine(message, sender)}\n`);
     return;
   }
   io.stdout(`${JSON.stringify(printableMessage(message))}\n`);
@@ -746,12 +775,17 @@ async function handleBackup(args: string[], io: CliIo, context: CliContext, clie
   throw new Error('usage: cone backup <export|import>');
 }
 
-async function loadClient(context: CliContext, io: CliIo, deps: CliDeps): Promise<ConeClient> {
+async function loadClient(
+  context: CliContext,
+  io: CliIo,
+  deps: CliDeps,
+  options: { autoAllowGroupsFromContacts?: boolean } = {},
+): Promise<ConeClient> {
   const secret = context.args.includes('--secret-stdin')
     ? parseSecretKey(await io.stdinText())
     : loadSecretKey(defaultConfigPath());
   const env = optionalOption(context.args, '--env') as XmtpEnv | undefined;
-  return deps.createClient ? deps.createClient(secret, { env }) : createCliClient(secret, { env });
+  return deps.createClient ? deps.createClient(secret, { env, ...options }) : createCliClient(secret, { env, ...options });
 }
 
 async function readLoginSecret(args: string[], io: CliIo): Promise<string> {
@@ -957,7 +991,9 @@ function helpText(): string {
   cone [--json|--plain] login --secret-stdin [--remember]
   cone [--json|--plain] whoami [--env dev|production|local]
   cone [--json|--plain] send --to <inboxId|address|contactName> --text "..."
-  cone [--json|--plain] listen [--once] [--timeout-ms <ms>]   (allowed senders only)
+  cone [--json|--plain] listen [--once] [--timeout-ms <ms>] [--auto-accept-groups-from-contacts]
+       (allowed senders only; group adds stay explicit-accept unless the flag is given;
+        JSON lines carry conversationKind plus senderName/groupName when known)
   cone [--json|--plain] inbox [list]
   cone [--json|--plain] inbox sync
   cone [--json|--plain] inbox read <conversationId|contactName|inboxId>

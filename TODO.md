@@ -9,7 +9,7 @@ Goal metric for the whole batch: **a stranger agent handed only a SKILL.md URL g
 - [ ] **Publish the CLI to npm** so `bunx <package> keygen` works with no clone. Blockers to resolve:
   - `@cone/cli` `bin` currently points at TS source (`./src/bin.ts`) — fine under Bun, breaks for Node consumers. Either add a build step that emits JS for the published package, or declare Bun as an explicit runtime requirement (`engines`, README, and a clear error if run under Node).
   - All workspace packages are unpublished (`@cone/core`, `@cone/xmtp-node` are `workspace:*` deps) — they need real published versions or the CLI must be bundled into a single publishable artifact.
-  - Decide the public package name now — interacts with the existing "new name" item below (secret key prefix `cone_sk_v1_` and the `cone` binary name should be settled before anything is published).
+  - Public name is settled (Cone; `cone` binary, `cone_sk_v1_` secrets) — decide only the npm package name (`cone` may be taken; `@cone/cli`?).
 - [ ] **Single-file compiled binaries** as an alternative install path: `bun build --compile` per platform (macOS arm64/x64, Linux arm64/x64), attached to GitHub releases, with a curl-able install script. Agents without Bun or npm can still get a working `cone`.
 - [ ] **Fix the nightly XMTP pin before publishing** (see the standing item under "Pre-existing" below — it is a hard blocker for this section). A fresh `bun install` resolving a different nightly months from now is exactly the failure mode that strands an unattended agent. If stable is still broken on macOS arm64, pin an exact known-good nightly version (`=6.1.0-nightly.X`, not a range) and/or vendor the bindings.
 - [ ] **Host SKILL.md at a stable URL and rewrite it to be fully self-contained from zero.** Today it assumes the repo is already cloned and invokes `bun run packages/cli/src/bin.ts ...`. The rewrite should walk: install (one `bunx`/curl command) → `keygen` → `login --secret-stdin` → verify with the echo bot (see §4) → pair/send/listen → consent recipes. Include the exact JSON output shape for every command (agents write parsers against the examples), exit-code semantics, and two operating recipes: a heartbeat/polling loop for turn-based agents and a long-running `listen` daemon for persistent agents.
@@ -51,16 +51,16 @@ Most agent harnesses wake → check → respond → sleep; they cannot hold a bl
 
 - [ ] **Market the consent boundary as a prompt-injection firewall.** The allowed-only stream means an unknown sender's text can never reach an agent's context — a security property no webhook or shared Slack channel offers, and it's already built. Say this explicitly in README and SKILL.md; it's the differentiator vs. "just use XMTP directly."
 - [ ] **`cone whoami --card`**: a stable, shareable identity blob (e.g. `xmtp:<inboxId>` plus optional self-described capabilities) that an agent can paste into a README, website, or registry so other agents can initiate contact without a pairing code (landing in Requests, gated by consent as usual). This is the eventual discovery/growth loop; keep v1 minimal.
-- [ ] Group chat (item below) becomes the multi-agent room primitive — sequence it after §§1–4; it doesn't matter until the two-party path is frictionless.
+- [x] Group chat is done and is the multi-agent room primitive (respond-when-addressed convention + strict group consent keep multi-agent rooms loop-free; see SPEC "Groups → Agents").
 
 ## Pre-existing
 
 - [ ] replace the temporary XMTP nightly Node dependencies with stable releases once XMTP publishes a fixed stable macOS arm64 `@xmtp/node-bindings` package. The stable `@xmtp/node-sdk@6.0.0` currently pulls `@xmtp/node-bindings@1.10.0`, whose published macOS arm64 binary is linked to a machine-specific Nix `libiconv` path. Cone currently requires `@xmtp/node-sdk >=6.1.0-nightly <6.2.0` so Bun does not resolve back to the broken stable SDK.
 - [ ] an agentic skill of how to install and use this easily for agents themselves to use (covered by §1 "Host SKILL.md…" above)
-- [ ] group chat functionality (design agreed + phased plan in SCRATCHPAD-GROUPS.md; Phase 0 stream guard shipped; Eddy 2026-06-12: implement groups before the agent-readiness batch, overriding §6's sequencing)
+- [x] group chat functionality — complete 2026-07-02: core model, admin & surfaces, invite codes, invite links + rendezvous v2, agent kit (SPEC "Groups"; deliberately deferred pieces — knock links, in-group secret distribution — documented with reasoning in SCRATCHPAD.md)
 - [ ] self-profile / share-card: volunteer profile info (name, …) offered as save-suggestions on pair / request-accept / group-join — easy mutual address-book saves without auto-save (spun off from groups design; relates to "Context box/aliases/names" below)
 - [ ] add how this works/explainer + Github link
-- [ ] new name (remember to update secret key format)
+- [x] new name — **Cone** (2026-07-01): binary `cone`, `CONE_*` env, `cone_sk_v1_` secrets, `cone.*` control types
 - [ ] feature to sync data between versions of app? Send encrypted data to yourself style transfer. The use of the history feature?
 - [x] adopt use of "consent" or anti-spam
 - [ ] Skill so you can make your own version of the app with the same secret key and data store

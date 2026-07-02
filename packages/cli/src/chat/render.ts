@@ -1,4 +1,5 @@
 import {
+  filterMatchSnippet,
   formatConnectionStatus,
   formatGroupUpdate,
   formatRetention,
@@ -8,6 +9,7 @@ import {
   isGroupUpdateMessage,
   isVisibleChatMessage,
   latestReadOutboundId,
+  matchConversationFilter,
   matchesPendingSend,
   messageBody,
   relativeTime,
@@ -18,7 +20,7 @@ import {
 import { activeContact, composerKey, conversationActivityAt, groupInfoMembers, isContactsMode, memberDisplayName, requestCount, scopedConversations, selectedContact, selectedConversation, visibleConversations } from './state';
 import { box, columns, fitRows, spread } from './layout';
 import type { ChatMode, ChatState } from './types';
-import { CSI, accent, bold, chip, danger, dim, ellipsize, highlight, inputField, inverse, pad, shortId, stripAnsi, success, wrapText } from './text';
+import { CSI, accent, bold, chip, danger, dim, ellipsize, highlight, inputField, inverse, matchMark, pad, shortId, stripAnsi, success, wrapText } from './text';
 
 // An unnamed peer's conversation title is its raw XMTP inbox ID (60+ chars),
 // which is unreadable in a list. Show a short form until the peer is named
@@ -167,7 +169,18 @@ function chatListBox(state: ChatState, width: number, height: number, active: bo
     const unread = (state.unreadByConversation[conversation.conversationId] ?? 0) + (conversation.unreadCount ?? 0);
     const badge = unread > 0 ? `●${unread}` : '';
     const marker = selected ? '▸' : ' ';
-    const name = ellipsize(convTitle(conversation), Math.max(1, innerWidth - time.length - badge.length - 4));
+    // While filtering, mark the matched characters in the name so the filter
+    // is self-explanatory. A match the name doesn't show (the peer's full
+    // inbox ID, or a title truncated past the match) is revealed on the
+    // preview line instead — see below.
+    const match = state.filter.trim() ? matchConversationFilter(conversation, state.filter) : null;
+    const fullName = convTitle(conversation);
+    const plainName = ellipsize(fullName, Math.max(1, innerWidth - time.length - badge.length - 4));
+    const nameShown = plainName === fullName ? plainName.length : plainName.length - 1;
+    const nameMatchVisible = match?.field === 'title' && fullName === match.value && match.index + match.length <= nameShown;
+    const name = match && nameMatchVisible
+      ? `${plainName.slice(0, match.index)}${matchMark(plainName.slice(match.index, match.index + match.length), { colored: !selected })}${plainName.slice(match.index + match.length)}`
+      : plainName;
     const timeLabel = compact && badge ? `${badge} ${time}` : time;
     if (selected) {
       rows.push(highlight(spread(`${marker} ${name}${conversation.kind === 'group' ? ' ⚇' : ''}`, timeLabel, innerWidth)));
@@ -175,9 +188,19 @@ function chatListBox(state: ChatState, width: number, height: number, active: bo
       rows.push(spread(`${marker} ${name}${conversation.kind === 'group' ? dim(' ⚇') : ''}`, dim(timeLabel), innerWidth));
     }
     if (!compact) {
-      const preview = ellipsize(state.previewByConversation[conversation.conversationId] ?? '', Math.max(1, innerWidth - badge.length - 3));
-      const previewLine = spread(`  ${preview}`, badge, innerWidth);
-      rows.push(selected ? highlight(previewLine) : spread(`  ${dim(preview)}`, accent(badge), innerWidth));
+      const snippet = match && !nameMatchVisible ? filterMatchSnippet(match) : null;
+      if (snippet) {
+        // The match isn't in the displayed name: show the matched fragment in
+        // place of the preview while the filter is live.
+        const label = match?.field === 'inboxId' ? 'id ' : '';
+        rows.push(selected
+          ? highlight(spread(`  ${label}${snippet.before}${matchMark(snippet.hit, { colored: false })}${snippet.after}`, badge, innerWidth))
+          : spread(`  ${dim(`${label}${snippet.before}`)}${matchMark(snippet.hit)}${dim(snippet.after)}`, accent(badge), innerWidth));
+      } else {
+        const preview = ellipsize(state.previewByConversation[conversation.conversationId] ?? '', Math.max(1, innerWidth - badge.length - 3));
+        const previewLine = spread(`  ${preview}`, badge, innerWidth);
+        rows.push(selected ? highlight(previewLine) : spread(`  ${dim(preview)}`, accent(badge), innerWidth));
+      }
     }
   }
   return box(rows, { width, height, title, right, active });

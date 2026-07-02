@@ -107,6 +107,20 @@ describe('group updates', () => {
     ]);
   });
 
+  test('isAddressedTo matches @alias at token boundaries, case-insensitively', async () => {
+    const { isAddressedTo } = await import('../src/index');
+    expect(isAddressedTo('@concierge can you mint a link?', ['concierge'])).toBe(true);
+    expect(isAddressedTo('hey @Concierge, ping', ['concierge'])).toBe(true);
+    expect(isAddressedTo('ends with @concierge', ['concierge'])).toBe(true);
+    // Token boundary: a longer alias must not match a shorter mention query.
+    expect(isAddressedTo('@conciergebot hello', ['concierge'])).toBe(false);
+    expect(isAddressedTo('mail me at bot@concierge.example', ['concierge'])).toBe(true);
+    expect(isAddressedTo('no mention here', ['concierge'])).toBe(false);
+    expect(isAddressedTo(undefined, ['concierge'])).toBe(false);
+    expect(isAddressedTo('@bot hi', ['concierge', 'bot'])).toBe(true);
+    expect(isAddressedTo('@bot hi', [undefined, ''])).toBe(false);
+  });
+
   test('a disappearing-timer change renders once, with the duration', async () => {
     const { formatGroupUpdate } = await import('../src/index');
     // One timer change arrives as two metadata field changes (from_ns + in_ns).
@@ -146,5 +160,64 @@ describe('group updates', () => {
     const { messageBody } = await import('../src/index');
     expect(isVisibleChatMessage({ kind: 'control', json: update })).toBe(false);
     expect(messageBody({ json: update })).toBe('[inbox-alice added inbox-bob; inbox-carol left; inbox-alice renamed the group to Crew]');
+  });
+});
+
+describe('chat-list filter matching', () => {
+  const INBOX = '9f2c4d7b1a3e6f8c0d2b4a6e8f1c3d5b7a9e0c2d4f6b8a1c3e5d7f9b0a2c4e6d';
+  const named = { title: 'Alice', peerInboxId: INBOX };
+  const unnamed = { title: INBOX, peerInboxId: INBOX };
+  const group = { title: 'Project Alpha', peerInboxId: undefined };
+
+  test('matches the title case-insensitively and reports the range', async () => {
+    const { matchConversationFilter } = await import('../src/index');
+    expect(matchConversationFilter(named, 'LIC')).toEqual({ field: 'title', value: 'Alice', index: 1, length: 3 });
+    expect(matchConversationFilter(group, 'alpha')).toEqual({ field: 'title', value: 'Project Alpha', index: 8, length: 5 });
+  });
+
+  test('falls back to the peer inbox ID when the name does not match', async () => {
+    const { matchConversationFilter } = await import('../src/index');
+    expect(matchConversationFilter(named, '8f1c3d')).toEqual({ field: 'inboxId', value: INBOX, index: 24, length: 6 });
+  });
+
+  test('an unnamed peer (title === inbox ID) always matches as an inbox ID', async () => {
+    const { matchConversationFilter } = await import('../src/index');
+    expect(matchConversationFilter(unnamed, '9f2c')).toEqual({ field: 'inboxId', value: INBOX, index: 0, length: 4 });
+  });
+
+  test('trims the query and treats empty or non-matching queries as no match', async () => {
+    const { matchConversationFilter } = await import('../src/index');
+    expect(matchConversationFilter(named, '  lic  ')?.field).toBe('title');
+    expect(matchConversationFilter(named, '')).toBeNull();
+    expect(matchConversationFilter(named, '   ')).toBeNull();
+    expect(matchConversationFilter(named, 'zzz')).toBeNull();
+  });
+
+  test('accepts the same rows the surfaces accepted before the helper existed', async () => {
+    const { matchConversationFilter } = await import('../src/index');
+    // Legacy behavior: title OR peerInboxId substring, case-insensitive.
+    for (const conversation of [named, unnamed, group]) {
+      for (const query of ['ali', 'ALPHA', INBOX.slice(30, 38), 'nope']) {
+        const legacy =
+          conversation.title.toLowerCase().includes(query.toLowerCase()) ||
+          (conversation.peerInboxId ?? '').toLowerCase().includes(query.toLowerCase());
+        expect(matchConversationFilter(conversation, query) !== null).toBe(legacy);
+      }
+    }
+  });
+
+  test('snippet windows the match with ellipses only where text was cut', async () => {
+    const { filterMatchSnippet, matchConversationFilter } = await import('../src/index');
+    const match = matchConversationFilter(named, '8f1c3d')!;
+    expect(filterMatchSnippet(match)).toEqual({ before: '…2b4a6e', hit: '8f1c3d', after: '5b7a9e…' });
+    // Match at the very start: no leading ellipsis, no cut before it.
+    const head = matchConversationFilter(unnamed, '9f2c')!;
+    expect(filterMatchSnippet(head)).toEqual({ before: '', hit: '9f2c', after: '4d7b1a…' });
+    // Match at the very end: no trailing ellipsis.
+    const tail = matchConversationFilter(unnamed, INBOX.slice(-4))!;
+    expect(filterMatchSnippet(tail)).toEqual({ before: '…9b0a2c', hit: '4e6d', after: '' });
+    // Short titles fit entirely: no ellipses at all.
+    const title = matchConversationFilter(named, 'lic')!;
+    expect(filterMatchSnippet(title)).toEqual({ before: 'A', hit: 'lic', after: 'e' });
   });
 });
