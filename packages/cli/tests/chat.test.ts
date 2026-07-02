@@ -41,7 +41,7 @@ describe('cone chat', () => {
       text: "hey what's your name",
     }];
 
-    const output = renderChat(state, 100, 24);
+    const output = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
 
     expect(output).toContain('Cone ·dev');
     expect(output).toContain('1 Chats');
@@ -79,7 +79,7 @@ describe('cone chat', () => {
     const output = renderChat(state, 80, 20);
 
     expect(output).toContain('Bob');
-    expect(output).toContain('Message:');
+    expect(output).toContain('›');
     expect(output).toContain('jk are text here');
     expect(output).toContain('█');
     expect(output).toContain('Enter send');
@@ -105,10 +105,10 @@ describe('cone chat', () => {
     );
     state.mode = 'contacts-select';
 
-    const output = renderChat(state, 90, 20);
+    const output = renderChat(state, 100, 20).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
 
-    expect(output).toContain('[contacts]');
-    expect(output).toContain('[contact]');
+    expect(output).toContain('─ contacts ');
+    expect(output).toContain('─ contact ');
     expect(output).toContain('Bob');
     expect(output).toContain('XMTP inbox ID: inbox-bob-long');
     expect(output).toContain('EVM address: 0x1111111111111111111111111111111111111111');
@@ -130,8 +130,8 @@ describe('cone chat', () => {
 
     const output = renderChat(state, 100, 20);
 
-    expect(output).toContain('[Add contact]');
-    expect(output).toContain('> Name: Dana Laptop');
+    expect(output).toContain('Add contact');
+    expect(output).toContain('▸ Name: Dana Laptop');
     expect(output).toContain('XMTP inbox ID or EVM address: inbox-dana');
     expect(output).toContain('Tab next field');
     expect(output).toContain('Shift+Tab previous');
@@ -179,7 +179,7 @@ describe('cone chat', () => {
 
     const output = renderChat(state, 90, 18);
 
-    expect(output).toContain('[Delete chat Bob]');
+    expect(output).toContain('Delete chat Bob');
     expect(output).toContain('Type DELETE to remove Bob');
     expect(output).toContain('Enter Delete');
   });
@@ -270,7 +270,7 @@ describe('cone chat', () => {
     await handleInput('\n', client, state, async () => {}, async () => {}, async () => {});
 
     // The row is in the transcript before the network resolves, unmarked.
-    const optimistic = renderChat(state, 100, 24);
+    const optimistic = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
     expect(optimistic).toContain('me: hello optimism');
     expect(optimistic).not.toContain('✗');
     expect(state.input).toBe('');
@@ -301,7 +301,7 @@ describe('cone chat', () => {
     };
     await handleInput('\n', retryClient, state, refreshWithDelivered, async () => {}, async () => {});
     await delay(0);
-    const retried = renderChat(state, 100, 24);
+    const retried = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
     expect(retried).toContain('me: hello optimism');
     expect(retried).not.toContain('✗');
     expect(state.pendingMessages).toHaveLength(0);
@@ -316,7 +316,7 @@ describe('cone chat', () => {
       { conversationId: 'dm-bob', direction: 'inbound', kind: 'control', messageId: 'r1', senderInboxId: 'inbox-bob', sentAt: '2026-01-01T10:02:00.000Z', json: { type: 'cone.read.v1' } },
     ];
 
-    const output = renderChat(state, 80, 16);
+    const output = renderChat(state, 100, 16);
     expect(output).toContain('✓✓ Read');
     // The read receipt itself is never shown as a transcript line.
     expect(output).not.toContain('[read]');
@@ -427,8 +427,8 @@ describe('cone chat', () => {
 
     const output = renderChat(state, 100, 22);
 
-    expect(output).toContain('[New message]');
-    expect(output).toContain('> To: Da');
+    expect(output).toContain('New message');
+    expect(output).toContain('▸ To: Da');
     expect(output).toContain('Message:');
     expect(output).toContain('Suggestions from contacts and conversations');
     expect(output).toContain('Dana');
@@ -450,7 +450,7 @@ describe('cone chat', () => {
 
     const output = renderChat(state, 80, 12);
 
-    expect(output).toContain('> Chat 29');
+    expect(output).toContain('▸ Chat 29');
     expect(output).not.toContain('Chat 0');
   });
 
@@ -601,7 +601,7 @@ describe('cone chat', () => {
     await handleInput('o', client, state, refresh, syncNow, quit);
     expect(state.filter).toBe('co');
     expect(visibleConversations(state).map((conversation) => conversation.title)).toEqual(['Codex']);
-    expect(renderChat(state, 100, 24)).toContain('[chats /co 1/2]');
+    expect(renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '')).toContain('─ chats /co 1/2');
 
     await handleInput('\r', client, state, refresh, syncNow, quit);
     expect(state.filterActive).toBe(false);
@@ -661,10 +661,11 @@ describe('cone chat', () => {
       text: 'this is a message that wraps cleanly',
     }];
 
-    const output = renderChat(state, 60, 14);
+    state.mode = 'chat-talk';
+    const output = renderChat(state, 52, 14).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
 
     expect(output).toContain('16:39 - Bob: this');
-    expect(output).toContain('             wraps cleanly');
+    expect(output).toContain('             cleanly');
   });
 
   test('does not expose slash command or command palette concepts', () => {
@@ -768,7 +769,7 @@ describe('cone chat', () => {
 
     const plain = renderChat(state, 100, 20).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
     // The selected field carries the cursor; the inactive field does not.
-    expect(plain).toContain('> Name: Alice█');
+    expect(plain).toContain('▸ Name: Alice█');
     expect(plain).not.toContain('XMTP inbox ID or EVM address: █');
   });
 
@@ -893,7 +894,7 @@ describe('cone chat', () => {
     await handleInput('i', client, state, noop, noop, noop);
     expect(state.mode).toBe('group-info');
     const plain = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
-    expect(plain).toContain('[group info] Crew');
+    expect(plain).toContain('group info — Crew');
     expect(plain).toContain('Olive [owner]');
     expect(plain).toContain('you');
     expect(plain).toContain('3 members');

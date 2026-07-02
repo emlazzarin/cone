@@ -23,12 +23,25 @@ export function dim(value: string): string {
   return `${CSI}2m${value}${CSI}0m`;
 }
 
-export function highlight(value: string): string {
-  return `${CSI}36m${CSI}7m${value}${CSI}0m`;
+export function bold(value: string): string {
+  return `${CSI}1m${value}${CSI}0m`;
 }
 
+// Selection bar: amber-inverse, matching the PWA's CRT accent.
+export function highlight(value: string): string {
+  return `${CSI}38;5;214m${CSI}7m${value}${CSI}0m`;
+}
+
+// The single accent color — 256-color amber, the PWA's `--amber` in terminal
+// terms, so both surfaces read as one product.
 export function accent(value: string): string {
-  return `${CSI}33m${value}${CSI}0m`;
+  return `${CSI}38;5;214m${value}${CSI}0m`;
+}
+
+// State chips (active tab, current mode): bold amber-inverse so the current
+// state is unmistakable at a glance.
+export function chip(value: string): string {
+  return `${CSI}1;38;5;214;7m${value}${CSI}0m`;
 }
 
 export function danger(value: string): string {

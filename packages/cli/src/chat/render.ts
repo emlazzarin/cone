@@ -16,8 +16,9 @@ import {
 } from '@cone/core';
 
 import { activeContact, composerKey, conversationActivityAt, groupInfoMembers, isContactsMode, memberDisplayName, requestCount, scopedConversations, selectedContact, selectedConversation, visibleConversations } from './state';
+import { box, columns, fitRows, spread } from './layout';
 import type { ChatMode, ChatState } from './types';
-import { CSI, accent, danger, dim, ellipsize, highlight, inputField, inverse, pad, shortId, stripAnsi, success, wrapText } from './text';
+import { CSI, accent, bold, chip, danger, dim, ellipsize, highlight, inputField, inverse, pad, shortId, stripAnsi, success, wrapText } from './text';
 
 // An unnamed peer's conversation title is its raw XMTP inbox ID (60+ chars),
 // which is unreadable in a list. Show a short form until the peer is named
@@ -26,366 +27,428 @@ function convTitle(conversation: Pick<ConeConversation, 'title' | 'peerInboxId'>
   return conversation.title === conversation.peerInboxId ? shortId(conversation.peerInboxId) : conversation.title;
 }
 
+// Layout tiers: two-pane above NARROW_WIDTH, single column (the mode decides
+// which pane shows) below it — the same collapse the PWA does on mobile.
+const NARROW_WIDTH = 84;
+// Below this body height, chat rows collapse from two lines to one and the
+// talk composer folds into the bottom line instead of its own boxed row.
+const SHORT_BODY = 12;
+
 export function renderChat(state: ChatState, width: number, height: number): string {
-  if (width < 50 || height < 10) {
+  if (width < 44 || height < 9) {
     return `${CSI}2J${CSI}H${inverse(' Cone '.slice(0, Math.max(1, width)))}\nterminal too small for cone chat\n`;
   }
 
   const safeWidth = Math.max(1, width);
-  const safeHeight = Math.max(1, height);
-  const leftWidth = Math.min(32, Math.max(22, Math.floor(safeWidth * 0.25)));
-  const mainWidth = safeWidth - leftWidth - 1;
-  const bodyHeight = safeHeight - 4;
+  const bodyHeight = Math.max(3, height - 4);
   const lines: string[] = [];
 
   lines.push(`${CSI}2J${CSI}H${CSI}?25l`);
-  lines.push(topBar(state, safeWidth));
-  for (let row = 0; row < bodyHeight; row += 1) {
-    const left = isContactsMode(state)
-      ? renderContactRow(state, row, leftWidth, bodyHeight)
-      : renderConversationRow(state, row, leftWidth, bodyHeight);
-    const right = renderMainRow(state, row, mainWidth, bodyHeight);
-    lines.push(`${left}|${right}`);
+  lines.push(headerLine(state, safeWidth));
+  for (const line of fitRows(renderBody(state, safeWidth, bodyHeight), bodyHeight)) {
+    lines.push(pad(line, safeWidth));
   }
-  lines.push(inputLine(state, safeWidth));
+  lines.push(bottomLine(state, safeWidth, bodyHeight));
   lines.push(footerLine(state, safeWidth));
   return `${lines.join('\n')}\n`;
 }
 
-// Mirrors the PWA top bar: brand·env, tabs, connection (+ new count when
-// non-zero), current context, own identity last so narrow terminals lose the
-// least important cell first. Modes are expressed by the footer and input
-// line, not a dedicated label.
-function topBar(state: ChatState, width: number): string {
+// ── Header: brand chip, highlighted section tabs, status on the right ────
+function headerLine(state: ChatState, width: number): string {
+  const contacts = isContactsMode(state);
+  const brand = chip(` Cone ·${state.identity.env} `);
+  const chatsTab = contacts ? dim(' 1 Chats ') : chip(' 1 Chats ');
+  const contactsTab = contacts ? chip(' 2 Contacts ') : dim(' 2 Contacts ');
+  const left = `${brand} ${chatsTab}${contactsTab}`;
+
   const selected = selectedConversation(state);
-  const context = isContactsMode(state)
+  const context = contacts
     ? selectedContact(state)?.name ?? 'contacts'
     : state.mode === 'chat-compose'
       ? state.editForm?.title ?? 'New message'
       : activeContact(state)?.name ?? (selected ? convTitle(selected) : 'chats');
   const unread = Object.values(state.unreadByConversation).reduce((sum, count) => sum + count, 0);
   const connection = formatConnectionStatus(connectionStatusForState(state));
+  const connectionLabel = state.streamState === 'online' && state.syncState !== 'stale'
+    ? success(connection)
+    : state.streamState === 'offline' || state.syncState === 'stale'
+      ? danger(connection)
+      : dim(connection);
   const requests = requestCount(state);
   const parts = [
-    `Cone ·${state.identity.env}`,
-    '1 Chats',
-    '2 Contacts',
-    unread > 0 ? `${connection} · ${unread} new` : connection,
-    ...(requests > 0 ? [`${requests} request${requests === 1 ? '' : 's'}`] : []),
-    ...(state.readReceipts ? [] : ['receipts off']),
-    context,
-    `you ${shortId(state.identity.inboxId)}`,
+    unread > 0 ? `${connectionLabel}${dim(' · ')}${accent(`${unread} new`)}` : connectionLabel,
+    ...(requests > 0 ? [accent(`${requests} request${requests === 1 ? '' : 's'}`)] : []),
+    ...(state.readReceipts ? [] : [dim('receipts off')]),
+    bold(ellipsize(context, Math.max(6, Math.floor(width / 4)))),
+    dim(`you ${shortId(state.identity.inboxId)}`),
   ];
-  return inverse(` ${parts.join(' | ')} `.slice(0, width));
+  return spread(left, `${parts.join(dim(' · '))} `, width);
 }
 
-// Two rows per chat, like the PWA list: name + relative time, then the last
-// message preview + unread count.
-function renderConversationRow(state: ChatState, row: number, width: number, bodyHeight: number): string {
+// ── Body composition per mode and width tier ──────────────────────────────
+function renderBody(state: ChatState, width: number, bodyHeight: number): string[] {
+  if (state.helpVisible) {
+    return box(helpRows(state), { width, height: bodyHeight, title: bold(`help — ${modeLabel(state.mode)}`), active: true });
+  }
+
+  const narrow = width < NARROW_WIDTH;
+  const listWidth = Math.min(36, Math.max(24, Math.floor(width * 0.3)));
+  const mainWidth = width - listWidth - 1;
+
+  if (isContactsMode(state)) {
+    const listActive = state.mode === 'contacts-select';
+    if (narrow) {
+      return state.mode === 'contacts-edit'
+        ? formBox(state, width, bodyHeight)
+        : contactsListBox(state, width, bodyHeight, true);
+    }
+    const right = state.mode === 'contacts-edit'
+      ? formBox(state, mainWidth, bodyHeight)
+      : contactDetailBox(state, mainWidth, bodyHeight);
+    return columns([contactsListBox(state, listWidth, bodyHeight, listActive), right], [listWidth, mainWidth]);
+  }
+
+  const listActive = state.mode === 'chat-select';
+  if (narrow) {
+    if (state.mode === 'chat-compose') {
+      return formBox(state, width, bodyHeight);
+    }
+    if (state.mode === 'group-info') {
+      return groupInfoBox(state, width, bodyHeight);
+    }
+    if (state.mode === 'chat-talk') {
+      return threadColumn(state, width, bodyHeight);
+    }
+    return chatListBox(state, width, bodyHeight, true);
+  }
+
+  const right = state.mode === 'chat-compose'
+    ? formBox(state, mainWidth, bodyHeight)
+    : state.mode === 'group-info'
+      ? groupInfoBox(state, mainWidth, bodyHeight)
+      : threadColumn(state, mainWidth, bodyHeight);
+  return columns([chatListBox(state, listWidth, bodyHeight, listActive), right], [listWidth, mainWidth]);
+}
+
+// ── Chat list ─────────────────────────────────────────────────────────────
+function chatListBox(state: ChatState, width: number, height: number, active: boolean): string[] {
   const conversations = visibleConversations(state);
   const label = state.scope === 'requests' ? 'requests' : 'chats';
-  if (row === 0) {
-    const heading = state.filter || state.filterActive
-      ? `[${label} /${state.filter} ${conversations.length}/${scopedConversations(state).length}]`
-      : `[${label}]`;
-    return pad(heading, width);
-  }
+  const title = state.filter || state.filterActive
+    ? `${label} ${accent(`/${state.filter}`)} ${dim(`${conversations.length}/${scopedConversations(state).length}`)}`
+    : state.scope === 'requests' ? accent(label) : label;
+  const requests = requestCount(state);
+  const right = state.scope === 'chats' && requests > 0 ? accent(`t ${requests} req`) : undefined;
+
+  const innerWidth = width - 4;
+  const innerHeight = height - 2;
+  const rows: string[] = [];
+
   if (conversations.length === 0) {
     const empty = state.filter
       ? [`no ${label} match`, 'Esc clears the filter']
       : state.scope === 'requests'
         ? ['no requests', 't back to chats']
         : ['no chats yet', 'n new message', '2 contacts + pairing'];
-    return pad(dim(empty[row - 1] ?? ''), width);
+    rows.push(...empty.map((line) => dim(line)));
+    return box(rows, { width, height, title, right, active });
   }
 
-  const visiblePairs = Math.max(1, Math.floor((bodyHeight - 1) / 2));
-  const start = visibleStart(state.selectedIndex, conversations.length, visiblePairs);
-  const conversationIndex = start + Math.floor((row - 1) / 2);
-  const conversation = conversations[conversationIndex];
-  if (!conversation || conversationIndex >= start + visiblePairs) {
-    return pad('', width);
-  }
-  const selected = conversationIndex === state.selectedIndex;
+  // Two rows per chat normally; one row when the terminal is short.
+  const compact = innerHeight < SHORT_BODY;
+  const rowsPerEntry = compact ? 1 : 2;
+  const visibleEntries = Math.max(1, Math.floor(innerHeight / rowsPerEntry));
+  const start = visibleStart(state.selectedIndex, conversations.length, visibleEntries);
 
-  if ((row - 1) % 2 === 0) {
+  for (let index = start; index < Math.min(conversations.length, start + visibleEntries); index += 1) {
+    const conversation = conversations[index]!;
+    const selected = index === state.selectedIndex;
     const time = relativeTime(conversationActivityAt(state, conversation) || undefined);
-    const nameWidth = Math.max(1, width - time.length - 3);
-    const name = ellipsize(convTitle(conversation), nameWidth).padEnd(nameWidth);
-    const marker = selected ? '>' : ' ';
+    const unread = (state.unreadByConversation[conversation.conversationId] ?? 0) + (conversation.unreadCount ?? 0);
+    const badge = unread > 0 ? `●${unread}` : '';
+    const marker = selected ? '▸' : ' ';
+    const name = ellipsize(convTitle(conversation), Math.max(1, innerWidth - time.length - badge.length - 4));
+    const timeLabel = compact && badge ? `${badge} ${time}` : time;
     if (selected) {
-      return highlight(pad(`${marker} ${name} ${time}`, width));
+      rows.push(highlight(spread(`${marker} ${name}${conversation.kind === 'group' ? ' ⚇' : ''}`, timeLabel, innerWidth)));
+    } else {
+      rows.push(spread(`${marker} ${name}${conversation.kind === 'group' ? dim(' ⚇') : ''}`, dim(timeLabel), innerWidth));
     }
-    return pad(`${marker} ${name} ${dim(time)}`, width);
+    if (!compact) {
+      const preview = ellipsize(state.previewByConversation[conversation.conversationId] ?? '', Math.max(1, innerWidth - badge.length - 3));
+      const previewLine = spread(`  ${preview}`, badge, innerWidth);
+      rows.push(selected ? highlight(previewLine) : spread(`  ${dim(preview)}`, accent(badge), innerWidth));
+    }
   }
-
-  const unread = (state.unreadByConversation[conversation.conversationId] ?? 0) + (conversation.unreadCount ?? 0);
-  const badge = unread > 0 ? `●${unread}` : '';
-  const previewWidth = Math.max(1, width - badge.length - 3);
-  const preview = ellipsize(state.previewByConversation[conversation.conversationId] ?? '', previewWidth).padEnd(previewWidth);
-  if (selected) {
-    return highlight(pad(`  ${preview} ${badge}`, width));
-  }
-  return pad(`  ${dim(preview)} ${accent(badge)}`, width);
+  return box(rows, { width, height, title, right, active });
 }
 
-function renderContactRow(state: ChatState, row: number, width: number, bodyHeight: number): string {
-  if (row === 0) {
-    return pad('[contacts]', width);
-  }
+// ── Contacts ──────────────────────────────────────────────────────────────
+function contactsListBox(state: ChatState, width: number, height: number, active: boolean): string[] {
+  const innerWidth = width - 4;
+  const innerHeight = height - 2;
+  const rows: string[] = [];
   if (state.contacts.length === 0) {
-    const empty = ['no contacts yet', 'a add contact', 'c create code', 'p join code'];
-    return pad(dim(empty[row - 1] ?? ''), width);
+    rows.push(...['no contacts yet', 'a add contact', 'c create code', 'p join code'].map((line) => dim(line)));
+    return box(rows, { width, height, title: 'contacts', active });
   }
-  const start = visibleStart(state.selectedContactIndex, state.contacts.length, bodyHeight - 1);
-  const contactIndex = start + row - 1;
-  const contact = state.contacts[contactIndex];
-  if (!contact) {
-    return pad('', width);
+  const start = visibleStart(state.selectedContactIndex, state.contacts.length, innerHeight);
+  for (let index = start; index < Math.min(state.contacts.length, start + innerHeight); index += 1) {
+    const contact = state.contacts[index]!;
+    const selected = index === state.selectedContactIndex;
+    const line = pad(`${selected ? '▸' : ' '} ${ellipsize(contact.name, innerWidth - 2)}`, innerWidth);
+    rows.push(selected ? highlight(line) : line);
   }
-  const marker = contactIndex === state.selectedContactIndex ? '>' : ' ';
-  const label = `${marker} ${contact.name}`;
-  return pad(contactIndex === state.selectedContactIndex ? highlight(label) : label, width);
+  return box(rows, { width, height, title: 'contacts', active });
 }
 
-function renderMainRow(state: ChatState, row: number, width: number, bodyHeight: number): string {
-  if (state.helpVisible) {
-    return renderHelpRow(state, row, width);
-  }
-  if (state.mode === 'contacts-select') {
-    return renderContactDetailRow(state, row, width);
-  }
-  if (state.mode === 'contacts-edit' || state.mode === 'chat-compose') {
-    return renderEditFormRow(state, row, width);
-  }
-  if (state.mode === 'group-info') {
-    return renderGroupInfoRow(state, row, width, bodyHeight);
-  }
-  return renderThreadRow(state, row, width, bodyHeight);
+function contactDetailBox(state: ChatState, width: number, height: number): string[] {
+  const contact = selectedContact(state);
+  const rows = contact
+    ? [
+        bold(contact.name),
+        `XMTP inbox ID: ${contact.inboxId}`,
+        `EVM address: ${contact.address ?? 'unknown'}`,
+        dim(`Source: ${contact.source}`),
+        dim(`Created: ${contact.createdAt}`),
+        dim(`Updated: ${contact.updatedAt}`),
+      ]
+    : ['No contacts yet.', dim('a add contact'), dim('c create pairing code'), dim('p join pairing code')];
+  return box(rows, { width, height, title: 'contact' });
 }
 
-// The group-info pane: shared metadata, own status, and the member list with
-// roles ('owner' for XMTP super admins). Members read from the cached mirror,
-// so the pane works offline; entering the pane kicks a quiet sync to freshen.
-function renderGroupInfoRow(state: ChatState, row: number, width: number, bodyHeight: number): string {
-  const conversation = selectedConversation(state);
-  if (!conversation || conversation.kind !== 'group') {
-    return pad(row === 0 ? '[group info]' : '', width);
+// ── Thread + composer ─────────────────────────────────────────────────────
+function threadColumn(state: ChatState, width: number, height: number): string[] {
+  // The composer is its own boxed row (droid-style) unless the terminal is
+  // too short — then it folds into the bottom chrome line instead.
+  const composerHeight = height >= SHORT_BODY ? 3 : 0;
+  const thread = threadBox(state, width, height - composerHeight);
+  if (composerHeight === 0) {
+    return thread;
   }
-  if (row === 0) {
-    const left = conversation.active === false ? ` ${danger('no longer a member')}` : '';
-    return pad(`[group info] ${conversation.title}${left}`, width);
-  }
-  const meta: string[] = [];
-  if (conversation.groupDescription) {
-    meta.push(dim(ellipsize(conversation.groupDescription, width - 2)));
-  }
-  const timer = conversation.retention ? ` · timer ${formatRetention(conversation.retention.durationMs)}` : '';
-  meta.push(dim(`${conversation.memberCount ?? groupInfoMembers(state).length} members · consent ${conversation.consentState}${timer}`));
-  meta.push('');
-  if (row <= meta.length) {
-    return pad(meta[row - 1] ?? '', width);
-  }
-
-  const members = groupInfoMembers(state);
-  const listRow = row - meta.length - 1;
-  if (members.length === 0) {
-    return pad(listRow === 0 ? dim('no member list yet — syncing') : '', width);
-  }
-  const visibleRows = Math.max(1, bodyHeight - meta.length - 1);
-  const start = visibleStart(state.groupInfoIndex, members.length, visibleRows);
-  const member = members[start + listRow];
-  if (!member || start + listRow >= start + visibleRows) {
-    return pad('', width);
-  }
-  const selected = start + listRow === state.groupInfoIndex;
-  const role = member.level === 'superAdmin' ? ' [owner]' : member.level === 'admin' ? ' [admin]' : '';
-  const rawName = memberDisplayName(state, member.inboxId);
-  const unnamed = rawName === member.inboxId;
-  const name = unnamed ? shortId(member.inboxId) : rawName;
-  const idSuffix = unnamed ? '' : ` ${dim(shortId(member.inboxId))}`;
-  const blocked = member.consentState === 'denied' ? ` ${danger('[blocked]')}` : '';
-  const line = `${selected ? '>' : ' '} ${name}${role}${idSuffix}${blocked}`;
-  return pad(selected ? highlight(line) : line, width);
+  return [...thread, ...composerBox(state, width)];
 }
 
-function renderThreadRow(state: ChatState, row: number, width: number, bodyHeight: number): string {
+function threadBox(state: ChatState, width: number, height: number): string[] {
   const conversation = selectedConversation(state);
   const contact = activeContact(state);
-  if (row === 0) {
-    const unread = conversation ? state.unreadByConversation[conversation.conversationId] ?? 0 : 0;
-    // When the title is already the peer's inbox ID, don't repeat it dimmed.
-    // Groups show their member count instead of a peer id.
-    const peerSuffix = conversation?.kind === 'group'
-      ? ` ${dim(conversation.memberCount ? `group · ${conversation.memberCount}` : 'group')}${conversation.active === false ? ` ${danger('left')}` : ''}`
+  const active = state.mode === 'chat-talk';
+
+  const title = conversation
+    ? bold(ellipsize(convTitle(conversation), Math.max(6, width - 30)))
+    : contact
+      ? `${bold(contact.name)} ${dim('new chat')}`
+      : dim('no chat selected');
+  const unread = conversation ? state.unreadByConversation[conversation.conversationId] ?? 0 : 0;
+  const metaParts = [
+    ...(conversation?.kind === 'group'
+      ? [`${dim(conversation.memberCount ? `group · ${conversation.memberCount}` : 'group')}${conversation.active === false ? ` ${danger('left')}` : ''}`]
       : conversation?.peerInboxId && conversation.title !== conversation.peerInboxId
-        ? ` ${dim(shortId(conversation.peerInboxId))}`
-        : '';
-    // Active disappearing-messages timer, ASCII so padded rows never overflow.
-    const timer = conversation?.retention ? ` ${accent(`timer ${formatRetention(conversation.retention.durationMs)}`)}` : '';
-    const title = conversation
-      ? `${convTitle(conversation)}${peerSuffix}${timer}`
-      : contact
-        ? `${contact.name} ${dim('new chat')}`
-        : 'no chat selected';
-    const scroll = state.transcriptScroll > 0 ? ` ${dim(`scroll +${state.transcriptScroll}`)}` : '';
-    const newBelow = unread > 0 ? ` ${accent(`${unread} new`)}` : '';
-    return pad(`[${title}]${scroll}${newBelow}`, width);
-  }
-  if (!conversation && !contact) {
-    const emptyLines = [
-      'No selected chat.',
-      'n starts a structured message to a contact, inbox ID, or EVM address.',
-      '2 opens contacts for address-book edits and pairing.',
-    ];
-    return pad(emptyLines[row - 1] ?? '', width);
-  }
-
-  const rows = transcriptRows(state, conversation, contact ? `contact:${contact.contactId}` : undefined, width);
-  const available = bodyHeight - 1;
-  const scroll = Math.min(state.transcriptScroll, Math.max(0, rows.length - available));
-  const bottom = Math.max(0, rows.length - scroll);
-  const start = Math.max(0, bottom - available);
-  return pad(rows.slice(start, bottom)[row - 1] ?? '', width);
-}
-
-function renderContactDetailRow(state: ChatState, row: number, width: number): string {
-  const contact = selectedContact(state);
-  if (row === 0) {
-    return pad('[contact]', width);
-  }
-  if (!contact) {
-    const empty = [
-      'No contacts yet.',
-      'a add contact',
-      'c create pairing code',
-      'p join pairing code',
-    ];
-    return pad(empty[row - 1] ?? '', width);
-  }
-  const lines = [
-    contact.name,
-    `XMTP inbox ID: ${contact.inboxId}`,
-    `EVM address: ${contact.address ?? 'unknown'}`,
-    `Source: ${contact.source}`,
-    `Created: ${contact.createdAt}`,
-    `Updated: ${contact.updatedAt}`,
+        ? [dim(shortId(conversation.peerInboxId))]
+        : []),
+    ...(conversation?.retention ? [accent(`timer ${formatRetention(conversation.retention.durationMs)}`)] : []),
+    ...(state.transcriptScroll > 0 ? [dim(`scroll +${state.transcriptScroll}`)] : []),
+    ...(unread > 0 ? [accent(`${unread} new`)] : []),
   ];
-  return pad(lines[row - 1] ?? '', width);
+
+  const innerWidth = width - 4;
+  const innerHeight = height - 2;
+  if (!conversation && !contact) {
+    return box([
+      'No selected chat.',
+      dim('n starts a structured message to a contact, inbox ID, or EVM address.'),
+      dim('2 opens contacts for address-book edits and pairing.'),
+    ], { width, height, title, active });
+  }
+
+  const rows = transcriptRows(state, conversation, contact ? `contact:${contact.contactId}` : undefined, innerWidth);
+  const scroll = Math.min(state.transcriptScroll, Math.max(0, rows.length - innerHeight));
+  const bottom = Math.max(0, rows.length - scroll);
+  const start = Math.max(0, bottom - innerHeight);
+  return box(rows.slice(start, bottom), { width, height, title, right: metaParts.length > 0 ? metaParts.join(dim(' · ')) : undefined, active });
 }
 
-function renderEditFormRow(state: ChatState, row: number, width: number): string {
+function composerBox(state: ChatState, width: number): string[] {
+  const active = state.mode === 'chat-talk';
+  const innerWidth = width - 4;
+  if (!active) {
+    const conversation = selectedConversation(state);
+    // A request is previewed, not replied to — accepting is the gate.
+    const hint = conversation?.consentState === 'unknown'
+      ? 'a accept · b block — accept before writing'
+      : conversation
+        ? `Enter to write to ${ellipsize(convTitle(conversation), Math.max(4, innerWidth - 22))}`
+        : 'Enter to write';
+    return box([dim(`› ${hint}`)], { width, height: 3 });
+  }
+  const available = Math.max(4, innerWidth - 3);
+  const value = state.input.length > available ? state.input.slice(state.input.length - available) : state.input;
+  return box([`${accent('›')} ${value}${accent('█')}`], { width, height: 3, active: true });
+}
+
+// ── Group info ────────────────────────────────────────────────────────────
+function groupInfoBox(state: ChatState, width: number, height: number): string[] {
+  const conversation = selectedConversation(state);
+  if (!conversation || conversation.kind !== 'group') {
+    return box([], { width, height, title: 'group info', active: true });
+  }
+  const innerWidth = width - 4;
+  const title = `group info — ${bold(ellipsize(conversation.title, Math.max(6, innerWidth - 30)))}`;
+  const right = conversation.active === false ? danger('no longer a member') : undefined;
+
+  const rows: string[] = [];
+  if (conversation.groupDescription) {
+    rows.push(dim(ellipsize(conversation.groupDescription, innerWidth)));
+  }
+  const timer = conversation.retention ? ` · timer ${formatRetention(conversation.retention.durationMs)}` : '';
+  rows.push(dim(`${conversation.memberCount ?? groupInfoMembers(state).length} members · consent ${conversation.consentState}${timer}`));
+  rows.push('');
+
+  const members = groupInfoMembers(state);
+  if (members.length === 0) {
+    rows.push(dim('no member list yet — syncing'));
+    return box(rows, { width, height, title, right, active: true });
+  }
+  const visibleRows = Math.max(1, height - 2 - rows.length);
+  const start = visibleStart(state.groupInfoIndex, members.length, visibleRows);
+  for (let index = start; index < Math.min(members.length, start + visibleRows); index += 1) {
+    const member = members[index]!;
+    const selected = index === state.groupInfoIndex;
+    const role = member.level === 'superAdmin' ? ' [owner]' : member.level === 'admin' ? ' [admin]' : '';
+    const rawName = memberDisplayName(state, member.inboxId);
+    const unnamed = rawName === member.inboxId;
+    const name = unnamed ? shortId(member.inboxId) : rawName;
+    const idSuffix = unnamed ? '' : ` ${dim(shortId(member.inboxId))}`;
+    const blocked = member.consentState === 'denied' ? ` ${danger('[blocked]')}` : '';
+    const line = `${selected ? '▸' : ' '} ${name}${role}${idSuffix}${blocked}`;
+    rows.push(selected ? highlight(pad(line, innerWidth)) : line);
+  }
+  return box(rows, { width, height, title, right, active: true });
+}
+
+// ── Forms ─────────────────────────────────────────────────────────────────
+function formBox(state: ChatState, width: number, height: number): string[] {
   const form = state.editForm;
   if (!form) {
-    return pad('', width);
+    return box([], { width, height, active: true });
   }
-  if (row === 0) {
-    return pad(`[${form.title}]`, width);
-  }
+  const innerWidth = width - 4;
+  const rows: string[] = [];
+
   if (form.pending) {
-    // A pending group invite keeps its result lines (the code) on screen —
-    // that is what gets read out to the joiner while we wait.
-    const result = form.resultLines ?? [];
-    if (row <= result.length) {
-      return pad(result[row - 1] ?? '', width);
-    }
+    // A pending invite keeps its result lines (the code) on screen — that is
+    // what gets read out to the other side while we wait.
+    rows.push(...(form.resultLines ?? []));
     const waiting = form.kind === 'group-invite'
       ? ['Waiting for someone to join with this code (up to 60s)…', 'Esc to leave — the invite keeps running in the background.']
       : form.kind === 'group-join'
         ? ['Waiting for the inviter to share the group (up to 60s)…', 'Esc to leave — the join keeps running in the background.']
         : ['Waiting for the other side to enter the same code (up to 60s)…', 'Esc to leave — pairing keeps running in the background.'];
-    return pad(dim(waiting[row - result.length - 1] ?? ''), width);
+    rows.push(...waiting.map((line) => dim(line)));
+    return box(rows, { width, height, title: bold(form.title), active: true });
   }
-  if (form.resultLines && row <= form.resultLines.length) {
-    return pad(form.resultLines[row - 1] ?? '', width);
+
+  if (form.resultLines && form.resultLines.length > 0) {
+    rows.push(...form.resultLines);
+    return box(rows, { width, height, title: bold(form.title), active: true });
   }
-  const field = form.fields[row - 1];
-  if (field) {
-    const isActive = row - 1 === form.activeField;
-    const label = `${isActive ? '>' : ' '} ${field.label}: `;
+
+  form.fields.forEach((field, index) => {
+    const isActive = index === form.activeField;
+    const label = `${isActive ? '▸' : ' '} ${field.label}: `;
     if (!isActive) {
-      return pad(`${label}${field.value}`, width);
+      rows.push(`${label}${field.value}`);
+      return;
     }
     // Cursor sits in the selected field. Long values (e.g. an inbox ID) scroll
     // so the caret stays visible instead of overflowing the pane.
-    const avail = Math.max(4, width - label.length - 2);
+    const avail = Math.max(4, innerWidth - stripAnsi(label).length - 2);
     const shown = field.value.length > avail ? field.value.slice(field.value.length - avail) : field.value;
-    return pad(`${label}${shown}${accent('█')}`, width);
-  }
+    rows.push(`${label}${shown}${accent('█')}`);
+  });
 
-  if (form.kind === 'pair-join' && row === form.fields.length + 1) {
-    return pad(dim('No code yet? Esc, then press c to create one to share.'), width);
+  if (form.kind === 'pair-join') {
+    rows.push(dim('No code yet? Esc, then press c to create one to share.'));
   }
 
   const suggestions = form.kind === 'message' ? messageTargetSuggestions(state) : [];
-  const suggestionsStart = form.fields.length + 1;
-  if (suggestions.length > 0 && row === suggestionsStart) {
-    return pad(dim('Suggestions from contacts and conversations:'), width);
-  }
   if (suggestions.length > 0) {
-    const suggestion = suggestions[row - suggestionsStart - 1];
-    if (suggestion) {
-      return pad(`  ${suggestion}`, width);
-    }
+    rows.push(dim('Suggestions from contacts and conversations:'));
+    rows.push(...suggestions.map((suggestion) => `  ${suggestion}`));
   }
 
-  const errorRow = form.fields.length + (suggestions.length > 0 ? suggestions.length + 2 : 2);
-  if (form.error && row === errorRow) {
-    return pad(`Error: ${form.error}`, width);
+  if (form.error) {
+    rows.push('');
+    rows.push(danger(`Error: ${form.error}`));
   }
-  return pad('', width);
+  return box(rows, { width, height, title: bold(form.title), active: true });
 }
 
-function inputLine(state: ChatState, width: number): string {
-  if (state.mode === 'chat-talk') {
-    return inputBox('Message: ', state.input, width);
-  }
+// ── Bottom chrome: filter/short-composer input, or the status line ────────
+function bottomLine(state: ChatState, width: number, bodyHeight: number): string {
   if (state.mode === 'chat-select' && state.filterActive) {
-    return inputBox('Filter: ', state.filter, width);
+    return inputPrompt('Filter: ', state.filter, width);
   }
-  if (state.mode === 'contacts-edit' || state.mode === 'chat-compose') {
-    // The active field carries the cursor in the form itself (main pane), so the
-    // bottom line just shows status.
-    return `status: ${state.status}`.slice(0, width);
+  if (state.mode === 'chat-talk' && bodyHeight < SHORT_BODY) {
+    return inputPrompt('Message: ', state.input, width);
   }
-  return `status: ${state.status}`.slice(0, width);
+  return pad(dim(`status: ${state.status}`), width);
 }
 
 function footerLine(state: ChatState, width: number): string {
   if (state.helpVisible) {
-    return inverse(' Esc close help | ? close help '.slice(0, width));
+    return `${chip(' HELP ')}${inverse(pad(' Esc close help | ? close help ', Math.max(0, width - 6)))}`;
   }
-  // Pane switching (1/2) lives in the top bar only, so footers stay focused
-  // on the keys unique to the current mode.
   const retrySync = state.syncState === 'stale' || state.streamState === 'offline';
-  const filterHint = state.filter ? '/ edit filter | Esc clear filter' : '/ filter';
+  const filterHint = state.filter ? '/ edit filter · Esc clear filter' : '/ filter';
   const failedHere = state.pendingMessages.some((entry) => entry.status === 'failed' && entry.key === composerKey(state));
   const requests = requestCount(state);
-  // In the Requests sub-surface, the footer carries accept/block; otherwise the
-  // normal chat keys plus a toggle into Requests when any exist.
   const requestsHint = state.scope === 'requests'
     ? ' t chats'
-    : requests > 0 ? ` | t requests (${requests})` : '';
+    : requests > 0 ? ` · t requests (${requests})` : '';
+  // The mode chip claims footer width, so hints stay lean; `g` (join a group
+  // by code/token) lives in help rather than the footer.
   const text = state.mode === 'chat-select'
     ? state.filterActive
-      ? ' type to filter | Up/Down move | Enter keep | Esc clear '
+      ? ' type to filter · Up/Down move · Enter keep · Esc clear '
       : state.scope === 'requests'
-        ? ` j/k move | Enter preview | a accept | b block${state.pendingBlockId ? ' (again to confirm)' : ''} | ${filterHint} |${requestsHint} | ? help | q quit `
-        : ` j/k move | Enter talk | n new | ${selectedConversation(state)?.kind === 'group' ? 'i info' : 'r name'} | e timer | c/p pair | g join group | ${filterHint} | d delete${failedHere ? ' | Ctrl+X delete failed' : ''}${retrySync ? ' | s retry sync' : ''}${requestsHint} | ? help | q quit `
+        ? ` j/k move · Enter preview · a accept · b block${state.pendingBlockId ? ' (again to confirm)' : ''} · ${filterHint} ·${requestsHint} · ? help · q quit `
+        : ` j/k move · Enter talk · n new · ${selectedConversation(state)?.kind === 'group' ? 'i info' : 'r name'} · e timer · c/p pair · ${filterHint} · d delete${failedHere ? ' · Ctrl+X delete failed' : ''}${retrySync ? ' · s retry sync' : ''}${requestsHint} · ? help · q quit `
     : state.mode === 'group-info'
-      ? ` j/k move | a add | v invite | l link | r rename | +/- role | d remove | e timer | x leave | b block | Esc back `
+      ? ` j/k move · a add · v invite · l link · r rename · +/- role · d remove · e timer · x leave · b block · Esc back `
     : state.mode === 'chat-talk'
       ? failedHere
-        ? ' Enter retry | Ctrl+X delete failed | Esc back | Ctrl+U clear '
-        : ' Enter send | Esc back | Ctrl+U clear | Ctrl+W delete word '
+        ? ' Enter retry · Ctrl+X delete failed · Esc back · Ctrl+U clear '
+        : ' Enter send · Esc back · Ctrl+U clear · Ctrl+W delete word '
     : state.mode === 'chat-compose'
         ? chatComposeFooter(state)
         : state.mode === 'contacts-select'
-          ? ' j/k move | Enter talk | a add | r rename | d delete | c create code | p join code | ? help | q quit '
+          ? ' j/k move · Enter talk · a add · r rename · d delete · c create code · p join code · ? help · q quit '
           : state.editForm?.resultLines?.length
-            ? ' Enter done | Esc done '
-            : ` Tab next field | Shift+Tab previous | Enter ${state.editForm?.submitLabel ?? 'save'} | Esc cancel `;
-  return inverse(text.slice(0, width));
+            ? ' Enter done · Esc done '
+            : ` Tab next field · Shift+Tab previous · Enter ${state.editForm?.submitLabel ?? 'save'} · Esc cancel `;
+  const label = modeChip(state);
+  return `${chip(label)}${inverse(pad(text, Math.max(0, width - stripAnsi(label).length)))}`;
+}
+
+// The explicit current-state chip: the mode is always visible at a glance.
+function modeChip(state: ChatState): string {
+  if (state.mode === 'chat-select') {
+    return state.scope === 'requests' ? ' REQUESTS ' : state.filterActive ? ' FILTER ' : ' CHATS ';
+  }
+  if (state.mode === 'chat-talk') {
+    return ' TALK ';
+  }
+  if (state.mode === 'chat-compose') {
+    return ' COMPOSE ';
+  }
+  if (state.mode === 'contacts-select') {
+    return ' CONTACTS ';
+  }
+  if (state.mode === 'group-info') {
+    return ' GROUP ';
+  }
+  return ' EDIT ';
 }
 
 function visibleStart(selectedIndex: number, count: number, visibleRows: number): number {
@@ -422,8 +485,8 @@ function transcriptRows(
     return [
       ...(notice ? [dim(`· ${notice}`)] : []),
       conversation
-        ? 'No local messages yet. New messages stream in automatically.'
-        : 'No messages yet. Press Enter to talk, type Message, then Enter to send.',
+        ? dim('No local messages yet. New messages stream in automatically.')
+        : dim('No messages yet. Press Enter to talk, type Message, then Enter to send.'),
     ];
   }
 
@@ -436,19 +499,21 @@ function transcriptRows(
   const pushEntry = (sentAt: string, sender: string, body: string, options: { failed?: boolean; outbound?: boolean; read?: boolean }) => {
     const failed = options.failed ?? false;
     const marker = failed ? `${danger('✗')} ` : '';
+    const senderLabel = options.outbound ? dim(sender) : accent(sender);
     const prefix = `${marker}${formatTranscriptTime(sentAt)} - ${sender}: `;
+    const styledPrefix = `${marker}${dim(formatTranscriptTime(sentAt))} ${dim('-')} ${senderLabel}${dim(':')} `;
     const indent = stripAnsi(prefix).length;
     const reserve = options.outbound ? gutter : 0;
     const wrapped = wrapText(body, Math.max(10, width - indent - reserve));
-    const built = [`${prefix}${failed ? danger(wrapped[0] ?? '') : wrapped[0] ?? ''}`];
+    const built = [`${styledPrefix}${failed ? danger(wrapped[0] ?? '') : wrapped[0] ?? ''}`];
     for (const continuation of wrapped.slice(1)) {
       built.push(`${' '.repeat(indent)}${failed ? danger(continuation) : continuation}`);
     }
     if (options.read) {
       const last = built.length - 1;
       const lastRow = built[last] ?? '';
-      const pad = Math.max(1, width - stripAnsi(lastRow).length - readLabel.length);
-      built[last] = `${lastRow}${' '.repeat(pad)}${success(readLabel)}`;
+      const gap = Math.max(1, width - stripAnsi(lastRow).length - readLabel.length);
+      built[last] = `${lastRow}${' '.repeat(gap)}${success(readLabel)}`;
     }
     for (const row of built) {
       rows.push(row);
@@ -493,10 +558,8 @@ function shortSender(name: string): string {
   return name.length > 20 && /^[0-9a-f]+$/iu.test(name) ? shortId(name) : name;
 }
 
-function renderHelpRow(state: ChatState, row: number, width: number): string {
-  const title = modeLabel(state.mode);
-  const lines = [
-    `[help: ${title}]`,
+function helpRows(state: ChatState): string[] {
+  return [
     'j/k or arrows move selection in list modes.',
     'Enter talks to the selected chat/contact or submits the current form.',
     'Esc leaves writing/form modes and closes this help.',
@@ -523,7 +586,6 @@ function renderHelpRow(state: ChatState, row: number, width: number): string {
     'Contacts: a add, r rename, d delete, c create code, p join code.',
     'Realtime stream stays on; s only appears when sync/stream needs retry.',
   ];
-  return pad(lines[row] ?? '', width);
 }
 
 function chatComposeFooter(state: ChatState): string {
@@ -556,11 +618,10 @@ function modeLabel(mode: ChatMode): string {
   return 'Editing';
 }
 
-function inputBox(label: string, rawValue: string, width: number): string {
+function inputPrompt(label: string, rawValue: string, width: number): string {
   const boxWidth = Math.max(4, width - label.length - 4);
   const visibleValue = rawValue.length >= boxWidth ? rawValue.slice(rawValue.length - boxWidth + 1) : rawValue;
-  const cursor = '█';
-  const content = `${visibleValue}${cursor}`;
+  const content = `${visibleValue}█`;
   const paddedContent = ` ${content}${' '.repeat(Math.max(0, boxWidth - content.length))} `;
   return pad(`${label}${accent('[')}${inputField(paddedContent)}${accent(']')}`, width);
 }
@@ -595,7 +656,7 @@ function messageTargetSuggestions(state: ChatState): string[] {
     .filter(([key]) => !query || key.includes(query))
     .slice(0, 5)
     .map(([key, label]) => {
-      const marker = key === query ? '>' : ' ';
+      const marker = key === query ? '▸' : ' ';
       return `${marker} ${label}`;
     });
 }
