@@ -2,12 +2,12 @@
 // The inviter (already in the group) posts an encrypted *group descriptor* to
 // the rendezvous room; the joiner posts a *join request*. The inviter's client
 // decrypts the request and calls addMembers — auto-add is correct here because
-// the code was created seconds ago, so intent is unambiguous. Payloads carry
-// explicit `type` fields: decryptJson does not authenticate the schema label,
-// so the type inside the ciphertext is what keeps a group-invite payload from
-// being mistaken for a pairing offer under the same code.
+// the code was created seconds ago, so intent is unambiguous. Every payload
+// sharing the rendezvous keyspace carries an explicit `type` field (pairing
+// offers included): decryptJson does not authenticate the schema label, so the
+// type inside the ciphertext is the authoritative discriminator.
 import { decryptJson, encryptJson, inviteScopedKey, normalizeRendezvousSecret, sha256Hex } from './crypto';
-import { PAIRING_TTL_MS } from './pairing';
+import { PAIRING_TTL_MS, isKnownOfferSchema, networkMismatchError, unknownVersionError } from './pairing';
 import type { ConeConversation, ConeIdentity, RendezvousStoredOffer, XmtpEnv } from './types';
 import type { EncryptedJson } from './crypto';
 
@@ -92,28 +92,34 @@ export async function createEncryptedJoinRequest(input: {
   return { participantId, request, encrypted };
 }
 
-// Inviter side: find the joiner's request among the stored offers — skip our
-// own, accept only a payload that decrypts under the code, is a join request,
-// and belongs to a different inbox on the same network.
+// Inviter side, synchronous code flow: find the joiner's request. Exactly one
+// joiner is expected, so anything unreadable fails fast — an unfamiliar
+// payload schema means the joiner is on a newer Cone, and waiting cannot fix
+// that.
 export async function decryptJoinRequest(
   offers: RendezvousStoredOffer[],
   input: { code: string; participantId: string; identity: ConeIdentity },
 ): Promise<GroupJoinRequest | null> {
-  return (await decryptJoinRequests(offers, input))[0]?.request ?? null;
+  for (const stored of foreignOffers(offers, input.participantId)) {
+    if (!isKnownOfferSchema(stored.encryptedOffer.schema)) {
+      throw unknownVersionError(stored.encryptedOffer.schema);
+    }
+  }
+  const requests = await decryptJoinRequests(offers, input);
+  return requests[0]?.request ?? null;
 }
 
 // Link servicing decrypts every valid join request in the room, keyed by
-// participant id so servicing stays idempotent across sync passes.
+// participant id so servicing stays idempotent across sync passes. Lenient by
+// design: one unreadable request (corrupt, or from a newer Cone) must never
+// wedge the link for everyone else — it is simply left unserviced.
 export async function decryptJoinRequests(
   offers: RendezvousStoredOffer[],
   input: { code: string; participantId: string; identity: ConeIdentity },
 ): Promise<Array<{ participantId: string; request: GroupJoinRequest }>> {
   const key = inviteScopedKey(input.code);
   const requests: Array<{ participantId: string; request: GroupJoinRequest }> = [];
-  for (const stored of offers) {
-    if (stored.participantId === input.participantId) {
-      continue;
-    }
+  for (const stored of foreignOffers(offers, input.participantId)) {
     try {
       const payload = await decryptJson<GroupJoinRequest>(key, stored.encryptedOffer);
       if (payload
@@ -130,39 +136,38 @@ export async function decryptJoinRequests(
   return requests;
 }
 
-// Joiner side: find the inviter's group descriptor.
+// Joiner side: find the inviter's group descriptor. Fails loudly on the
+// conditions waiting cannot fix (newer-version schema, wrong network).
 export async function decryptGroupDescriptor(
   offers: RendezvousStoredOffer[],
   input: { code: string; participantId: string; identity: ConeIdentity },
 ): Promise<GroupInviteDescriptor | null> {
-  const candidate = await decryptOther<GroupInviteDescriptor>(offers, input);
-  return candidate && candidate.type === GROUP_INVITE_DESCRIPTOR_TYPE
-    && typeof candidate.conversationId === 'string'
-    && candidate.inviterInboxId !== input.identity.inboxId
-    && candidate.env === input.identity.env
-    ? candidate
-    : null;
-}
-
-async function decryptOther<T extends { type: string }>(
-  offers: RendezvousStoredOffer[],
-  input: { code: string; participantId: string },
-): Promise<T | null> {
   const key = inviteScopedKey(input.code);
-  for (const stored of offers) {
-    if (stored.participantId === input.participantId) {
-      continue;
+  for (const stored of foreignOffers(offers, input.participantId)) {
+    if (!isKnownOfferSchema(stored.encryptedOffer.schema)) {
+      throw unknownVersionError(stored.encryptedOffer.schema);
     }
+    let payload: GroupInviteDescriptor;
     try {
-      const payload = await decryptJson<T>(key, stored.encryptedOffer);
-      if (payload && typeof payload.type === 'string') {
-        return payload;
-      }
+      payload = await decryptJson<GroupInviteDescriptor>(key, stored.encryptedOffer);
     } catch {
       continue;
     }
+    if (payload?.type !== GROUP_INVITE_DESCRIPTOR_TYPE
+      || typeof payload.conversationId !== 'string'
+      || payload.inviterInboxId === input.identity.inboxId) {
+      continue;
+    }
+    if (payload.env !== input.identity.env) {
+      throw networkMismatchError(payload.env, input.identity.env);
+    }
+    return payload;
   }
   return null;
+}
+
+function foreignOffers(offers: RendezvousStoredOffer[], participantId: string): RendezvousStoredOffer[] {
+  return offers.filter((stored) => stored.participantId !== participantId);
 }
 
 function participantIdFor(code: string, inboxId: string, nonce: string): string {

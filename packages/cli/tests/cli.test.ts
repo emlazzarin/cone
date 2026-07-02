@@ -68,6 +68,60 @@ describe('CLI', () => {
     expect(client.contacts[0]?.name).toBe('Alice');
   });
 
+  test('config prints resolved values with provenance, without unlocking an account', async () => {
+    const KEYS = ['CONE_HOME', 'XMTP_ENV', 'CONE_RENDEZVOUS_URL', 'CONE_SECRET_KEY', 'CONE_OUTPUT'] as const;
+    const saved = Object.fromEntries(KEYS.map((key) => [key, process.env[key]]));
+    const noClient = { createClient: async (): Promise<ConeClient> => {
+      throw new Error('config must not unlock an account');
+    } };
+    try {
+      for (const key of KEYS) {
+        delete process.env[key];
+      }
+
+      // Bare environment: every value is the compiled default.
+      const io = makeIo();
+      expect(await runCli(['config'], io, noClient)).toBe(0);
+      const bare = JSON.parse(io.out.join('')) as Record<string, { value?: unknown; source: string; via?: string }>;
+      expect(bare.xmtpEnv).toEqual({ value: 'production', source: 'default' });
+      expect(bare.rendezvousUrl).toEqual({ value: 'http://localhost:8787', source: 'default' });
+      expect(bare.statePath?.source).toBe('default');
+      expect(bare.configPath?.source).toBe('default');
+      // The secret itself is never printed, only where one would come from.
+      expect(io.out.join('')).not.toContain('cone_sk_v1_');
+
+      // Overridden environment: values and sources both reflect it.
+      const home = `/tmp/cone-config-test-${crypto.randomUUID()}`;
+      process.env.CONE_HOME = home;
+      process.env.XMTP_ENV = 'dev';
+      process.env.CONE_RENDEZVOUS_URL = 'https://rendezvous.example';
+      const overriddenIo = makeIo();
+      expect(await runCli(['config'], overriddenIo, noClient)).toBe(0);
+      const overridden = JSON.parse(overriddenIo.out.join('')) as Record<string, { value?: unknown; source: string; via?: string; location?: string }>;
+      // Environment-sourced entries name the variable that supplied them and
+      // pinpoint where it was set (.env line or shell — the exact string
+      // depends on this machine's .env, so only its presence is asserted).
+      expect(overridden.xmtpEnv).toMatchObject({ value: 'dev', source: 'environment', via: 'XMTP_ENV' });
+      expect(overridden.statePath).toMatchObject({ value: `${home}/state.sqlite`, source: 'environment', via: 'CONE_HOME' });
+      expect(overridden.configPath).toMatchObject({ value: `${home}/config.json`, source: 'environment', via: 'CONE_HOME' });
+      expect(overridden.rendezvousUrl).toMatchObject({ value: 'https://rendezvous.example', source: 'environment', via: 'CONE_RENDEZVOUS_URL' });
+      for (const entry of [overridden.xmtpEnv, overridden.statePath, overridden.configPath, overridden.rendezvousUrl]) {
+        expect(typeof entry?.location).toBe('string');
+      }
+      expect(overridden.secretKey).toEqual({ source: 'none' });
+      expect(overridden.readReceipts).toEqual({ value: true, source: 'default' });
+      expect(overridden.groupAutoAllow).toEqual({ value: true, source: 'default' });
+    } finally {
+      for (const key of KEYS) {
+        if (saved[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = saved[key];
+        }
+      }
+    }
+  });
+
   test('pair --print mints a code without unlocking an account', async () => {
     const io = makeIo(generateSecretKey());
 

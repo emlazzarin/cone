@@ -73,10 +73,24 @@ export function secretRoomId(secret: string): string {
 // Async group invite tokens are base64url and therefore case-sensitive —
 // unlike spoken handshake codes they must NOT be lowercased.
 export const GROUP_INVITE_TOKEN_PREFIX = 'cone_gi_v1_';
+// The version-agnostic family prefix. Anything cone_gi_* that is not a valid
+// v1 token gets a clear "update Cone" error instead of being lowercased into
+// a handshake code that hashes to an empty room and times out silently.
+const GROUP_INVITE_TOKEN_FAMILY_PREFIX = 'cone_gi_';
 
 export function isGroupInviteToken(value: string): boolean {
   const trimmed = value.trim();
   return trimmed.startsWith(GROUP_INVITE_TOKEN_PREFIX) && trimmed.length > GROUP_INVITE_TOKEN_PREFIX.length;
+}
+
+export function assertSupportedRendezvousSecret(secret: string): void {
+  const trimmed = secret.trim();
+  if (trimmed.startsWith(GROUP_INVITE_TOKEN_FAMILY_PREFIX) && !isGroupInviteToken(trimmed)) {
+    throw new Error(
+      'unrecognized invite token — it may be truncated, or created by a newer version of Cone. ' +
+      'Check the token was pasted whole; if it was, update Cone to join.',
+    );
+  }
 }
 
 export function generateGroupInviteToken(): string {
@@ -88,6 +102,7 @@ export function generateGroupInviteToken(): string {
 // case-insensitive) or an invite token (pasted, case-sensitive).
 export function normalizeRendezvousSecret(secret: string): string {
   const trimmed = secret.trim();
+  assertSupportedRendezvousSecret(trimmed);
   return isGroupInviteToken(trimmed) ? trimmed : normalizeHandshakeCode(trimmed);
 }
 

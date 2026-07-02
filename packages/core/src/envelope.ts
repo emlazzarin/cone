@@ -1,6 +1,13 @@
 // Cone wire envelopes. Every Cone-specific payload is JSON with a `cone.*`
 // type; everything except the app-JSON envelope is a control message and is
-// hidden from transcripts.
+// hidden from transcripts. On the network, envelopes ride the Cone envelope
+// content type (see content-type.ts) — never plain text, so a typed message
+// can never impersonate one.
+
+// The shape of every Cone wire payload: a self-describing `type` plus
+// type-specific fields. New fields on an existing type must be optional
+// (tolerant-reader), and a field's meaning is never repurposed.
+export type ConeEnvelope = { type: string } & Record<string, unknown>;
 
 export const APP_JSON_TYPE = 'cone.app.json.v1';
 export const READ_RECEIPT_TYPE = 'cone.read.v1';
@@ -52,4 +59,13 @@ export function isAppJsonEnvelope(value: unknown): value is { type: typeof APP_J
 export function isControlEnvelope(value: unknown): boolean {
   const type = envelopeType(value);
   return type !== undefined && type.startsWith('cone.') && type !== APP_JSON_TYPE;
+}
+
+// Validates an envelope received over the network. Group updates are minted
+// exclusively by decoding XMTP's own GroupUpdated system messages — one
+// arriving *as a sent envelope* is a forgery attempt ("Alice added Bob"
+// authored by Mallory) and is rejected here, at the trust boundary.
+export function isAcceptableInboundEnvelope(value: unknown): value is ConeEnvelope {
+  const type = envelopeType(value);
+  return type !== undefined && type.startsWith('cone.') && type !== GROUP_UPDATE_TYPE;
 }

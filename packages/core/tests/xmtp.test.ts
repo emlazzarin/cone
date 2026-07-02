@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { createSdkXmtpAdapter, type SdkClient, type SdkConsentRecord, type SdkGroup } from '../src/xmtp';
+import { createSdkXmtpAdapter, type SdkClient, type SdkConsentRecord, type SdkDm, type SdkGroup } from '../src/xmtp';
+import { CONE_ENVELOPE_CONTENT_TYPE, type ConeEncodedContent } from '../src/content-type';
 import { GROUP_UPDATE_TYPE } from '../src/envelope';
 import type { IncomingMessage } from '../src/types';
 
@@ -30,6 +31,7 @@ function makeGroup(overrides: Partial<SdkGroup> & { id: string }): SdkGroup {
     addedByInboxId: 'inbox-adder',
     createdAt: new Date('2026-01-01T00:00:00.000Z'),
     sendText: async () => 'msg-group',
+    send: async () => 'msg-group-envelope',
     messages: async () => [],
     consentState: () => CONSENT.unknown,
     messageDisappearingSettings: () => null,
@@ -52,7 +54,23 @@ function makeGroup(overrides: Partial<SdkGroup> & { id: string }): SdkGroup {
   };
 }
 
-function makeSdkClient(captured: Captured, options: { groups?: SdkGroup[] } = {}): SdkClient {
+function makeDm(sentEnvelopes: ConeEncodedContent[]): SdkDm {
+  return {
+    id: 'dm-1',
+    sendText: async () => 'msg-dm-text',
+    send: async (encoded: ConeEncodedContent) => {
+      sentEnvelopes.push(encoded);
+      return 'msg-dm-envelope';
+    },
+    messages: async () => [],
+    consentState: () => CONSENT.allowed,
+    messageDisappearingSettings: () => null,
+    updateMessageDisappearingSettings: async () => undefined,
+    removeMessageDisappearingSettings: async () => undefined,
+  };
+}
+
+function makeSdkClient(captured: Captured, options: { groups?: SdkGroup[]; dm?: SdkDm } = {}): SdkClient {
   return {
     inboxId: 'inbox-self',
     conversations: {
@@ -74,7 +92,7 @@ function makeSdkClient(captured: Captured, options: { groups?: SdkGroup[] } = {}
       getConversationById: () => null,
       fetchDmByIdentifier: () => null,
       createDmWithIdentifier: () => Promise.reject(new Error('unused')),
-      getDmByInboxId: () => null,
+      getDmByInboxId: () => options.dm ?? null,
       createDm: () => Promise.reject(new Error('unused')),
     },
     preferences: {
@@ -91,7 +109,7 @@ function makeSdkClient(captured: Captured, options: { groups?: SdkGroup[] } = {}
   };
 }
 
-function makeAdapter(captured: Captured, options: { groups?: SdkGroup[] } = {}) {
+function makeAdapter(captured: Captured, options: { groups?: SdkGroup[]; dm?: SdkDm } = {}) {
   return createSdkXmtpAdapter({
     client: makeSdkClient(captured, options),
     env: 'dev',
@@ -196,6 +214,117 @@ describe('SdkXmtpAdapter streaming', () => {
       superAdminsRemoved: [],
       metadataChanges: [{ field: 'group_name', oldValue: 'Old', newValue: 'New' }],
     });
+  });
+});
+
+// Inbound payloads are trusted by *content type*, never by parsing: text can
+// never impersonate a control envelope, forged group updates are rejected,
+// and content this build cannot decode degrades to its self-describing
+// fallback (or stays hidden when the sender declared none).
+describe('SdkXmtpAdapter inbound decode provenance', () => {
+  async function receive(adapter: ReturnType<typeof makeAdapter>, captured: Captured, message: Record<string, unknown>) {
+    const received: IncomingMessage[] = [];
+    await adapter.streamMessages((incoming) => {
+      received.push(incoming);
+    });
+    captured.streams[0]!.emit({ id: 'm-1', conversationId: 'dm-1', senderInboxId: 'inbox-a', sentAt: new Date(), ...message });
+    return received[0];
+  }
+
+  test('a Cone envelope arrives as json via its content type', async () => {
+    const captured = emptyCaptured();
+    const message = await receive(makeAdapter(captured), captured, {
+      contentType: { ...CONE_ENVELOPE_CONTENT_TYPE },
+      content: { type: 'cone.read.v1' },
+    });
+
+    expect(message?.json).toEqual({ type: 'cone.read.v1' });
+    expect(message?.text).toBeUndefined();
+  });
+
+  test('a minor version bump of the envelope content type still decodes', async () => {
+    const captured = emptyCaptured();
+    const message = await receive(makeAdapter(captured), captured, {
+      contentType: { ...CONE_ENVELOPE_CONTENT_TYPE, versionMinor: 7 },
+      content: { type: 'cone.read.v1' },
+    });
+
+    expect(message?.json).toEqual({ type: 'cone.read.v1' });
+  });
+
+  test('a forged group update sent as a Cone envelope is rejected', async () => {
+    const captured = emptyCaptured();
+    const message = await receive(makeAdapter(captured), captured, {
+      contentType: { ...CONE_ENVELOPE_CONTENT_TYPE },
+      content: { type: GROUP_UPDATE_TYPE, initiatedByInboxId: 'inbox-mallory', added: [{ inboxId: 'inbox-bob' }] },
+    });
+
+    // Neither json nor text: the forgery is stored as unsupported and hidden.
+    expect(message?.json).toBeUndefined();
+    expect(message?.text).toBeUndefined();
+  });
+
+  test('text that merely looks like an envelope stays plain text', async () => {
+    const spoof = JSON.stringify({ type: GROUP_UPDATE_TYPE, initiatedByInboxId: 'inbox-mallory', added: ['inbox-bob'] });
+    const captured = emptyCaptured();
+    const message = await receive(makeAdapter(captured), captured, {
+      contentType: { authorityId: 'xmtp.org', typeId: 'text', versionMajor: 1, versionMinor: 0 },
+      content: spoof,
+    });
+
+    expect(message?.text).toBe(spoof);
+    expect(message?.json).toBeUndefined();
+  });
+
+  test('an undecodable content type renders its self-describing fallback', async () => {
+    const captured = emptyCaptured();
+    const message = await receive(makeAdapter(captured), captured, {
+      contentType: { authorityId: 'example.org', typeId: 'sticker', versionMajor: 1, versionMinor: 0 },
+      content: undefined,
+      fallback: 'sent a sticker',
+    });
+
+    expect(message?.text).toBe('sent a sticker');
+    expect(message?.json).toBeUndefined();
+  });
+
+  test('an undecodable content type with no fallback stays hidden', async () => {
+    const captured = emptyCaptured();
+    const message = await receive(makeAdapter(captured), captured, {
+      contentType: { authorityId: 'example.org', typeId: 'signal', versionMajor: 1, versionMinor: 0 },
+      content: undefined,
+    });
+
+    expect(message?.text).toBeUndefined();
+    expect(message?.json).toBeUndefined();
+  });
+});
+
+describe('SdkXmtpAdapter envelope sending', () => {
+  test('sendEnvelope publishes the envelope content type; control carries no fallback', async () => {
+    const sentEnvelopes: ConeEncodedContent[] = [];
+    const captured = emptyCaptured();
+    const adapter = makeAdapter(captured, { dm: makeDm(sentEnvelopes) });
+
+    await adapter.sendEnvelope({ inboxId: 'inbox-peer', source: 'inboxId' }, { type: 'cone.read.v1' });
+
+    expect(sentEnvelopes).toHaveLength(1);
+    expect(sentEnvelopes[0]?.type).toEqual(CONE_ENVELOPE_CONTENT_TYPE);
+    expect(sentEnvelopes[0]?.fallback).toBeUndefined();
+    expect(JSON.parse(new TextDecoder().decode(sentEnvelopes[0]?.content))).toEqual({ type: 'cone.read.v1' });
+  });
+
+  test('app JSON envelopes carry a human-readable fallback', async () => {
+    const sentEnvelopes: ConeEncodedContent[] = [];
+    const captured = emptyCaptured();
+    const adapter = makeAdapter(captured, { dm: makeDm(sentEnvelopes) });
+
+    await adapter.sendEnvelope(
+      { inboxId: 'inbox-peer', source: 'inboxId' },
+      { type: 'cone.app.json.v1', value: { text: 'order confirmed', orderId: 7 } },
+    );
+
+    expect(sentEnvelopes[0]?.fallback).toBe('order confirmed');
   });
 });
 

@@ -48,7 +48,7 @@ bun run dev:rendezvous   # serves http://localhost:8787, the default CONE_RENDEZ
 
 Plain messaging (`cone send`, `cone listen`, `cone chat`) talks to XMTP directly and needs no rendezvous.
 
-`cone` works from any directory. One Bun quirk to know: running it *inside this repo* picks up the repo `.env` — with `CONE_HOME=./.cone` there, repo runs keep their state in `./.cone` (handy for development), while runs from anywhere else use `~/.config/cone` and `~/.local/share/cone`. Delete that line from `.env` if you want one identity everywhere. Uninstall the binary with `cd packages/cli && bun unlink`.
+`cone` works from any directory. One Bun quirk to know: running it *inside this repo* picks up the repo `.env` — with `CONE_HOME=./.cone` there, repo runs keep their state in `./.cone` (handy for development), while runs from anywhere else use `~/.config/cone` and `~/.local/share/cone`. Delete that line from `.env` if you want one identity everywhere. When in doubt, `cone config` prints the effective configuration and where each value came from. Uninstall the binary with `cd packages/cli && bun unlink`.
 
 ## Developing
 
@@ -75,7 +75,7 @@ For invites that outlive a conversation, **invite links** (`--link`, `l` in the 
 
 Group management lives in **group info**: `i` on a group in the TUI, or the `group · N members` header button in the PWA. Members show with roles (the creator is the *owner* — XMTP's super admin); any member can add members and rename under the default policy, admins remove, owners manage roles. Promoting someone else to owner is how ownership transfers — an owner can't leave until another owner exists. **Leaving is visible to the group; blocking is silent** — both are offered, labeled honestly. Membership and rename events render as system lines in the transcript ("Alice added Bob"), and if you're removed (or leave), the chat stays readable but marked left.
 
-Read receipts are on by default and toggleable (PWA Settings; `R` in the TUI chat). When on, a `cone.read.v1` control message is sent into a conversation when you read it, and a single `✓✓ Read` marker appears on the most recent of your messages the peer has read. The toggle is symmetric: turning it off stops sending receipts *and* hides peer read state — only failed sends are ever marked. Receipts are only sent for allowed conversations, so previewing a Request never acknowledges it. Receipts interoperate between Cone clients (they ride the same control-envelope channel as pairing confirmations).
+Read receipts are on by default and toggleable (PWA Settings; `R` in the TUI chat). When on, a `cone.read.v1` control message is sent into a conversation when you read it, and a single `✓✓ Read` marker appears on the most recent of your messages the peer has read. The toggle is symmetric: turning it off stops sending receipts *and* hides peer read state — only failed sends are ever marked. Receipts are only sent for allowed conversations, so previewing a Request never acknowledges it. Receipts interoperate between Cone clients: they ride Cone's own envelope content type with no fallback text, so other XMTP clients simply never see them.
 
 Run the rendezvous worker locally:
 
@@ -95,6 +95,7 @@ bun run packages/cli/src/bin.ts keygen
 cone keygen
 cone login --remember
 cone whoami
+cone config          # effective configuration + where each value came from
 cone inbox
 cone inbox sync
 cone inbox read <conversationId|contactName|inboxId>
@@ -135,7 +136,7 @@ For automation, pipe the key instead of using the interactive prompt:
 printf '%s\n' "$CONE_SECRET_KEY" | cone login --secret-stdin --remember
 ```
 
-The `SECRET_KEY` determines the XMTP account/inbox. The CLI stores one remembered secret and one local state database by default. Use `CONE_HOME` or exact `CONE_STATE_PATH`/`CONE_CONFIG_PATH` overrides only when you need isolated local state for tests or multiple concurrent agent processes.
+The `SECRET_KEY` determines the XMTP account/inbox. The CLI stores one remembered secret and one local state database by default. `CONE_HOME` is the single path override — one directory holding both `config.json` and `state.sqlite` — for tests and concurrent agent processes (see [Configuration](#configuration)).
 
 Pairing names are explicit. `--share-name` proposes a peer-visible contact name during pairing. `--save-as` saves the peer under a local contact name. Contact names are local aliases and are not global usernames.
 
@@ -144,6 +145,26 @@ Set `CONE_HOME=./.cone` to keep config and state in a local ignored directory wh
 `cone inbox sync` pulls account-level XMTP state into the local encrypted read model. `cone inbox` lists local conversations (allowed senders only) and `cone inbox read <target>` reads a local transcript. `cone chat` opens the lightweight terminal chat client over the same local read model; use `cone chat --plain-log` for a non-interactive stream log.
 
 `cone chat` is mode-driven, not command-palette driven. The chat list is sorted by most recent activity and shows each chat's last message, relative time, and unread count — the same density and order as the PWA. In Chats, use `j/k` or arrows to move, `Enter` to talk, `n` for a structured new message, `r` to name the selected chat's peer (saves a contact), `c`/`p` to create or join a pairing code, `/` to filter chats as you type, `t` to toggle the Requests sub-surface, and `2` for contacts. In Contacts, use `a` add, `r` rename, `d` delete, `c` create pairing code, `p` join pairing code, and `1` for chats. Transcript rows use the same human format across CLI and web: `16:39 - Alice: hello`.
+
+## Configuration
+
+Configuration is layered by lifetime, and `cone config` is the one place to see it resolved — every effective value plus exactly where it was set, `git config --show-origin`-style: a built-in default (and the knob that changes it), a config-file key, a command-line flag, or an environment variable pinpointed to the `.env` line that defined it (`.env:2`) or the shell. Bun auto-loads `.env` only for processes launched from the repo directory, which is the usual source of "why does it behave differently here?" — `cone config` names the line.
+
+Per-process environment variables (the complete list):
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `CONE_SECRET_KEY` | Account secret for this process; beats the remembered secret | — |
+| `XMTP_ENV` | XMTP network: `production`, `dev`, or `local`. Identities are env-scoped — a dev identity can never touch the production account | `production` |
+| `CONE_HOME` | The single path override: one directory holding `config.json` and `state.sqlite` | `~/.config/cone` + `~/.local/share/cone` |
+| `CONE_RENDEZVOUS_URL` | Rendezvous service for pairing and group invites | `http://localhost:8787` |
+| `CONE_OUTPUT` | CLI output mode, `json` or `plain` (the `--json`/`--plain` flags beat it) | `json` |
+| `CONE_AGENT_NAME` | The example agent's `@alias` | `concierge` |
+| `VITE_CONE_RENDEZVOUS_URL` | PWA rendezvous URL — read by Vite at **build** time, not runtime | `http://localhost:8787` |
+
+Durable per-user settings — the remembered secret, `readReceipts`, `groupAutoAllow` — live in `config.json` (under `CONE_HOME` when set); the PWA keeps its equivalents in browser storage per account. Product decisions with protocol weight (the production-network default, rendezvous room TTLs and caps) are deliberately code, not configuration.
+
+`.env.example` documents the recommended repo-local development overrides (`CONE_HOME=./.cone`, `XMTP_ENV=dev`); copy it to `.env` to keep repo hacking isolated from your real account.
 
 ## Secret Keys
 

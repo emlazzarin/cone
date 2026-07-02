@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 
+import { normalizeRendezvousSecret } from '../src/crypto';
 import {
   codeScopedKey,
   createConeClient,
   createEncryptedGroupDescriptor,
   createEncryptedJoinRequest,
+  createEncryptedPairingOffer,
   decryptGroupDescriptor,
   decryptJoinRequest,
   decryptJson,
@@ -72,7 +74,7 @@ describe('group invite payloads', () => {
     await expect(decryptJson<GroupInviteDescriptor>(codeScopedKey('wrong-code-entirely'), encrypted)).rejects.toThrow();
   });
 
-  test('pairing never mistakes a group invite payload for a peer offer', async () => {
+  test('pairing never mistakes a group invite payload for a peer offer — it names the mix-up', async () => {
     const identity: ConeIdentity = { env: 'dev', inboxId: 'inbox-me' };
     const { participantId, encrypted } = await createEncryptedGroupDescriptor({
       code: CODE,
@@ -82,27 +84,60 @@ describe('group invite payloads', () => {
     const offers: RendezvousStoredOffer[] = [
       { offerId: 'a', participantId, role: 'descriptor' as const, encryptedOffer: encrypted, expiresAt: future() },
     ];
-    expect(await decryptPeerOffer(offers, { code: CODE, participantId: 'someone-else', identity })).toBeNull();
+    // Waiting cannot fix a flow mix-up, so this fails fast with a pointer to
+    // the group-join flow instead of decaying into a silent timeout.
+    await expect(decryptPeerOffer(offers, { code: CODE, participantId: 'someone-else', identity }))
+      .rejects.toThrow(/group invite, not a pairing code/);
   });
 
-  test('mismatched network is rejected on both sides', async () => {
+  test('mismatched network fails fast with the two env names', async () => {
     const descriptor = await createEncryptedGroupDescriptor({
       code: CODE,
       identity: { env: 'production', inboxId: 'inbox-inviter' },
       conversation: { conversationId: 'group-1', memberCount: 2 },
     });
-    const join = await createEncryptedJoinRequest({ code: CODE, identity: { env: 'production', inboxId: 'inbox-joiner' } });
     const devJoiner: ConeIdentity = { env: 'dev', inboxId: 'inbox-joiner' };
-    const devInviter: ConeIdentity = { env: 'dev', inboxId: 'inbox-inviter' };
 
-    expect(await decryptGroupDescriptor(
+    // The joiner learns the inviter is on another network — waiting longer can
+    // never succeed, so this is an error, not a null.
+    await expect(decryptGroupDescriptor(
       [{ offerId: 'a', participantId: descriptor.participantId, role: 'descriptor' as const, encryptedOffer: descriptor.encrypted, expiresAt: future() }],
       { code: CODE, participantId: 'joiner', identity: devJoiner },
-    )).toBeNull();
+    )).rejects.toThrow(/"production" XMTP network.*"dev"/);
+
+    // The inviter side stays lenient (shared with link servicing, which must
+    // never wedge): a cross-network join request is simply not serviced.
+    const join = await createEncryptedJoinRequest({ code: CODE, identity: { env: 'production', inboxId: 'inbox-joiner' } });
+    const devInviter: ConeIdentity = { env: 'dev', inboxId: 'inbox-inviter' };
     expect(await decryptJoinRequest(
       [{ offerId: 'b', participantId: join.participantId, role: 'join' as const, encryptedOffer: join.encrypted, expiresAt: future() }],
       { code: CODE, participantId: 'inviter', identity: devInviter },
     )).toBeNull();
+  });
+
+  test('an offer schema from a newer Cone raises an update error, not a timeout', async () => {
+    const identity: ConeIdentity = { env: 'dev', inboxId: 'inbox-me' };
+    const futureOffer = await createEncryptedPairingOffer({ code: CODE, identity: { env: 'dev', inboxId: 'inbox-future' } });
+    const offers: RendezvousStoredOffer[] = [{
+      offerId: 'a',
+      participantId: 'future-peer',
+      role: 'pair' as const,
+      encryptedOffer: { ...futureOffer.encryptedOffer, schema: 'cone.pairing.offer.v2' },
+      expiresAt: future(),
+    }];
+
+    await expect(decryptPeerOffer(offers, { code: CODE, participantId: 'someone-else', identity }))
+      .rejects.toThrow(/newer Cone/);
+    await expect(decryptGroupDescriptor(offers, { code: CODE, participantId: 'someone-else', identity }))
+      .rejects.toThrow(/newer Cone/);
+    await expect(decryptJoinRequest(offers, { code: CODE, participantId: 'someone-else', identity }))
+      .rejects.toThrow(/newer Cone/);
+  });
+
+  test('unrecognized invite-token versions are rejected with an update error', () => {
+    expect(() => normalizeRendezvousSecret('cone_gi_v2_abcdef')).toThrow(/newer version of Cone/);
+    // A spoken handshake code is untouched.
+    expect(normalizeRendezvousSecret('Anchor Beacon')).toBe('anchor-beacon');
   });
 });
 
@@ -495,6 +530,10 @@ class GroupAdapter implements XmtpAdapter {
   }
 
   sendText(): Promise<SentMessage> {
+    throw new Error('not used in invite tests');
+  }
+
+  sendEnvelope(): Promise<SentMessage> {
     throw new Error('not used in invite tests');
   }
 

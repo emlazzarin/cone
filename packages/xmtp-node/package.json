@@ -7,8 +7,9 @@
   },
   "dependencies": {
     "@cone/core": "workspace:*",
-    "@xmtp/node-bindings": ">=1.11.0-nightly <2.0.0-0",
-    "@xmtp/node-sdk": ">=6.1.0-nightly <6.2.0",
+    "@xmtp/content-type-primitives": "3.0.0",
+    "@xmtp/node-bindings": "1.11.0-nightly.20260603.89c3fc3",
+    "@xmtp/node-sdk": "6.1.0-nightly.20260603.89c3fc3",
     "viem": "^2.40.0"
   }
 }

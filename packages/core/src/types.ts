@@ -1,4 +1,5 @@
 import type { EncryptedJson } from './crypto';
+import type { ConeEnvelope } from './envelope';
 
 export type Brand<T, Name extends string> = T & { readonly __brand: Name };
 
@@ -227,11 +228,16 @@ export interface PairingResult {
 }
 
 export interface PairingOffer {
+  // Explicit discriminator, like every payload sharing the rendezvous
+  // keyspace. Frozen: 'cone.pairing.offer.v1'.
+  type: 'cone.pairing.offer.v1';
   offerId: string;
   env: XmtpEnv;
   inboxId: string;
   address?: string;
   nonce: string;
+  // Reserved negotiation hook: what this client can receive. v1 clients send
+  // ['text', 'json'] and ignore unknown entries.
   capabilities: string[];
   proposedName?: string;
   createdAt: string;
@@ -334,6 +340,9 @@ export interface XmtpAdapter {
   resolveIdentity(ref: IdentityRef): Promise<ResolvedIdentity | null>;
   canMessage(identity: ResolvedIdentity): Promise<boolean>;
   sendText(identity: ResolvedIdentity, text: string): Promise<SentMessage>;
+  // Send a Cone envelope (control message or app JSON) to a DM peer. Rides the
+  // Cone envelope content type, never text — see content-type.ts.
+  sendEnvelope(identity: ResolvedIdentity, envelope: ConeEnvelope): Promise<SentMessage>;
   // Send into an existing conversation by id — works for DMs and groups.
   sendToConversation(conversationId: string, text: string): Promise<SentMessage>;
   sync(filter?: ConsentFilter): Promise<XmtpSyncResult>;

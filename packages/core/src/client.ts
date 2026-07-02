@@ -1,5 +1,6 @@
 import { bytesToUtf8, utf8ToBytes } from './encoding';
 import {
+  assertSupportedRendezvousSecret,
   decryptBytes,
   decryptJson,
   encryptBytes,
@@ -140,8 +141,20 @@ class ConeClientImpl implements ConeClient {
     return sent;
   }
 
-  sendJson(to: IdentityRef, value: unknown): Promise<SentMessage> {
-    return this.sendText(to, JSON.stringify({ type: APP_JSON_TYPE, value }));
+  // App JSON rides the Cone envelope content type (with a human-readable
+  // fallback for clients without the codec) — same reachability and
+  // implied-consent semantics as sendText.
+  async sendJson(to: IdentityRef, value: unknown): Promise<SentMessage> {
+    const resolved = await this.resolveIdentity(to);
+    if (!(await this.options.xmtp.canMessage(resolved))) {
+      throw new Error('identity is not XMTP-reachable');
+    }
+
+    const envelope = { type: APP_JSON_TYPE, value };
+    const sent = await this.options.xmtp.sendEnvelope(resolved, envelope);
+    await this.persistOutbound(sent, resolved, 'json', envelope);
+    await this.setConsentSafe(resolved.inboxId, 'allowed');
+    return sent;
   }
 
   // Send into an existing conversation. DMs route through the identity path so
@@ -320,7 +333,7 @@ class ConeClientImpl implements ConeClient {
   async sendReadReceipt(to: IdentityRef): Promise<void> {
     try {
       const resolved = await this.resolveIdentity(to);
-      await this.options.xmtp.sendText(resolved, JSON.stringify({ type: READ_RECEIPT_TYPE }));
+      await this.options.xmtp.sendEnvelope(resolved, { type: READ_RECEIPT_TYPE });
     } catch {
       // Read receipts are advisory; a failure must never disrupt the session.
     }
@@ -762,15 +775,12 @@ class ConeClientImpl implements ConeClient {
     let sentConfirmation = false;
     const resolved = contactToResolved(contact);
     if (await this.options.xmtp.canMessage(resolved)) {
-      await this.options.xmtp.sendText(
-        resolved,
-        JSON.stringify({
-          type: PAIR_CONFIRM_TYPE,
-          inboxId: identity.inboxId,
-          address: identity.address,
-          codeAcceptedAt: this.nowIso(),
-        }),
-      );
+      await this.options.xmtp.sendEnvelope(resolved, {
+        type: PAIR_CONFIRM_TYPE,
+        inboxId: identity.inboxId,
+        address: identity.address,
+        codeAcceptedAt: this.nowIso(),
+      });
       sentConfirmation = true;
     }
 
@@ -846,6 +856,10 @@ class ConeClientImpl implements ConeClient {
     if (!this.options.rendezvous) {
       throw new Error('rendezvous client is required for group invite codes');
     }
+    // A cone_gi_* value that is not a valid v1 token fails here with an
+    // "update Cone" error, before it can be lowercased into a bogus handshake
+    // code that would wait out the full timeout on an empty room.
+    assertSupportedRendezvousSecret(code);
     const isToken = isGroupInviteToken(code);
     const normalizedCode = isToken ? code.trim() : normalizeHandshakeCode(code);
     const identity = await this.identity();

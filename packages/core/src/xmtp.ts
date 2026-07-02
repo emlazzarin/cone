@@ -7,8 +7,9 @@
 // Imported as `@cone/core/xmtp` by adapter packages only; apps use the main
 // `@cone/core` entry.
 
+import { encodeConeEnvelope, isConeEnvelopeContentType, type ConeEncodedContent } from './content-type';
 import { normalizeDeliveryStatus } from './display';
-import { GROUP_UPDATE_TYPE, type GroupUpdateEnvelope } from './envelope';
+import { GROUP_UPDATE_TYPE, isAcceptableInboundEnvelope, type ConeEnvelope, type GroupUpdateEnvelope } from './envelope';
 import { isEvmAddress } from './validation';
 import type {
   ConeConsentState,
@@ -63,6 +64,9 @@ export interface SdkConversation {
   topic?: string;
   createdAt?: Date;
   sendText(text: string): Promise<string>;
+  // Sends pre-encoded content (the Cone envelope content type). Identical
+  // signature in both bindings: send(encodedContent, opts?).
+  send(encodedContent: ConeEncodedContent): Promise<string>;
   messages(options?: Record<string, unknown>): Promise<unknown[]>;
   consentState(): MaybePromise<unknown>;
   messageDisappearingSettings(): MaybePromise<SdkDisappearingSettings | null | undefined>;
@@ -239,6 +243,19 @@ class SdkXmtpAdapter implements XmtpAdapter {
     // optimistic send + publishMessages split because a failed-then-retried
     // optimistic message can later flush and duplicate.)
     const messageId = await dm.sendText(text);
+    return {
+      messageId,
+      conversationId: String(dm.id ?? dm.topic ?? `dm:${identity.inboxId}`),
+      sentAt: new Date().toISOString(),
+      deliveryStatus: 'published',
+    };
+  }
+
+  // Cone envelopes ride the Cone envelope content type. Same synchronous
+  // publish semantics as sendText.
+  async sendEnvelope(identity: ResolvedIdentity, envelope: ConeEnvelope): Promise<SentMessage> {
+    const dm = await this.findOrCreateDm(identity);
+    const messageId = await dm.send(encodeConeEnvelope(envelope));
     return {
       messageId,
       conversationId: String(dm.id ?? dm.topic ?? `dm:${identity.inboxId}`),
@@ -541,19 +558,30 @@ function isDelivered(message: unknown): boolean {
   return normalizeDeliveryStatus((message as { deliveryStatus?: unknown }).deliveryStatus) === 'published';
 }
 
+// Inbound decode discriminates on the message's content type — provenance,
+// not parsing. Text is always just text (a typed message can never become a
+// control envelope); Cone envelopes come only from the Cone content type;
+// group updates come only from XMTP's GroupUpdated system messages. Content
+// in a type this build cannot decode renders its self-describing fallback
+// when the sender provided one, and stays hidden when they did not — both by
+// the content type's own declaration, so a newer client's messages degrade
+// the way that client intended instead of vanishing.
 function toIncomingMessage(message: unknown, kind: ConversationKind = 'dm'): IncomingMessage {
   const record = message as Record<string, unknown>;
   const content = record.content;
   let json: unknown = decodeGroupUpdate(record);
-  if (json === undefined && typeof content === 'string') {
-    try {
-      const parsed = JSON.parse(content) as unknown;
-      if (typeof parsed === 'object' && parsed !== null) {
-        json = parsed;
-      }
-    } catch {
-      json = undefined;
+  let text: string | undefined;
+  if (json === undefined && isConeEnvelopeContentType(record.contentType)) {
+    // The registered codec already decoded the payload; accept only a valid
+    // envelope (isAcceptableInboundEnvelope rejects forged group updates).
+    // Anything else falls through as unsupported and stays hidden.
+    if (isAcceptableInboundEnvelope(content)) {
+      json = content;
     }
+  } else if (json === undefined && typeof content === 'string') {
+    text = content;
+  } else if (json === undefined && typeof record.fallback === 'string' && record.fallback.length > 0) {
+    text = record.fallback;
   }
 
   return {
@@ -563,7 +591,7 @@ function toIncomingMessage(message: unknown, kind: ConversationKind = 'dm'): Inc
     senderInboxId: String(record.senderInboxId ?? record.sender ?? 'unknown'),
     senderAddress: typeof record.senderAddress === 'string' ? record.senderAddress : undefined,
     sentAt: record.sentAt instanceof Date ? record.sentAt.toISOString() : nsToIso(record.sentAtNs) ?? new Date().toISOString(),
-    text: typeof content === 'string' ? content : undefined,
+    text,
     json,
     raw: {
       contentType: String(record.contentType ?? 'unknown'),

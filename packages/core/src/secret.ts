@@ -12,6 +12,9 @@ import {
 import type { DerivedAccount, SecretKey, XmtpEnv } from './types';
 
 const SECRET_PREFIX = 'cone_sk_v1_';
+// Version-agnostic family prefix: a cone_sk_* key this build cannot parse is
+// from a newer Cone, which deserves a better error than "invalid prefix".
+const SECRET_FAMILY_PREFIX = 'cone_sk_';
 const SECRET_VERSION = 1;
 const SEED_LENGTH = 32;
 const CHECKSUM_LENGTH = 4;
@@ -24,10 +27,6 @@ export function generateSecretKey(): SecretKey {
 
 export function parseSecretKey(input: string): SecretKey {
   const trimmed = input.trim();
-  if (!trimmed.startsWith(SECRET_PREFIX)) {
-    throw new Error('invalid secret key prefix');
-  }
-
   decodeSecretSeed(trimmed);
   return trimmed as SecretKey;
 }
@@ -36,7 +35,10 @@ export function deriveAccount(
   secret: SecretKey,
   options: { env?: XmtpEnv; accountId?: string } = {},
 ): DerivedAccount {
-  const env = options.env ?? 'dev';
+  // The default is the durable network. The env is part of the derivation
+  // salt, so the same SECRET KEY is a *different identity* per network —
+  // a social graph formed on one env can never move to another.
+  const env = options.env ?? 'production';
   const accountId = options.accountId ?? 'main';
   const seed = decodeSecretSeed(secret);
   const salt = utf8ToBytes(`cone/v1/${env}/${accountId}`);
@@ -63,6 +65,9 @@ export function encodeSecretSeed(seed: Uint8Array): SecretKey {
 
 export function decodeSecretSeed(secret: SecretKey | string): Uint8Array {
   if (!secret.startsWith(SECRET_PREFIX)) {
+    if (secret.startsWith(SECRET_FAMILY_PREFIX)) {
+      throw new Error('this SECRET KEY was created by a newer version of Cone — update Cone to use it');
+    }
     throw new Error('invalid secret key prefix');
   }
 
@@ -73,7 +78,7 @@ export function decodeSecretSeed(secret: SecretKey | string): Uint8Array {
 
   const version = payload[0];
   if (version !== SECRET_VERSION) {
-    throw new Error('unsupported secret key version');
+    throw new Error('unsupported secret key version — this key is from a newer version of Cone');
   }
 
   const body = payload.slice(0, 1 + SEED_LENGTH);

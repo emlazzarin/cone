@@ -16,17 +16,14 @@ interface CommandResult {
   stdout: string;
 }
 
-// Every spawned `bun` re-loads the repo .env, which may pin
-// CONE_STATE_PATH/CONE_CONFIG_PATH for interactive use. Those take precedence
-// over CONE_HOME, so every actor would share one state (and one XMTP DB,
-// keyed per secret — PRAGMA key mismatch). Real env vars beat .env, so pin
-// them explicitly per actor instead of relying on CONE_HOME alone.
+// Every spawned `bun` re-loads the repo .env, but real env vars beat it —
+// and CONE_HOME is the only path override (the exact-path knobs are gone),
+// so pinning CONE_HOME per actor is sufficient isolation.
 const baseEnv = {
   ...process.env,
   CONE_OUTPUT: 'json',
   CONE_RENDEZVOUS_URL: rendezvousUrl,
-  CONE_STATE_PATH: join(runDir, 'shared', 'state.sqlite'),
-  CONE_CONFIG_PATH: join(runDir, 'shared', 'config.json'),
+  CONE_HOME: join(runDir, 'shared'),
   XMTP_ENV: process.env.XMTP_ENV ?? 'dev',
 };
 
@@ -302,8 +299,6 @@ function commandEnv(actor?: string): Record<string, string | undefined> {
   return {
     ...baseEnv,
     CONE_HOME: join(runDir, actor),
-    CONE_STATE_PATH: join(runDir, actor, 'state.sqlite'),
-    CONE_CONFIG_PATH: join(runDir, actor, 'config.json'),
   };
 }
 

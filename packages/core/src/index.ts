@@ -48,6 +48,14 @@ export {
   READ_RECEIPT_TYPE,
   isGroupUpdateEnvelope,
 } from './envelope';
+export type { ConeEnvelope } from './envelope';
+export {
+  CONE_ENVELOPE_CONTENT_TYPE,
+  createConeEnvelopeCodec,
+  encodeConeEnvelope,
+  isConeEnvelopeContentType,
+} from './content-type';
+export type { ConeContentTypeId, ConeEncodedContent } from './content-type';
 export {
   createEncryptedPairingOffer,
   createHandshakeCode,
@@ -71,7 +79,7 @@ export {
   parseRetention,
 } from './retention';
 export { MemoryStore } from './store';
-export { HttpRendezvousClient } from './rendezvous';
+export { DEFAULT_RENDEZVOUS_URL, HttpRendezvousClient } from './rendezvous';
 export type {
   ConeClient,
   ConeConsentState,

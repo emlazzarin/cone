@@ -175,6 +175,11 @@ class PairingAdapter implements XmtpAdapter {
   }
 
   sendText(_identity: ResolvedIdentity, _text: string): Promise<SentMessage> {
+    return Promise.resolve({ messageId: crypto.randomUUID(), sentAt: new Date().toISOString() });
+  }
+
+  // Pair confirmations ride the envelope content type.
+  sendEnvelope(_identity: ResolvedIdentity, _envelope: unknown): Promise<SentMessage> {
     this.sentConfirmations += 1;
     return Promise.resolve({ messageId: crypto.randomUUID(), sentAt: new Date().toISOString() });
   }

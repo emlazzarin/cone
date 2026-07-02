@@ -55,6 +55,14 @@ cone whoami
 
 The output includes the XMTP `inboxId` and EVM address.
 
+## Configuration
+
+```sh
+cone config
+```
+
+Prints the effective configuration as JSON — XMTP env, config/state paths, rendezvous URL, secret-key source, `readReceipts`, `groupAutoAllow` — each with a `source` (`default`, `config`, `environment`, `flag`), the variable that supplied it (`via`), and for environment values a `location` pinpointing the exact `.env` line (e.g. `.env:2`) or `shell`. Run it first when behavior surprises you. `CONE_HOME` is the single path override; set it per process for isolated state.
+
 ## Messaging
 
 Sync missed state into the local read model:

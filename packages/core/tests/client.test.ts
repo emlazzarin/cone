@@ -8,6 +8,7 @@ import {
   secretKeyFromHexSeed,
   type ConeConsentState,
   type ConeConversation,
+  type ConeEnvelope,
   type ConeGroupMember,
   type ConeIdentity,
   type ConsentFilter,
@@ -169,6 +170,8 @@ describe('ConeClient', () => {
     const client = await makeClient(adapter);
 
     await client.streamMessages(() => {});
+    // Envelopes arrive with json only — they ride the Cone envelope content
+    // type, never text.
     await adapter.emit({
       conversationId: 'dm-control',
       conversationKind: 'dm',
@@ -181,7 +184,6 @@ describe('ConeClient', () => {
       raw: {},
       senderInboxId: 'inbox-peer',
       sentAt: new Date().toISOString(),
-      text: JSON.stringify({ type: 'cone.pair.confirm.v1' }),
     });
 
     const [message] = await client.listMessages('dm-control');
@@ -195,7 +197,9 @@ describe('ConeClient', () => {
 
     await client.sendReadReceipt({ inboxId: 'inbox-peer' });
 
-    expect(adapter.sent.at(-1)).toEqual({ inboxId: 'inbox-peer', text: JSON.stringify({ type: 'cone.read.v1' }) });
+    // Receipts ride the envelope content type, never the text one.
+    expect(adapter.sentEnvelopes.at(-1)).toEqual({ inboxId: 'inbox-peer', envelope: { type: 'cone.read.v1' } });
+    expect(adapter.sent).toHaveLength(0);
     // Our own receipts are fire-and-forget; only the peer's receipts matter.
     expect(await client.listMessages()).toHaveLength(0);
   });
@@ -720,6 +724,7 @@ class FakeAdapter implements XmtpAdapter {
   conversations: ConeConversation[] = [];
   networkMessages: IncomingMessage[] = [];
   sent: Array<{ inboxId: string; text: string }> = [];
+  sentEnvelopes: Array<{ inboxId: string; envelope: ConeEnvelope }> = [];
   sentToConversation: Array<{ conversationId: string; text: string }> = [];
   consent = new Map<string, ConeConsentState>();
   groupConsent = new Map<string, ConeConsentState>();
@@ -764,6 +769,16 @@ class FakeAdapter implements XmtpAdapter {
 
   sendText(identity: ResolvedIdentity, text: string): Promise<SentMessage> {
     this.sent.push({ inboxId: identity.inboxId, text });
+    this.sentCount += 1;
+    return Promise.resolve({
+      conversationId: `dm:${identity.inboxId}`,
+      messageId: `sent-${this.sentCount}`,
+      sentAt: (this.clock?.() ?? new Date()).toISOString(),
+    });
+  }
+
+  sendEnvelope(identity: ResolvedIdentity, envelope: ConeEnvelope): Promise<SentMessage> {
+    this.sentEnvelopes.push({ inboxId: identity.inboxId, envelope });
     this.sentCount += 1;
     return Promise.resolve({
       conversationId: `dm:${identity.inboxId}`,

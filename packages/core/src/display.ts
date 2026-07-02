@@ -1,3 +1,4 @@
+import { humanizeAppJsonValue } from './content-type';
 import {
   GROUP_UPDATE_TYPE,
   PAIR_CONFIRM_TYPE,
@@ -371,24 +372,20 @@ export function formatConnectionStatus(status: ConeConnectionStatus): string {
   }
 }
 
+// Text is always rendered verbatim: envelopes arrive via their own content
+// type and land in `json`, never in `text` — a typed message that *looks*
+// like an envelope is just text someone typed.
 function payloadBody(text: string | undefined, json: unknown): string {
   if (text !== undefined) {
-    const parsed = parseJson(text);
-    if (isAppJsonEnvelope(parsed)) {
-      return humanizeValue(parsed.value);
-    }
-    if (isControlEnvelope(parsed)) {
-      return humanizeControl(envelopeType(parsed)!, parsed);
-    }
     return text;
   }
   if (isAppJsonEnvelope(json)) {
-    return humanizeValue(json.value);
+    return humanizeAppJsonValue(json.value);
   }
   if (isControlEnvelope(json)) {
     return humanizeControl(envelopeType(json)!, json);
   }
-  return humanizeValue(json);
+  return humanizeAppJsonValue(json);
 }
 
 function humanizeControl(type: string, value?: unknown): string {
@@ -407,33 +404,3 @@ function humanizeControl(type: string, value?: unknown): string {
   return `[${type}]`;
 }
 
-function humanizeValue(value: unknown): string {
-  if (value === undefined) {
-    return '';
-  }
-  if (typeof value === 'string') {
-    return value;
-  }
-  if (typeof value === 'number' || typeof value === 'boolean' || value === null) {
-    return String(value);
-  }
-  if (typeof value === 'object' && value !== null) {
-    const record = value as Record<string, unknown>;
-    for (const key of ['text', 'message', 'content', 'body']) {
-      if (typeof record[key] === 'string') {
-        return record[key];
-      }
-    }
-    const keys = Object.keys(record).slice(0, 4).join(', ');
-    return keys ? `[structured message: ${keys}]` : '[structured message]';
-  }
-  return String(value);
-}
-
-function parseJson(value: string): unknown {
-  try {
-    return JSON.parse(value) as unknown;
-  } catch {
-    return null;
-  }
-}

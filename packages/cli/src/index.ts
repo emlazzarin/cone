@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 
 import {
@@ -24,7 +25,8 @@ import {
 import { createNodeXmtpAdapter } from '@cone/xmtp-node';
 
 import { loadSecretKey, readConfig, writeConfig } from './config';
-import { defaultConfigPath, defaultRendezvousUrl, defaultStatePath } from './paths';
+import { envVarLocation } from './env-origin';
+import { defaultConfigPath, defaultRendezvousUrl, defaultStatePath, resolveConfigPath, resolveRendezvousUrl, resolveStatePath, type ConfigSource } from './paths';
 import { BunSQLiteStore } from './store';
 import { runChat } from './chat';
 
@@ -63,7 +65,7 @@ export async function createCliClient(
 }
 
 export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliDeps = {}): Promise<number> {
-  let context: CliContext = { args, output: 'json' };
+  let context: CliContext = { args, output: 'json', outputSource: 'default' };
   let command: string | undefined;
   let activeClient: ConeClient | undefined;
   const getClient = async () => {
@@ -96,6 +98,9 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
           }, () => 'Secret key is valid. Use CONE_SECRET_KEY or pass --remember to persist it.\n');
         }
         return 0;
+      }
+      case 'config': {
+        return handleConfig(io, context);
       }
       case 'whoami': {
         const client = await getClient();
@@ -883,11 +888,15 @@ type OutputMode = 'json' | 'plain';
 interface CliContext {
   args: string[];
   output: OutputMode;
+  // Where `output` came from — the flags are consumed here, so `cone config`
+  // cannot reconstruct this from args.
+  outputSource: 'default' | 'environment' | 'flag';
 }
 
 function parseCliArgs(args: string[]): CliContext {
   const rest: string[] = [];
   let output: OutputMode = process.env.CONE_OUTPUT === 'plain' ? 'plain' : 'json';
+  let outputSource: CliContext['outputSource'] = process.env.CONE_OUTPUT ? 'environment' : 'default';
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -896,20 +905,25 @@ function parseCliArgs(args: string[]): CliContext {
     }
     if (arg === '--json') {
       output = 'json';
+      outputSource = 'flag';
       continue;
     }
     if (arg === '--plain') {
       output = 'plain';
+      outputSource = 'flag';
       continue;
     }
     rest.push(arg);
   }
 
-  return { args: rest, output };
+  return { args: rest, output, outputSource };
 }
 
 function readEnv(): XmtpEnv {
-  const env = process.env.XMTP_ENV ?? 'dev';
+  // Production is the durable XMTP network and the default; dev/local are
+  // explicit opt-ins for testing (identities are env-scoped, so they never
+  // collide with the production account).
+  const env = process.env.XMTP_ENV ?? 'production';
   if (env === 'local' || env === 'dev' || env === 'production') {
     return env;
   }
@@ -984,12 +998,110 @@ async function readHiddenLine(prompt: string): Promise<string> {
   });
 }
 
+// `cone config` answers "what will this process actually do?" — every
+// resolved setting plus the exact place its value was set, without unlocking
+// an account. Sources: 'default' is the compiled product decision, 'config'
+// is the config.json file, 'environment' is an env var — whose `location`
+// pinpoints the .env line or the shell (see env-origin.ts), 'flag' is a
+// command-line flag. Modeled on `git config --list --show-origin`.
+function handleConfig(io: CliIo, context: CliContext): number {
+  const configPath = withVia(resolveConfigPath(), 'CONE_HOME');
+  const statePath = withVia(resolveStatePath(), 'CONE_HOME');
+  const rendezvousUrl = withVia(resolveRendezvousUrl(), 'CONE_RENDEZVOUS_URL');
+  const config = readConfig(configPath.value);
+
+  const resolved = {
+    xmtpEnv: sourced(readEnv(), 'XMTP_ENV'),
+    configPath,
+    statePath,
+    rendezvousUrl,
+    // The key itself is never printed — only where the CLI would find one.
+    secretKey: process.env.CONE_SECRET_KEY
+      ? { source: 'environment' as const, via: 'CONE_SECRET_KEY', location: envVarLocation('CONE_SECRET_KEY') }
+      : { source: config.secretKey ? 'config' as const : 'none' as const },
+    readReceipts: fromConfig(config.readReceipts, true, '"readReceipts"'),
+    groupAutoAllow: fromConfig(config.groupAutoAllow, true, '"groupAutoAllow"'),
+    output: context.outputSource === 'default'
+      ? { value: context.output, source: 'default' as const }
+      : context.outputSource === 'flag'
+        ? { value: context.output, source: 'flag' as const, via: `--${context.output}` }
+        : { value: context.output, source: 'environment' as const, via: 'CONE_OUTPUT', location: envVarLocation('CONE_OUTPUT') },
+  };
+
+  // Plain rendering: every line says, in words, where its value was set — or
+  // for a built-in default, the one knob that changes it.
+  const where = (entry: { source: string; via?: string; location?: string }, changeWith: string): string => {
+    if (entry.source === 'default') {
+      return `built-in default; ${changeWith} changes it`;
+    }
+    if (entry.source === 'flag') {
+      return `set by the ${entry.via} flag`;
+    }
+    if (entry.source === 'config') {
+      return `set as ${entry.via} in ${configPath.value}`;
+    }
+    return `set by ${entry.via} ${describeLocation(entry.location)}`;
+  };
+  const usesDotEnv = [resolved.xmtpEnv, resolved.configPath, resolved.statePath, resolved.rendezvousUrl, resolved.secretKey, resolved.output]
+    .some((entry) => 'location' in entry && entry.location !== undefined && !entry.location.startsWith('shell'));
+
+  writeValue(io, context, resolved, (value) => [
+    `XMTP network:     ${value.xmtpEnv.value} — ${where(value.xmtpEnv, 'XMTP_ENV')}`,
+    `Config file:      ${value.configPath.value} — ${where(value.configPath, 'CONE_HOME')}`,
+    `State database:   ${value.statePath.value} — ${where(value.statePath, 'CONE_HOME')}`,
+    `Rendezvous URL:   ${value.rendezvousUrl.value} — ${where(value.rendezvousUrl, 'CONE_RENDEZVOUS_URL')}`,
+    `Secret key:       ${value.secretKey.source === 'none'
+      ? 'not set — set CONE_SECRET_KEY or run `cone login --remember`'
+      : value.secretKey.source === 'environment'
+        ? `set by CONE_SECRET_KEY ${describeLocation(value.secretKey.location)}`
+        : `remembered as "secretKey" in ${value.configPath.value}; CONE_SECRET_KEY would override`}`,
+    `Read receipts:    ${value.readReceipts.value ? 'on' : 'off'} — ${where(value.readReceipts, `"readReceipts" in ${value.configPath.value}`)}`,
+    `Group auto-allow: ${value.groupAutoAllow.value ? 'on' : 'off'} — ${where(value.groupAutoAllow, `"groupAutoAllow" in ${value.configPath.value}`)}`,
+    '                  (whether a contact can add you to a group without a Request)',
+    `Output:           ${value.output.value} — ${where(value.output, 'CONE_OUTPUT or --plain/--json')}`,
+    ...(usesDotEnv ? [
+      '',
+      `.env here is ${join(process.cwd(), '.env')},`,
+      'auto-loaded by Bun for processes started in this directory only. (A shell',
+      'export carrying the same value is indistinguishable from the .env line.)',
+    ] : []),
+  ].join('\n') + '\n');
+  return 0;
+}
+
+function describeLocation(location: string | undefined): string {
+  if (location === undefined || location === 'shell') {
+    return 'exported in your shell';
+  }
+  if (location.startsWith('shell (overrides ')) {
+    return `exported in your shell, overriding ${location.slice('shell (overrides '.length, -1)}`;
+  }
+  return `in ${location}`;
+}
+
+function sourced<T>(value: T, envVar: string): { value: T; source: ConfigSource; via?: string; location?: string } {
+  return process.env[envVar] !== undefined
+    ? { value, source: 'environment', via: envVar, location: envVarLocation(envVar) }
+    : { value, source: 'default' };
+}
+
+function withVia(entry: { value: string; source: ConfigSource }, envVar: string): { value: string; source: ConfigSource; via?: string; location?: string } {
+  return entry.source === 'environment' ? { ...entry, via: envVar, location: envVarLocation(envVar) } : entry;
+}
+
+function fromConfig<T>(configured: T | undefined, fallback: T, key: string): { value: T; source: 'config' | 'default'; via?: string } {
+  return configured !== undefined
+    ? { value: configured, source: 'config', via: key }
+    : { value: fallback, source: 'default' };
+}
+
 function helpText(): string {
   return `Usage:
   cone keygen
   cone [--json|--plain] login [--remember]
   cone [--json|--plain] login --secret-stdin [--remember]
   cone [--json|--plain] whoami [--env dev|production|local]
+  cone [--json|--plain] config                 (effective configuration and where each value came from)
   cone [--json|--plain] send --to <inboxId|address|contactName> --text "..."
   cone [--json|--plain] listen [--once] [--timeout-ms <ms>] [--auto-accept-groups-from-contacts]
        (allowed senders only; group adds stay explicit-accept unless the flag is given;

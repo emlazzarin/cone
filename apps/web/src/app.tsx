@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 
 import {
   createConeClient,
+  DEFAULT_RENDEZVOUS_URL as CORE_DEFAULT_RENDEZVOUS_URL,
   deriveAccount,
   errorMessage,
   filterMatchSnippet,
@@ -98,12 +99,16 @@ const VIEWS: { key: View; label: string }[] = [
   { key: 'settings', label: 'Settings' },
 ];
 
-const DEFAULT_RENDEZVOUS_URL = import.meta.env.VITE_CONE_RENDEZVOUS_URL ?? 'http://localhost:8787';
+// Build-time override first (baked by Vite), then the product default shared
+// with the CLI so the two surfaces can never drift apart.
+const DEFAULT_RENDEZVOUS_URL = import.meta.env.VITE_CONE_RENDEZVOUS_URL ?? CORE_DEFAULT_RENDEZVOUS_URL;
 
 export function App({ bootstrap }: AppProps = {}) {
   const [session, setSession] = useState<SessionState | null>(() => bootstrap?.session ?? null);
   const [secretInput, setSecretInput] = useState('');
-  const [env, setEnv] = useState<XmtpEnv>('dev');
+  // Production is the durable XMTP network and the default; the env select
+  // remains for dev/local testing (identities are env-scoped).
+  const [env, setEnv] = useState<XmtpEnv>('production');
   const [rendezvousUrl, setRendezvousUrl] = useState(bootstrap?.rendezvousUrl ?? DEFAULT_RENDEZVOUS_URL);
 
   const [view, setView] = useState<View>(bootstrap?.view ?? 'chats');

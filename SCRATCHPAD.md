@@ -67,9 +67,11 @@ batch, in this order:
 ## Gotchas (the classes of bug that recur)
 
 - **`decryptJson` does not authenticate the schema label** — payload type
-  discrimination must live *inside* the ciphertext (`type` fields on invite
-  payloads; pairing skips any typed payload). Same code space, no cross-flow
-  reads.
+  discrimination must live *inside* the ciphertext (explicit `type` fields on
+  every rendezvous payload, pairing offers included since 2026-07-02). The
+  cleartext schema label is untrusted, but useful for *diagnostics*: an
+  unfamiliar one means "peer is on a newer Cone", surfaced as an error
+  instead of a silent timeout. Same code space, no cross-flow reads.
 - **Store metadata key whitelist**: BunSQLiteStore's `getMetadata` enumerates
   keys explicitly — every new `ConeStoreMetadata` field needs a branch there
   or it is silently dropped (bit us for `deniedInboxIds`, again for
@@ -77,9 +79,13 @@ batch, in this order:
 - **SQLite upserts must update every denormalized column** — `putMessage`
   once updated only `data`, which would have silently broken re-keying
   messages during duplicate-DM collapse.
-- **Every spawned `bun` re-loads the repo `.env`**, and `CONE_STATE_PATH`
-  beats `CONE_HOME`. Multi-actor scripts must SET state/config paths per
-  actor. Symptom of collision: `PRAGMA key or salt has incorrect value`.
+- **Every spawned `bun` re-loads the repo `.env`** (cwd-scoped; real env
+  vars beat it). The exact-path `CONE_STATE_PATH`/`CONE_CONFIG_PATH` knobs
+  were removed 2026-07-02 because their precedence over `CONE_HOME` let a
+  repo `.env` silently make separate actors share one state DB (symptom:
+  `PRAGMA key or salt has incorrect value`). `CONE_HOME` is now the only
+  path override; multi-actor scripts set it per actor. `cone config` prints
+  the resolved values.
 - **Rendezvous re-posts need stable participant ids** — link servicing
   re-posts the descriptor every sync; a fresh nonce would mean "room already
   has a descriptor" (the stable nonce lives on `GroupInviteLink`).
