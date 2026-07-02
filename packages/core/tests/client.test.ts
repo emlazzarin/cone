@@ -708,6 +708,146 @@ describe('ConeClient', () => {
     expect((await client.listContacts()).some((contact) => contact.source === 'self')).toBe(false);
     expect((await client.listConversations()).map((row) => row.conversationId)).toEqual(['dm-peer']);
   });
+
+  test('pollMessages returns new allowed inbound messages once, with a durable cursor', async () => {
+    const adapter = new FakeAdapter();
+    adapter.conversations = [
+      { conversationId: 'dm-friend', kind: 'dm', peerInboxId: 'inbox-friend', title: 'Friend', consentState: 'allowed' },
+      { conversationId: 'dm-req', kind: 'dm', peerInboxId: 'inbox-stranger', title: 'inbox-stranger', consentState: 'unknown' },
+    ];
+    adapter.networkMessages = [
+      { conversationId: 'dm-friend', conversationKind: 'dm', messageId: 'new-1', raw: {}, senderInboxId: 'inbox-friend', sentAt: '2026-01-01T10:00:00.000Z', text: 'hello' },
+      // Control envelopes and request-conversation messages never wake a poll.
+      { conversationId: 'dm-friend', conversationKind: 'dm', messageId: 'ctl-1', raw: {}, senderInboxId: 'inbox-friend', sentAt: '2026-01-01T10:01:00.000Z', json: { type: 'cone.read.v1' } },
+      { conversationId: 'dm-req', conversationKind: 'dm', messageId: 'req-1', raw: {}, senderInboxId: 'inbox-stranger', sentAt: '2026-01-01T10:02:00.000Z', text: 'psst' },
+    ];
+    const store = new MemoryStore();
+    const client = await makeClient(adapter, store);
+    await client.sync();
+
+    const first = await client.pollMessages({ cursorName: 'agent-main' });
+    expect(first.messages.map((message) => message.messageId)).toEqual(['new-1']);
+
+    // Advanced: the same poll comes back empty until something new arrives.
+    const second = await client.pollMessages({ cursorName: 'agent-main' });
+    expect(second.messages).toEqual([]);
+    expect(second.cursor).toBe(first.cursor);
+
+    // A later message — even one sharing the previous watermark instant —
+    // arrives exactly once.
+    adapter.networkMessages.push({
+      conversationId: 'dm-friend', conversationKind: 'dm', messageId: 'new-2', raw: {}, senderInboxId: 'inbox-friend', sentAt: '2026-01-01T10:00:00.000Z', text: 'same instant',
+    });
+    await client.sync();
+    const third = await client.pollMessages({ cursorName: 'agent-main' });
+    expect(third.messages.map((message) => message.messageId)).toEqual(['new-2']);
+    expect((await client.pollMessages({ cursorName: 'agent-main' })).messages).toEqual([]);
+  });
+
+  test('pollMessages with advance:false peeks without moving the cursor', async () => {
+    const adapter = new FakeAdapter();
+    adapter.conversations = [
+      { conversationId: 'dm-friend', kind: 'dm', peerInboxId: 'inbox-friend', title: 'Friend', consentState: 'allowed' },
+    ];
+    adapter.networkMessages = [
+      { conversationId: 'dm-friend', conversationKind: 'dm', messageId: 'peek-1', raw: {}, senderInboxId: 'inbox-friend', sentAt: '2026-01-01T10:00:00.000Z', text: 'hello' },
+    ];
+    const client = await makeClient(adapter);
+    await client.sync();
+
+    expect((await client.pollMessages({ advance: false })).messages).toHaveLength(1);
+    expect((await client.pollMessages({ advance: false })).messages).toHaveLength(1);
+    expect((await client.pollMessages()).messages).toHaveLength(1);
+    expect((await client.pollMessages()).messages).toHaveLength(0);
+  });
+
+  test('an idempotency key returns the original send instead of publishing again', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+
+    const first = await client.sendText({ inboxId: 'inbox-peer' }, 'transfer $5', { idempotencyKey: 'tx-42' });
+    const retry = await client.sendText({ inboxId: 'inbox-peer' }, 'transfer $5', { idempotencyKey: 'tx-42' });
+
+    expect(adapter.sent).toHaveLength(1);
+    expect(retry.messageId).toBe(first.messageId);
+    expect(retry.deduplicated).toBe(true);
+
+    await client.sendText({ inboxId: 'inbox-peer' }, 'transfer $5', { idempotencyKey: 'tx-43' });
+    expect(adapter.sent).toHaveLength(2);
+  });
+
+  test('pollMessages catches a late-synced message with an older sentAt', async () => {
+    const adapter = new FakeAdapter();
+    adapter.conversations = [
+      { conversationId: 'dm-friend', kind: 'dm', peerInboxId: 'inbox-friend', title: 'Friend', consentState: 'allowed' },
+    ];
+    adapter.networkMessages = [
+      { conversationId: 'dm-friend', conversationKind: 'dm', messageId: 'newer', raw: {}, senderInboxId: 'inbox-friend', sentAt: '2026-01-01T10:05:00.000Z', text: 'first to arrive' },
+    ];
+    const client = await makeClient(adapter);
+    await client.sync();
+    expect((await client.pollMessages()).messages.map((m) => m.messageId)).toEqual(['newer']);
+
+    // Clock skew / delayed publish: an OLDER sentAt arrives on a later sync.
+    // The seq cursor still surfaces it; a sentAt watermark would drop it.
+    adapter.networkMessages.push({
+      conversationId: 'dm-friend', conversationKind: 'dm', messageId: 'older-late', raw: {}, senderInboxId: 'inbox-friend', sentAt: '2026-01-01T10:04:00.000Z', text: 'published late',
+    });
+    await client.sync();
+    expect((await client.pollMessages()).messages.map((m) => m.messageId)).toEqual(['older-late']);
+  });
+
+  test('an idempotency key reused for a different recipient is a conflict, not a silent skip', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+    await client.sendText({ inboxId: 'inbox-alice' }, 'transfer $5', { idempotencyKey: 'tx-1' });
+    await expect(client.sendText({ inboxId: 'inbox-bob' }, 'transfer $5', { idempotencyKey: 'tx-1' }))
+      .rejects.toThrow(/different recipient/);
+    expect(adapter.sent).toHaveLength(1);
+  });
+
+  test('an unsettled idempotency claim blocks the retry (at-most-once), and a definite failure releases it', async () => {
+    const adapter = new FakeAdapter();
+    const store = new MemoryStore();
+    // A crash left a claim without a messageId: the send may have published.
+    await store.putMetadata({ idempotencySends: [{ key: 'tx-crash', scope: 'inbox-peer' }] });
+    const client = await makeClient(adapter, store);
+    await expect(client.sendText({ inboxId: 'inbox-peer' }, 'hi', { idempotencyKey: 'tx-crash' }))
+      .rejects.toThrow(/may or may not have published/);
+
+    // A definite failure (unreachable) releases the claim so a retry works.
+    const blocked = new FakeAdapter({ blockedInboxIds: ['inbox-x'] });
+    const client2 = await makeClient(blocked, new MemoryStore());
+    await expect(client2.sendText({ inboxId: 'inbox-x' }, 'hi', { idempotencyKey: 'tx-2' })).rejects.toThrow(/not XMTP-reachable/);
+    (blocked as unknown as { options: { blockedInboxIds?: string[] } }).options.blockedInboxIds = [];
+    const retried = await client2.sendText({ inboxId: 'inbox-x' }, 'hi', { idempotencyKey: 'tx-2' });
+    expect(retried.deduplicated).toBeUndefined();
+  });
+
+  test('reads unwrap app JSON: json is the payload, replyTo is first-class', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+    await client.sendJson({ inboxId: 'inbox-peer' }, { kind: 'quote', amount: 5 }, { replyTo: 'msg-q' });
+
+    const sent = (await client.listMessages()).find((m) => m.kind === 'json');
+    expect(sent?.json).toEqual({ kind: 'quote', amount: 5 });
+    expect(sent?.replyTo).toBe('msg-q');
+    expect(sent?.conversationKind).toBe('dm');
+  });
+
+  test('sendJson carries replyTo correlation in the envelope', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+
+    await client.sendJson({ inboxId: 'inbox-peer' }, { answer: 42 }, { replyTo: 'msg-question' });
+
+    expect(adapter.sentEnvelopes).toHaveLength(1);
+    expect(adapter.sentEnvelopes[0]?.envelope).toMatchObject({
+      type: 'cone.app.json.v1',
+      value: { answer: 42 },
+      replyTo: 'msg-question',
+    });
+  });
 });
 
 async function makeClient(

@@ -105,7 +105,8 @@ describe('cone chat', () => {
     );
     state.mode = 'contacts-select';
 
-    const output = renderChat(state, 100, 20).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    // Wide enough that no footer segment is dropped by the fitter.
+    const output = renderChat(state, 120, 20).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
 
     expect(output).toContain('─ contacts ');
     expect(output).toContain('─ contact ');
@@ -160,8 +161,8 @@ describe('cone chat', () => {
     expect(renderChat(deleteState, 90, 18)).toContain('Type DELETE to confirm');
     expect(renderChat(pairState, 90, 18)).toContain('Handshake code');
     expect(renderChat(pairState, 90, 18)).not.toContain('blank creates one');
-    expect(renderChat(pairState, 90, 18)).toContain('Offer them a name for you (optional)');
-    expect(renderChat(pairState, 90, 18)).toContain('Save their name as (optional)');
+    expect(renderChat(pairState, 90, 18)).toContain('My display name (offered to them, optional)');
+    expect(renderChat(pairState, 90, 18)).toContain('Save peer as (optional)');
     expect(renderChat(codeState, 90, 18)).toContain('forest-wormhole-direction');
     expect(renderChat(codeState, 90, 18)).toContain('Code expires at');
     expect(renderChat(codeState, 90, 18)).toContain('CLI: cone pair forest-wormhole-direction');
@@ -1133,6 +1134,7 @@ function stubClient(overrides: Partial<ConeClient> = {}): ConeClient {
     inviteToGroupWithCode: async (_code, conversationId) => ({ conversationId, joiner: { inboxId: 'inbox-joiner' } }),
     joinGroupWithCode: async () => ({ conversationId: 'group-joined', groupName: 'Crew', memberCount: 2, inviter: { inboxId: 'inbox-peer' } }),
     listPendingGroupJoins: async () => [],
+    pollMessages: async () => ({ messages: [], cursor: 'cursor-1' }),
     cancelGroupJoin: async () => {},
     createGroupInviteLink: async (conversationId) => ({
       linkId: 'link-1',

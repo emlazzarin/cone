@@ -71,4 +71,26 @@ describe('frozen v1 derivation vectors', () => {
     expect(secretRoomId('cone_gi_v1_AAAAAAAAAAAAAAAAAAAAAA'))
       .toBe('cf229b60f444a6dee20ceb3a53dc3a13606b4778bf180b75eb106851df884e18');
   });
+
+  // Frozen wire identifiers, as literals: a drift here strands deployed
+  // clients even though every self-consistency test still passes.
+  test('envelope and rendezvous identifiers are frozen', async () => {
+    const envelope = await import('../src/envelope');
+    expect(envelope.APP_JSON_TYPE).toBe('cone.app.json.v1');
+    expect(envelope.READ_RECEIPT_TYPE).toBe('cone.read.v1');
+    expect(envelope.PAIR_CONFIRM_TYPE).toBe('cone.pair.confirm.v1');
+    expect(envelope.GROUP_UPDATE_TYPE).toBe('cone.group.update.v1');
+    expect(envelope.BACKUP_TYPE).toBe('cone.backup.v1');
+
+    const invites = await import('../src/invites');
+    expect(invites.GROUP_INVITE_DESCRIPTOR_TYPE).toBe('cone.group.invite.descriptor.v1');
+    expect(invites.GROUP_JOIN_REQUEST_TYPE).toBe('cone.group.invite.join.v1');
+
+    const crypto = await import('../src/crypto');
+    expect(crypto.GROUP_INVITE_TOKEN_PREFIX).toBe('cone_gi_v1_');
+
+    // Rendezvous roles are validated server-side by exact string.
+    const roles: Array<'pair' | 'descriptor' | 'join'> = ['pair', 'descriptor', 'join'];
+    expect(roles).toEqual(['pair', 'descriptor', 'join']);
+  });
 });

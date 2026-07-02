@@ -7,16 +7,21 @@ import {
   createConeClient,
   createHandshakeCode,
   deriveAccount,
+  ConeError,
+  errorMessage,
   formatMessageLine,
   formatRetention,
   generateSecretKey,
   isAllowedConversation,
+  isAppJsonEnvelope,
+  isControlEnvelope,
   isDeniedConversation,
   isRequestConversation,
   parseRetention,
   parseSecretKey,
   type ConeClient,
   type ConeConversation,
+  type ConeMessage,
   type IncomingMessage,
   type SecretKey,
   type XmtpAdapter,
@@ -115,11 +120,98 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
       }
       case 'send': {
         const to = requiredOption(context.args, '--to');
-        const text = requiredOption(context.args, '--text');
+        const text = optionalOption(context.args, '--text');
+        // --data, not --json: --json is the global output-mode flag.
+        const jsonPayload = optionalOption(context.args, '--data');
+        if ((text === undefined) === (jsonPayload === undefined)) {
+          throw usageError('usage: cone send --to <identity> (--text "..." | --data \'<json>\') [--reply-to <messageId>] [--idempotency-key <key>]');
+        }
+        const replyTo = optionalOption(context.args, '--reply-to');
+        if (replyTo && jsonPayload === undefined) {
+          // Correlation rides the app-JSON envelope; plain text has none.
+          throw usageError('--reply-to requires --data (correlation rides the JSON envelope)');
+        }
+        const sendOptions = { replyTo, idempotencyKey: optionalOption(context.args, '--idempotency-key') };
         const client = await getClient();
-        const sent = await client.sendText(to, text);
-        writeValue(io, context, sent, (value) => `Sent ${value.messageId}${value.conversationId ? ` in ${value.conversationId}` : ''}.\n`);
+        const sent = jsonPayload !== undefined
+          ? await client.sendJson(to, parseJsonArgument(jsonPayload), sendOptions)
+          : await client.sendText(to, text ?? '', sendOptions);
+        writeValue(io, context, sent, (value) =>
+          `${value.deduplicated ? 'Already sent (idempotency key matched)' : 'Sent'} ${value.messageId}${value.conversationId ? ` in ${value.conversationId}` : ''}.\n`);
         return 0;
+      }
+      // The poll-shaped read model for turn-based agents: sync, then print
+      // everything new since the named durable cursor. Exit 3 = nothing new,
+      // so shell loops need no JSON parsing to know whether to wake the agent.
+      case 'messages': {
+        const client = await getClient();
+        await syncOrThrow(client);
+        const result = await client.pollMessages({
+          cursorName: optionalOption(context.args, '--cursor-name'),
+          advance: !context.args.includes('--peek'),
+        });
+        const enriched = { ...result, messages: await enrichMessages(client, result.messages) };
+        writeValue(io, context, enriched, (value) =>
+          value.messages.length === 0
+            ? 'No new messages.\n'
+            : `${value.messages.map((message) => formatMessageLine(message, message.senderName ?? message.senderInboxId)).join('\n')}\n`);
+        return result.messages.length > 0 ? 0 : EXIT_NOTHING_NEW;
+      }
+      // Drain anything missed while asleep, then block until at least one new
+      // allowed message arrives (or the timeout). The single primitive that
+      // makes heartbeat loops and cron jobs trivial.
+      case 'wait': {
+        const client = await getClient();
+        const cursorName = optionalOption(context.args, '--cursor-name');
+        const timeoutMs = parseTimeoutMs(context.args, 0);
+        await syncOrThrow(client);
+        const printMail = async (result: { messages: ConeMessage[]; cursor: string }) => {
+          const enriched = { ...result, messages: await enrichMessages(client, result.messages) };
+          writeValue(io, context, enriched, (value) =>
+            `${value.messages.map((message) => formatMessageLine(message, message.senderName ?? message.senderInboxId)).join('\n')}\n`);
+        };
+        const drained = await client.pollMessages({ cursorName });
+        if (drained.messages.length > 0) {
+          await printMail(drained);
+          return 0;
+        }
+        let resolveFirst: (() => void) | undefined;
+        const first = new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        });
+        const unsubscribe = await client.streamMessages((message) => {
+          // Control envelopes never wake an agent loop.
+          if (isControlEnvelope(message.json)) {
+            return;
+          }
+          resolveFirst?.();
+        });
+        // Close the subscribe gap: anything that arrived between the drain
+        // above and the stream landing is caught by one more sync + poll.
+        await client.sync();
+        const gap = await client.pollMessages({ cursorName });
+        if (gap.messages.length > 0) {
+          await unsubscribe();
+          await printMail(gap);
+          return 0;
+        }
+        const arrived = await waitForFirstMessage(first, timeoutMs).then(() => true).catch(() => false);
+        await unsubscribe();
+        if (!arrived) {
+          writeValue(io, context, { messages: [], timedOut: true }, () => 'No new messages (timed out).\n');
+          return EXIT_NOTHING_NEW;
+        }
+        const fresh = await client.pollMessages({ cursorName });
+        if (fresh.messages.length === 0) {
+          writeValue(io, context, { messages: [], timedOut: false }, () => 'No new messages.\n');
+          return EXIT_NOTHING_NEW;
+        }
+        await printMail(fresh);
+        return 0;
+      }
+      // JSON health check an agent runs first when anything fails.
+      case 'doctor': {
+        return await handleDoctor(context, io);
       }
       case 'listen': {
         // Agent trust boundary: streamMessages defaults to allowed senders
@@ -135,7 +227,7 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
           io.stdout('Listening for Cone messages (allowed senders only)...\n');
         }
         const once = context.args.includes('--once');
-        const timeoutMs = Number(optionalOption(context.args, '--timeout-ms') ?? (once ? '30000' : '0'));
+        const timeoutMs = parseTimeoutMs(context.args, once ? 30_000 : 0);
         let resolveFirstMessage: (() => void) | undefined;
         const firstMessage = once
           ? new Promise<void>((resolve) => {
@@ -143,12 +235,23 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
             })
           : null;
         const unsubscribe = await listenClient.streamMessages(async (message) => {
+          // Control envelopes (receipts, group updates) never reach an agent
+          // loop — same boundary as messages/wait.
+          if (isControlEnvelope(message.json)) {
+            return;
+          }
           writeMessage(io, context, await enrichIncomingMessage(listenClient, message));
           resolveFirstMessage?.();
         });
         if (once && firstMessage) {
-          await waitForFirstMessage(firstMessage, timeoutMs);
+          // Timeout is "nothing new" (exit 3), matching messages/wait — a
+          // quiet network is not an error.
+          const arrived = await waitForFirstMessage(firstMessage, timeoutMs).then(() => true).catch(() => false);
           await unsubscribe();
+          if (!arrived) {
+            writeValue(io, context, { messages: [], timedOut: true }, () => 'No new messages (timed out).\n');
+            return EXIT_NOTHING_NEW;
+          }
         } else {
           await new Promise(() => undefined);
         }
@@ -190,11 +293,98 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
         return command ? 1 : 0;
     }
   } catch (error) {
-    io.stderr(`${error instanceof Error ? error.message : String(error)}\n`);
+    const code = errorCode(error, errorMessage(error));
+    const hint = code === 'NETWORK_UNREACHABLE' ? '\nTry: cone doctor --plain' : '';
+    const message = `${errorMessage(error)}${hint}`;
+    if (context.output === 'plain') {
+      io.stderr(`${message}\n`);
+    } else {
+      // Agents parse errors; free text forces them to guess. Stable codes,
+      // one JSON object on stderr.
+      io.stderr(`${JSON.stringify({ error: { code, message } })}\n`);
+    }
     return 1;
   } finally {
     await activeClient?.close();
   }
+}
+
+// Exit code contract for poll-shaped commands: 0 = new messages in the
+// payload, 3 = nothing new (not an error), 1 = error.
+const EXIT_NOTHING_NEW = 3;
+
+function usageError(message: string): Error {
+  const error = new Error(message);
+  (error as Error & { code?: string }).code = 'USAGE';
+  return error;
+}
+
+function parseJsonArgument(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw usageError('--data payload is not valid JSON');
+  }
+}
+
+// Stable machine-readable error codes. Explicit `code` properties win;
+// otherwise classify the known failure modes by message.
+function errorCode(error: unknown, message: string): string {
+  const explicit = (error as { code?: unknown })?.code;
+  if (typeof explicit === 'string' && explicit.length > 0) {
+    return explicit;
+  }
+  const lower = message.toLowerCase();
+  if (lower.startsWith('usage:') || lower.startsWith('use --')) {
+    return 'USAGE';
+  }
+  if (lower.includes('missing secret key')) {
+    return 'NO_SECRET';
+  }
+  if (lower.includes('secret key')) {
+    return 'BAD_SECRET';
+  }
+  if (lower.includes('not xmtp-reachable') || lower.includes('not reachable on xmtp')) {
+    return 'NOT_MESSAGEABLE';
+  }
+  if (lower.includes('rendezvous service unreachable')) {
+    return 'RENDEZVOUS_UNREACHABLE';
+  }
+  if (lower.includes('rendezvous')) {
+    return 'RENDEZVOUS_REJECTED';
+  }
+  if (lower.includes('same account')) {
+    return 'SELF_PAIRING';
+  }
+  if (lower.includes('timed out')) {
+    return 'TIMEOUT';
+  }
+  if (lower.includes('no longer a member')) {
+    return 'NOT_A_MEMBER';
+  }
+  if (lower.includes('not found')) {
+    return 'NOT_FOUND';
+  }
+  // Raw transport failures from the XMTP bindings read like gRPC internals;
+  // classify them so agents and humans both get an actionable signal.
+  if (/genericfailure|grpc|transport error|fetch failed|econnrefused|network|socket|dns/iu.test(lower)) {
+    return 'NETWORK_UNREACHABLE';
+  }
+  return 'ERROR';
+}
+
+// Timeouts are part of the agent contract: garbage must fail fast as USAGE,
+// never parse to NaN (which reads as "no timeout" and hangs forever).
+function parseTimeoutMs(args: string[], fallback: number): number {
+  const raw = optionalOption(args, '--timeout-ms');
+  if (raw === undefined) {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw usageError(`--timeout-ms must be a non-negative number of milliseconds, got ${JSON.stringify(raw)}`);
+  }
+  return parsed;
 }
 
 function printableMessage(message: IncomingMessage): Omit<IncomingMessage, 'raw'> {
@@ -205,10 +395,19 @@ function printableMessage(message: IncomingMessage): Omit<IncomingMessage, 'raw'
 // Group context for agent consumers: the local contact name for the sender
 // and the group's name ride along, so an agent can address replies and log
 // sensibly without keeping its own address book. Reads are local-store only.
-type EnrichedMessage = IncomingMessage & { senderName?: string; groupName?: string };
+type EnrichedMessage = IncomingMessage & { senderName?: string; groupName?: string; replyTo?: string };
 
 async function enrichIncomingMessage(client: ConeClient, message: IncomingMessage): Promise<EnrichedMessage> {
   const enriched: EnrichedMessage = { ...message };
+  // Same read contract as messages/wait: `json` is the sender's payload,
+  // `replyTo` first-class — the envelope is transport plumbing.
+  if (isAppJsonEnvelope(message.json)) {
+    const envelope = message.json as { value: unknown; replyTo?: unknown };
+    enriched.json = envelope.value;
+    if (typeof envelope.replyTo === 'string') {
+      enriched.replyTo = envelope.replyTo;
+    }
+  }
   try {
     const contacts = await client.listContacts();
     enriched.senderName = contacts.find((contact) => contact.inboxId === message.senderInboxId)?.name;
@@ -222,6 +421,38 @@ async function enrichIncomingMessage(client: ConeClient, message: IncomingMessag
     // Enrichment is best-effort; the message itself always goes out.
   }
   return enriched;
+}
+
+// A failed sync must never masquerade as "nothing new" (exit 3): agents
+// polling through network trouble need the error, not silence.
+async function syncOrThrow(client: ConeClient): Promise<void> {
+  const result = await client.sync();
+  if (!result.ok) {
+    throw new ConeError('SYNC_FAILED', `sync failed: ${result.errors.join('; ') || 'unknown error'}`);
+  }
+}
+
+// Attach senderName/groupName to polled mail the same way listen does —
+// lookups are built once per command, not per message.
+async function enrichMessages(
+  client: ConeClient,
+  messages: ConeMessage[],
+): Promise<Array<ConeMessage & { senderName?: string; groupName?: string }>> {
+  if (messages.length === 0) {
+    return messages;
+  }
+  try {
+    const [contacts, conversations] = await Promise.all([client.listContacts(), client.listConversations()]);
+    const nameByInbox = new Map(contacts.map((contact) => [contact.inboxId, contact.name]));
+    const groupNameById = new Map(conversations.filter((c) => c.kind === 'group').map((c) => [c.conversationId, c.groupName]));
+    return messages.map((message) => ({
+      ...message,
+      senderName: nameByInbox.get(message.senderInboxId),
+      groupName: message.conversationKind === 'group' ? groupNameById.get(message.conversationId) : undefined,
+    }));
+  } catch {
+    return messages;
+  }
 }
 
 function writeMessage(io: CliIo, context: CliContext, message: EnrichedMessage): void {
@@ -239,7 +470,9 @@ function writeValue<T>(io: CliIo, context: CliContext, value: T, plain: (value: 
     io.stdout(plain(value));
     return;
   }
-  io.stdout(`${JSON.stringify(value, null, 2)}\n`);
+  // NDJSON: one compact document per line. Commands that report progress
+  // (bare pair, group invite) emit several lines; agents parse line-by-line.
+  io.stdout(`${JSON.stringify(value)}\n`);
 }
 
 async function waitForFirstMessage(firstMessage: Promise<void>, timeoutMs: number): Promise<void> {
@@ -1004,6 +1237,64 @@ async function readHiddenLine(prompt: string): Promise<string> {
 // is the config.json file, 'environment' is an env var — whose `location`
 // pinpoints the .env line or the shell (see env-origin.ts), 'flag' is a
 // command-line flag. Modeled on `git config --list --show-origin`.
+// `cone doctor` — the JSON health check an agent runs first when anything
+// fails: secret, state DB, rendezvous, XMTP reachability. Exit 0 only when
+// every check passes; each check is { name, ok, detail }.
+async function handleDoctor(context: CliContext, io: CliIo): Promise<number> {
+  const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
+  const rendezvousUrl = defaultRendezvousUrl();
+  const statePath = defaultStatePath();
+  const configPath = defaultConfigPath();
+  const env = readEnv();
+
+  let secret: SecretKey | undefined;
+  try {
+    secret = context.args.includes('--secret-stdin') ? parseSecretKey(await io.stdinText()) : loadSecretKey(configPath);
+    checks.push({ name: 'secret', ok: true, detail: 'secret key present and valid' });
+  } catch (error) {
+    checks.push({ name: 'secret', ok: false, detail: firstLine(error) });
+  }
+
+  try {
+    const store = new BunSQLiteStore(statePath);
+    await store.getMetadata();
+    store.close();
+    checks.push({ name: 'state-db', ok: true, detail: statePath });
+  } catch (error) {
+    checks.push({ name: 'state-db', ok: false, detail: `${statePath}: ${firstLine(error)}` });
+  }
+
+  // The probe lives on the transport client itself, so doctor can never
+  // drift from the endpoint/protocol the real client speaks.
+  const rendezvousCheck = await new HttpRendezvousClient(rendezvousUrl).probe();
+  checks.push({ name: 'rendezvous', ...rendezvousCheck });
+
+  if (secret) {
+    try {
+      const client = await Promise.race([
+        createCliClient(secret, { env }),
+        new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error(`XMTP ${env} did not respond within 20s`)), 20_000)),
+      ]);
+      const identity = await client.identity();
+      await client.close();
+      checks.push({ name: 'xmtp', ok: true, detail: `${env} · inbox ${identity.inboxId}` });
+    } catch (error) {
+      checks.push({ name: 'xmtp', ok: false, detail: firstLine(error) });
+    }
+  } else {
+    checks.push({ name: 'xmtp', ok: false, detail: 'skipped — no secret key' });
+  }
+
+  const ok = checks.every((check) => check.ok);
+  writeValue(io, context, { ok, env: { xmtpEnv: env, rendezvousUrl, statePath, configPath }, checks }, (value) =>
+    `${value.checks.map((check) => `${check.ok ? 'ok  ' : 'FAIL'} ${check.name}: ${check.detail}`).join('\n')}\n${value.ok ? 'All checks passed.' : 'Problems found.'}\n`);
+  return ok ? 0 : 1;
+}
+
+function firstLine(error: unknown): string {
+  return errorMessage(error).split('\n')[0] ?? 'unknown error';
+}
+
 function handleConfig(io: CliIo, context: CliContext): number {
   const configPath = withVia(resolveConfigPath(), 'CONE_HOME');
   const statePath = withVia(resolveStatePath(), 'CONE_HOME');
@@ -1102,7 +1393,15 @@ function helpText(): string {
   cone [--json|--plain] login --secret-stdin [--remember]
   cone [--json|--plain] whoami [--env dev|production|local]
   cone [--json|--plain] config                 (effective configuration and where each value came from)
-  cone [--json|--plain] send --to <inboxId|address|contactName> --text "..."
+  cone [--json|--plain] send --to <inboxId|address|contactName> (--text "..." | --data '<json>')
+       [--reply-to <messageId>] [--idempotency-key <key>]
+       (--data rides the Cone envelope as app JSON; --reply-to correlates request/response and requires --data;
+        a repeated --idempotency-key returns the original send instead of publishing again)
+  cone [--json|--plain] messages [--cursor-name <name>] [--peek]
+       (sync, then print new allowed inbound messages since the durable cursor; exit 3 = nothing new)
+  cone [--json|--plain] wait [--timeout-ms <ms>] [--cursor-name <name>]
+       (drain missed messages, else block until one arrives; exit 3 on timeout)
+  cone [--json|--plain] doctor      (health checks: secret, state DB, rendezvous, XMTP; exit 0 = all ok)
   cone [--json|--plain] listen [--once] [--timeout-ms <ms>] [--auto-accept-groups-from-contacts]
        (allowed senders only; group adds stay explicit-accept unless the flag is given;
         JSON lines carry conversationKind plus senderName/groupName when known)

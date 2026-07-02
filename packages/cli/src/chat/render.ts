@@ -63,12 +63,9 @@ function headerLine(state: ChatState, width: number): string {
   const contactsTab = contacts ? chip(' 2 Contacts ') : dim(' 2 Contacts ');
   const left = `${brand} ${chatsTab}${contactsTab}`;
 
-  const selected = selectedConversation(state);
-  const context = contacts
-    ? selectedContact(state)?.name ?? 'contacts'
-    : state.mode === 'chat-compose'
-      ? state.editForm?.title ?? 'New message'
-      : activeContact(state)?.name ?? (selected ? convTitle(selected) : 'chats');
+  // The active chat/contact is named by its pane title in every layout, so
+  // the header carries only account-level state: connection, unread,
+  // requests, receipts, identity.
   const unread = Object.values(state.unreadByConversation).reduce((sum, count) => sum + count, 0);
   const connection = formatConnectionStatus(connectionStatusForState(state));
   const connectionLabel = state.streamState === 'online' && state.syncState !== 'stale'
@@ -81,7 +78,6 @@ function headerLine(state: ChatState, width: number): string {
     unread > 0 ? `${connectionLabel}${dim(' · ')}${accent(`${unread} new`)}` : connectionLabel,
     ...(requests > 0 ? [accent(`${requests} request${requests === 1 ? '' : 's'}`)] : []),
     ...(state.readReceipts ? [] : [dim('receipts off')]),
-    bold(ellipsize(context, Math.max(6, Math.floor(width / 4)))),
     dim(`you ${shortId(state.identity.inboxId)}`),
   ];
   return spread(left, `${parts.join(dim(' · '))} `, width);
@@ -119,7 +115,7 @@ function renderBody(state: ChatState, width: number, bodyHeight: number): string
       return groupInfoBox(state, width, bodyHeight);
     }
     if (state.mode === 'chat-talk') {
-      return threadColumn(state, width, bodyHeight);
+      return threadColumn(state, width, bodyHeight, true);
     }
     return chatListBox(state, width, bodyHeight, true);
   }
@@ -241,26 +237,29 @@ function contactDetailBox(state: ChatState, width: number, height: number): stri
 }
 
 // ── Thread + composer ─────────────────────────────────────────────────────
-function threadColumn(state: ChatState, width: number, height: number): string[] {
+function threadColumn(state: ChatState, width: number, height: number, narrow = false): string[] {
   // The composer is its own boxed row (droid-style) unless the terminal is
   // too short — then it folds into the bottom chrome line instead.
   const composerHeight = height >= SHORT_BODY ? 3 : 0;
-  const thread = threadBox(state, width, height - composerHeight);
+  const thread = threadBox(state, width, height - composerHeight, narrow);
   if (composerHeight === 0) {
     return thread;
   }
   return [...thread, ...composerBox(state, width)];
 }
 
-function threadBox(state: ChatState, width: number, height: number): string[] {
+function threadBox(state: ChatState, width: number, height: number, narrow = false): string[] {
   const conversation = selectedConversation(state);
   const contact = activeContact(state);
   const active = state.mode === 'chat-talk';
 
+  // In the narrow single-column tier the list is hidden; the `‹` signals
+  // that Esc goes back to it.
+  const back = narrow ? dim('‹ ') : '';
   const title = conversation
-    ? bold(ellipsize(convTitle(conversation), Math.max(6, width - 30)))
+    ? `${back}${bold(ellipsize(convTitle(conversation), Math.max(6, width - 30)))}`
     : contact
-      ? `${bold(contact.name)} ${dim('new chat')}`
+      ? `${back}${bold(contact.name)} ${dim('new chat')}`
       : dim('no chat selected');
   const unread = conversation ? state.unreadByConversation[conversation.conversationId] ?? 0 : 0;
   const metaParts = [
@@ -420,39 +419,82 @@ function bottomLine(state: ChatState, width: number, bodyHeight: number): string
 
 function footerLine(state: ChatState, width: number): string {
   if (state.helpVisible) {
-    return `${chip(' HELP ')}${inverse(pad(' Esc close help | ? close help ', Math.max(0, width - 6)))}`;
+    return `${chip(' HELP ')}${inverse(pad(' Esc close help · ? close help ', Math.max(0, width - 6)))}`;
   }
+  const label = modeChip(state);
+  const hints = footerSegments(state);
+  return `${chip(label)}${inverse(pad(fitSegments(hints, Math.max(0, width - stripAnsi(label).length)), Math.max(0, width - stripAnsi(label).length)))}`;
+}
+
+// Footer hints as whole segments, most important first. When width runs out,
+// entire hints drop from the tail (never a mid-hint clip) and `? help` is
+// always kept — discoverability survives exactly when screens get small.
+function footerSegments(state: ChatState): string[] {
   const retrySync = state.syncState === 'stale' || state.streamState === 'offline';
   const filterHint = state.filter ? '/ edit filter · Esc clear filter' : '/ filter';
   const failedHere = state.pendingMessages.some((entry) => entry.status === 'failed' && entry.key === composerKey(state));
   const requests = requestCount(state);
-  const requestsHint = state.scope === 'requests'
-    ? ' t chats'
-    : requests > 0 ? ` · t requests (${requests})` : '';
-  // The mode chip claims footer width, so hints stay lean; `g` (join a group
-  // by code/token) lives in help rather than the footer.
-  const text = state.mode === 'chat-select'
-    ? state.filterActive
-      ? ' type to filter · Up/Down move · Enter keep · Esc clear '
-      : state.scope === 'requests'
-        ? ` j/k move · Enter preview · a accept · b block${state.pendingBlockId ? ' (again to confirm)' : ''} · ${filterHint} ·${requestsHint} · ? help · q quit `
-        : ` j/k move · Enter talk · n new · ${selectedConversation(state)?.kind === 'group' ? 'i info' : 'r name'} · e timer · c/p pair · ${filterHint} · d delete${failedHere ? ' · Ctrl+X delete failed' : ''}${retrySync ? ' · s retry sync' : ''}${requestsHint} · ? help · q quit `
-    : state.mode === 'group-info'
-      ? ` j/k move · a add · v invite · l link · r rename · +/- role · d remove · e timer · x leave · b block · Esc back `
-    : state.mode === 'chat-talk'
-      ? failedHere
-        ? ' Enter retry · Ctrl+X delete failed · Esc back · Ctrl+U clear '
-        : ' Enter send · Esc back · Ctrl+U clear · Ctrl+W delete word '
-    : state.mode === 'chat-compose'
-        ? chatComposeFooter(state)
-        : state.mode === 'contacts-select'
-          ? ' j/k move · Enter talk · a add · r rename · d delete · c create code · p join code · ? help · q quit '
-          : state.editForm?.resultLines?.length
-            ? ' Enter done · Esc done '
-            : ` Tab next field · Shift+Tab previous · Enter ${state.editForm?.submitLabel ?? 'save'} · Esc cancel `;
-  const label = modeChip(state);
-  return `${chip(label)}${inverse(pad(text, Math.max(0, width - stripAnsi(label).length)))}`;
+  if (state.mode === 'chat-select') {
+    if (state.filterActive) {
+      return ['type to filter', 'Up/Down move', 'Enter keep', 'Esc clear'];
+    }
+    if (state.scope === 'requests') {
+      return [
+        'j/k move', 'Enter preview', 'a accept', `b block${state.pendingBlockId ? ' (again to confirm)' : ''}`,
+        filterHint, 't chats', '? help', 'q quit',
+      ];
+    }
+    return [
+      'j/k move', 'Enter talk', 'n new',
+      selectedConversation(state)?.kind === 'group' ? 'i info' : 'r name',
+      'e timer', 'c/p pair',
+      ...(failedHere ? ['Ctrl+X delete failed'] : []),
+      ...(retrySync ? ['s retry sync'] : []),
+      ...(requests > 0 ? [`t requests (${requests})`] : []),
+      filterHint, 'd delete', '? help', 'q quit', 'g join group',
+    ];
+  }
+  if (state.mode === 'group-info') {
+    return ['j/k move', 'a add', 'v invite', 'l link', 'r rename', '+/- role', 'd remove', 'e timer', 'x leave', 'b block', 'Esc back', '? help'];
+  }
+  if (state.mode === 'chat-talk') {
+    return failedHere
+      ? ['Enter retry', 'Ctrl+X delete failed', 'Esc back', 'Ctrl+U clear']
+      : ['Enter send', 'Esc back', 'Ctrl+U clear', 'Ctrl+W delete word'];
+  }
+  if (state.mode === 'chat-compose') {
+    return chatComposeFooter(state);
+  }
+  if (state.mode === 'contacts-select') {
+    return ['j/k move', 'Enter talk', 'a add', 'r rename', 'd delete', 'c create code', 'p join code', '? help', 'q quit'];
+  }
+  return state.editForm?.resultLines?.length
+    ? ['Enter done', 'Esc done']
+    : ['Tab next field', 'Shift+Tab previous', `Enter ${state.editForm?.submitLabel ?? 'save'}`, 'Esc cancel'];
 }
+
+function fitSegments(segments: string[], width: number): string {
+  const pinned = segments.includes('? help') ? '? help' : undefined;
+  const kept: string[] = [];
+  const reserve = pinned ? pinned.length + 3 : 0;
+  let used = 2; // leading + trailing space
+  for (const segment of segments) {
+    if (segment === pinned) {
+      continue;
+    }
+    const cost = (kept.length > 0 ? 3 : 0) + segment.length;
+    if (used + cost + reserve > width) {
+      break;
+    }
+    kept.push(segment);
+    used += cost;
+  }
+  if (pinned) {
+    kept.push(pinned);
+  }
+  return ` ${kept.join(' · ')} `;
+}
+
 
 // The explicit current-state chip: the mode is always visible at a glance.
 function modeChip(state: ChatState): string {
@@ -611,15 +653,15 @@ function helpRows(state: ChatState): string[] {
   ];
 }
 
-function chatComposeFooter(state: ChatState): string {
+function chatComposeFooter(state: ChatState): string[] {
   const activeField = state.editForm?.fields[state.editForm.activeField];
   if (state.editForm?.kind === 'message' && activeField?.key === 'to') {
-    return ' Up/Down choose target | Enter accept target | Tab message | Esc cancel ';
+    return ['Up/Down choose target', 'Enter accept target', 'Tab message', 'Esc cancel'];
   }
   if (state.editForm?.kind === 'message') {
-    return ' Enter send | Tab target | Shift+Tab target | Esc cancel ';
+    return ['Enter send', 'Tab target', 'Shift+Tab target', 'Esc cancel'];
   }
-  return ` Enter ${state.editForm?.submitLabel ?? 'save'} | Esc cancel `;
+  return [`Enter ${state.editForm?.submitLabel ?? 'save'}`, 'Esc cancel'];
 }
 
 function modeLabel(mode: ChatMode): string {

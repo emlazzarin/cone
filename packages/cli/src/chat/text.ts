@@ -3,6 +3,15 @@
 // Control Sequence Introducer: the prefix of every ANSI escape we emit.
 export const CSI = '\x1b[';
 
+// Honor the NO_COLOR convention (https://no-color.org): when set, every
+// styling helper passes text through untouched. Hierarchy then rests on the
+// markers, borders, and spacing that are present regardless of color.
+const color = !process.env.NO_COLOR;
+
+function style(open: string, value: string): string {
+  return color ? `${CSI}${open}${value}${CSI}0m` : value;
+}
+
 export function shortId(value: string): string {
   return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
 }
@@ -16,44 +25,44 @@ export function pad(value: string, width: number): string {
 }
 
 export function inverse(value: string): string {
-  return `${CSI}7m${value}${CSI}0m`;
+  return style('7m', value);
 }
 
 export function dim(value: string): string {
-  return `${CSI}2m${value}${CSI}0m`;
+  return style('2m', value);
 }
 
 export function bold(value: string): string {
-  return `${CSI}1m${value}${CSI}0m`;
+  return style('1m', value);
 }
 
 // Selection bar: amber-inverse, matching the PWA's CRT accent.
 export function highlight(value: string): string {
-  return `${CSI}38;5;214m${CSI}7m${value}${CSI}0m`;
+  return color ? `${CSI}38;5;214m${CSI}7m${value}${CSI}0m` : value;
 }
 
 // The single accent color — 256-color amber, the PWA's `--amber` in terminal
 // terms, so both surfaces read as one product.
 export function accent(value: string): string {
-  return `${CSI}38;5;214m${value}${CSI}0m`;
+  return style('38;5;214m', value);
 }
 
 // State chips (active tab, current mode): bold amber-inverse so the current
 // state is unmistakable at a glance.
 export function chip(value: string): string {
-  return `${CSI}1;38;5;214;7m${value}${CSI}0m`;
+  return style('1;38;5;214;7m', value);
 }
 
 export function danger(value: string): string {
-  return `${CSI}31m${value}${CSI}0m`;
+  return style('31m', value);
 }
 
 export function success(value: string): string {
-  return `${CSI}32m${value}${CSI}0m`;
+  return style('32m', value);
 }
 
 export function inputField(value: string): string {
-  return `${CSI}30;47m${value}${CSI}0m`;
+  return style('30;47m', value);
 }
 
 // Emphasize the characters a live filter matched. Restores with non-reset
@@ -139,7 +148,8 @@ function truncateAnsi(value: string, width: number): string {
     output += value[index];
     visible += 1;
   }
-  return `${output}${CSI}0m`;
+  // Only close styling if any was present — NO_COLOR output stays byte-clean.
+  return output.includes('\x1b') ? `${output}${CSI}0m` : output;
 }
 
 function breakLongWord(word: string, width: number): string[] {

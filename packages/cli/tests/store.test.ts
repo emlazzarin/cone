@@ -55,7 +55,8 @@ describe('BunSQLiteStore', () => {
     expect(await reopened.getContactByName('contact')).toEqual(contact);
     expect(await reopened.getConversationById('dm-contact')).toEqual(conversation);
     expect(await reopened.listConversations()).toEqual([conversation]);
-    expect(await reopened.listMessages()).toEqual([message]);
+    // The store stamps ingestion order (rowid) on reads.
+    expect(await reopened.listMessages()).toEqual([{ ...message, seq: 1 }]);
     const snapshot = await reopened.exportSnapshot();
     expect(snapshot.metadata).toEqual({ lastStreamStartedAt: '2026-01-01T00:00:00.000Z', lastSyncedAt: '2026-01-01T00:01:00.000Z' });
     expect(snapshot.processedMessageIds).toEqual(['msg-1']);
@@ -92,6 +93,35 @@ describe('BunSQLiteStore', () => {
     reopened.close();
   });
 
+  test('two store handles on one database coexist (listen + send pattern)', async () => {
+    // Agents run `cone listen` in one process and `cone send` in another
+    // against the same CONE_HOME; WAL + busy_timeout make that safe.
+    const path = tempPath();
+    const writer = new BunSQLiteStore(path);
+    const reader = new BunSQLiteStore(path);
+
+    await writer.putContact({
+      contactId: 'contact-a',
+      name: 'Alice',
+      inboxId: 'inbox-a',
+      source: 'manual',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+    expect((await reader.listContacts()).map((contact) => contact.name)).toEqual(['Alice']);
+
+    // Interleaved writes from both handles land without SQLITE_BUSY.
+    await Promise.all([
+      writer.putMetadata({ lastSyncedAt: '2026-01-01T00:00:01.000Z' }),
+      reader.putMetadata({ lastStreamStartedAt: '2026-01-01T00:00:02.000Z' }),
+    ]);
+    const metadata = await writer.getMetadata();
+    expect(metadata.lastSyncedAt).toBe('2026-01-01T00:00:01.000Z');
+    expect(metadata.lastStreamStartedAt).toBe('2026-01-01T00:00:02.000Z');
+
+    writer.close();
+    reader.close();
+  });
 });
 
 function tempPath(): string {

@@ -71,8 +71,13 @@ export class MemoryStore implements ConeStore {
     return Promise.resolve();
   }
 
+  private nextSeq = 1;
+
   putMessage(message: StoredMessage): Promise<void> {
-    this.messagesById.set(message.messageId, message);
+    // Ingestion order is store-assigned and survives updates (re-keying a
+    // message during duplicate-DM collapse must not make it "new" again).
+    const seq = this.messagesById.get(message.messageId)?.seq ?? this.nextSeq++;
+    this.messagesById.set(message.messageId, { ...message, seq });
     return Promise.resolve();
   }
 

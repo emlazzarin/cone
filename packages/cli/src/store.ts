@@ -17,6 +17,10 @@ export class BunSQLiteStore implements ConeStore {
   constructor(private readonly filePath: string) {
     mkdirSync(dirname(filePath), { recursive: true });
     this.db = new Database(filePath, { create: true });
+    // Agents run `cone listen` and `cone send` concurrently against one
+    // CONE_HOME. WAL lets a reader and a writer coexist, and the busy timeout
+    // makes brief write overlaps queue instead of throwing SQLITE_BUSY.
+    this.db.exec('pragma journal_mode = WAL; pragma busy_timeout = 5000;');
     this.migrate();
   }
 
@@ -133,10 +137,15 @@ export class BunSQLiteStore implements ConeStore {
   }
 
   listMessages(conversationId?: string): Promise<StoredMessage[]> {
+    // rowid is the ingestion sequence: assigned on insert, preserved by the
+    // upsert's on-conflict update. Poll cursors ride it (StoredMessage.seq).
     const rows = conversationId
-      ? this.db.query(`select data from messages where conversation_id = ? order by sent_at asc`).all(conversationId)
-      : this.db.query(`select data from messages order by sent_at asc`).all();
-    return Promise.resolve((rows as DataRow[]).map(parseDataRow<StoredMessage>));
+      ? this.db.query(`select rowid as seq, data from messages where conversation_id = ? order by sent_at asc`).all(conversationId)
+      : this.db.query(`select rowid as seq, data from messages order by sent_at asc`).all();
+    return Promise.resolve((rows as Array<DataRow & { seq: number }>).map((row) => ({
+      ...parseDataRow<StoredMessage>(row),
+      seq: row.seq,
+    })));
   }
 
   // Deletes the stored payload only; the processed_messages marker is kept so
@@ -167,6 +176,10 @@ export class BunSQLiteStore implements ConeStore {
         metadata.pendingGroupJoins = parseJsonArray(row.value);
       } else if (row.key === 'groupInviteLinks') {
         metadata.groupInviteLinks = parseJsonArray(row.value);
+      } else if (row.key === 'pollCursors') {
+        metadata.pollCursors = parseJsonRecord(row.value);
+      } else if (row.key === 'idempotencySends') {
+        metadata.idempotencySends = parseJsonArray(row.value);
       }
     }
     return Promise.resolve(metadata);
@@ -297,5 +310,14 @@ function parseJsonArray<T>(value: string): T[] {
     return Array.isArray(parsed) ? (parsed as T[]) : [];
   } catch {
     return [];
+  }
+}
+
+function parseJsonRecord<T>(value: string): Record<string, T> {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, T>) : {};
+  } catch {
+    return {};
   }
 }

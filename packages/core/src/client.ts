@@ -1,4 +1,4 @@
-import { bytesToUtf8, utf8ToBytes } from './encoding';
+import { base64UrlDecode, base64UrlEncode, bytesToUtf8, utf8ToBytes } from './encoding';
 import {
   assertSupportedRendezvousSecret,
   decryptBytes,
@@ -15,6 +15,7 @@ import { laterIso } from './display';
 import {
   APP_JSON_TYPE,
   BACKUP_TYPE,
+  isAppJsonEnvelope,
   PAIR_CONFIRM_TYPE,
   READ_RECEIPT_TYPE,
   UNSUPPORTED_MESSAGE_TYPE,
@@ -34,6 +35,8 @@ import {
   type GroupInviteDescriptor,
   type GroupJoinRequest,
 } from './invites';
+import { ConeError } from './errors';
+import { isVisibleChatMessage } from './display';
 import { isExpiredMessage, messageExpiresAt } from './retention';
 import type {
   ConeClient,
@@ -57,6 +60,7 @@ import type {
   PairingResult,
   ResolvedIdentity,
   SaveContactInput,
+  SendOptions,
   SentMessage,
   StoredMessage,
   SyncResult,
@@ -122,39 +126,109 @@ class ConeClientImpl implements ConeClient {
     }
   }
 
-  async sendText(to: IdentityRef, text: string): Promise<SentMessage> {
+  async sendText(to: IdentityRef, text: string, options: SendOptions = {}): Promise<SentMessage> {
     if (text.trim().length === 0) {
       throw new Error('message text is required');
     }
-
     const resolved = await this.resolveIdentity(to);
-    if (!(await this.options.xmtp.canMessage(resolved))) {
-      throw new Error('identity is not XMTP-reachable');
+    const recalled = await this.claimIdempotentSend(options.idempotencyKey, resolved.inboxId);
+    if (recalled) {
+      return recalled;
     }
+    try {
+      if (!(await this.options.xmtp.canMessage(resolved))) {
+        throw new ConeError('NOT_MESSAGEABLE', 'identity is not XMTP-reachable');
+      }
 
-    const sent = await this.options.xmtp.sendText(resolved, text);
-    await this.persistOutbound(sent, resolved, 'text', text);
-    // Sending implies consent: the recipient leaves "unknown" so a reply never
-    // lands in Requests. persistOutbound already stamped the local mirror
-    // allowed; this propagates it to the network (best-effort).
-    await this.setConsentSafe(resolved.inboxId, 'allowed');
-    return sent;
+      const sent = await this.options.xmtp.sendText(resolved, text);
+      await this.persistOutbound(sent, resolved, 'text', text);
+      // Sending implies consent: the recipient leaves "unknown" so a reply never
+      // lands in Requests. persistOutbound already stamped the local mirror
+      // allowed; this propagates it to the network (best-effort).
+      await this.setConsentSafe(resolved.inboxId, 'allowed');
+      await this.settleIdempotentSend(options.idempotencyKey, sent);
+      return sent;
+    } catch (error) {
+      // A definite failure releases the claim so the caller may retry; only a
+      // crash (nothing runs) leaves it pending — the honest at-most-once case.
+      await this.releaseIdempotentSend(options.idempotencyKey);
+      throw error;
+    }
   }
 
   // App JSON rides the Cone envelope content type (with a human-readable
   // fallback for clients without the codec) — same reachability and
-  // implied-consent semantics as sendText.
-  async sendJson(to: IdentityRef, value: unknown): Promise<SentMessage> {
+  // implied-consent semantics as sendText. replyTo (correlation for
+  // request/response over async messaging) is an additive envelope field.
+  async sendJson(to: IdentityRef, value: unknown, options: SendOptions = {}): Promise<SentMessage> {
     const resolved = await this.resolveIdentity(to);
-    if (!(await this.options.xmtp.canMessage(resolved))) {
-      throw new Error('identity is not XMTP-reachable');
+    const recalled = await this.claimIdempotentSend(options.idempotencyKey, resolved.inboxId);
+    if (recalled) {
+      return recalled;
     }
+    try {
+      if (!(await this.options.xmtp.canMessage(resolved))) {
+        throw new ConeError('NOT_MESSAGEABLE', 'identity is not XMTP-reachable');
+      }
 
-    const envelope = { type: APP_JSON_TYPE, value };
-    const sent = await this.options.xmtp.sendEnvelope(resolved, envelope);
-    await this.persistOutbound(sent, resolved, 'json', envelope);
-    await this.setConsentSafe(resolved.inboxId, 'allowed');
-    return sent;
+      const envelope = { type: APP_JSON_TYPE, value, ...(options.replyTo ? { replyTo: options.replyTo } : {}) };
+      const sent = await this.options.xmtp.sendEnvelope(resolved, envelope);
+      await this.persistOutbound(sent, resolved, 'json', envelope);
+      await this.setConsentSafe(resolved.inboxId, 'allowed');
+      await this.settleIdempotentSend(options.idempotencyKey, sent);
+      return sent;
+    } catch (error) {
+      await this.releaseIdempotentSend(options.idempotencyKey);
+      throw error;
+    }
+  }
+
+  // At-most-once idempotency: the key is CLAIMED (recorded scoped to the
+  // resolved recipient) before publishing and settled with the messageId
+  // after. A retry that finds a settled record gets the original back; one
+  // that finds an unsettled claim gets IDEMPOTENCY_IN_FLIGHT — the previous
+  // attempt may or may not have published, and guessing would double-send.
+  // The ledger is capped: it protects crash-retry loops, not forever-uniqueness.
+  private async claimIdempotentSend(key: string | undefined, scope: string): Promise<SentMessage | null> {
+    if (!key) {
+      return null;
+    }
+    const records = (await this.options.store.getMetadata()).idempotencySends ?? [];
+    const match = records.find((record) => record.key === key);
+    if (match) {
+      if (match.scope !== scope) {
+        throw new ConeError('IDEMPOTENCY_CONFLICT', `idempotency key ${key} was already used for a different recipient`);
+      }
+      if (!match.messageId || !match.sentAt) {
+        throw new ConeError('IDEMPOTENCY_IN_FLIGHT', `a previous send with idempotency key ${key} may or may not have published — verify before retrying`);
+      }
+      return { messageId: match.messageId, conversationId: match.conversationId, sentAt: match.sentAt, deduplicated: true };
+    }
+    await this.options.store.putMetadata({ idempotencySends: [...records, { key, scope }].slice(-IDEMPOTENCY_CAP) });
+    return null;
+  }
+
+  private async settleIdempotentSend(key: string | undefined, sent: SentMessage): Promise<void> {
+    if (!key) {
+      return;
+    }
+    const records = (await this.options.store.getMetadata()).idempotencySends ?? [];
+    await this.options.store.putMetadata({
+      idempotencySends: records.map((record) =>
+        record.key === key
+          ? { ...record, messageId: sent.messageId, conversationId: sent.conversationId, sentAt: sent.sentAt }
+          : record),
+    });
+  }
+
+  private async releaseIdempotentSend(key: string | undefined): Promise<void> {
+    if (!key) {
+      return;
+    }
+    const records = (await this.options.store.getMetadata()).idempotencySends ?? [];
+    await this.options.store.putMetadata({
+      idempotencySends: records.filter((record) => !(record.key === key && !record.messageId)),
+    });
   }
 
   // Send into an existing conversation. DMs route through the identity path so
@@ -172,7 +246,7 @@ class ConeClientImpl implements ConeClient {
       return this.sendText({ inboxId: conversation.peerInboxId }, text);
     }
     if (conversation.active === false) {
-      throw new Error('you are no longer a member of this group');
+      throw new ConeError('NOT_A_MEMBER', 'you are no longer a member of this group');
     }
     if (text.trim().length === 0) {
       throw new Error('message text is required');
@@ -307,7 +381,7 @@ class ConeClientImpl implements ConeClient {
   private async requireGroup(conversationId: string): Promise<ConeConversation> {
     const conversation = await this.options.store.getConversationById(conversationId);
     if (!conversation || conversation.kind !== 'group') {
-      throw new Error(`group not found: ${conversationId}`);
+      throw new ConeError('NOT_FOUND', `group not found: ${conversationId}`);
     }
     return conversation;
   }
@@ -469,6 +543,46 @@ class ConeClientImpl implements ConeClient {
     });
   }
 
+  // The poll-shaped read model for turn-based agents (wake → check → respond
+  // → sleep): everything inbound and chat-visible from allowed conversations
+  // since the named cursor. The cursor is the store-stamped ingestion
+  // sequence (StoredMessage.seq) — never sender-supplied sentAt, which can
+  // arrive out of order and would silently skip late-synced mail. It advances
+  // past everything scanned unless the caller peeks. Callers sync() first to
+  // drain what arrived while asleep.
+  async pollMessages(options: { cursorName?: string; advance?: boolean } = {}): Promise<{ messages: ConeMessage[]; cursor: string }> {
+    const cursorName = options.cursorName ?? 'default';
+    const advance = options.advance ?? true;
+    const metadata = await this.options.store.getMetadata();
+    const stored = metadata.pollCursors?.[cursorName];
+    const afterSeq = decodePollCursor(stored);
+
+    const conversations = await this.listConversations();
+    const allowed = new Set(
+      conversations.filter((conversation) => conversation.consentState === 'allowed').map((conversation) => conversation.conversationId),
+    );
+    const all = await this.listMessages();
+    // The agent boundary again: inbound, allowed, and chat-visible only — a
+    // control envelope (receipt, group update) never wakes an agent loop.
+    const fresh = all
+      .filter((message) =>
+        (message.seq ?? 0) > afterSeq &&
+        message.direction === 'inbound' &&
+        allowed.has(message.conversationId) &&
+        isVisibleChatMessage(message))
+      .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+
+    const maxSeq = all.reduce((max, message) => Math.max(max, message.seq ?? 0), afterSeq);
+    const cursor = encodePollCursor(maxSeq);
+
+    if (advance && cursor !== stored) {
+      await this.options.store.putMetadata({
+        pollCursors: { ...(metadata.pollCursors ?? {}), [cursorName]: cursor },
+      });
+    }
+    return { messages: fresh, cursor };
+  }
+
   async listMessages(conversationId?: string): Promise<ConeMessage[]> {
     const [identity, messages, conversations, denied] = await Promise.all([
       this.identity(),
@@ -479,6 +593,7 @@ class ConeClientImpl implements ConeClient {
     const retentionByConversation = new Map(
       conversations.map((conversation) => [conversation.conversationId, conversation.retention]),
     );
+    const kindByConversation = new Map(conversations.map((conversation) => [conversation.conversationId, conversation.kind]));
     const groupConversationIds = new Set(
       conversations.filter((conversation) => conversation.kind === 'group').map((conversation) => conversation.conversationId),
     );
@@ -497,16 +612,26 @@ class ConeClientImpl implements ConeClient {
     return Promise.all(visible.map(async (message) => {
       const payload = await decryptJson<unknown>(this.options.account.coneStorageKey, message.encryptedPayload);
       const kind = message.kind === 'json' && isControlEnvelope(payload) ? 'control' : message.kind;
+      const json = typeof payload === 'string' ? undefined : payload;
+      // The app-JSON envelope is transport plumbing: readers get the sender's
+      // payload as `json` and the correlation id as `replyTo`, first-class.
+      // Control envelopes stay wrapped — their type IS their meaning.
+      const unwrapped = isAppJsonEnvelope(json) ? json.value : json;
+      const envelopeReplyTo = isAppJsonEnvelope(json) ? (json as unknown as { replyTo?: unknown }).replyTo : undefined;
+      const replyTo = typeof envelopeReplyTo === 'string' ? envelopeReplyTo : undefined;
       return {
         conversationId: message.conversationId,
+        conversationKind: kindByConversation.get(message.conversationId),
         direction: message.senderInboxId === identity.inboxId ? 'outbound' as const : 'inbound' as const,
         expiresAt: messageExpiresAt(message.sentAt, retentionByConversation.get(message.conversationId)),
-        json: typeof payload === 'string' ? undefined : payload,
+        json: unwrapped,
         kind,
         messageId: message.messageId,
         recipientInboxId: message.recipientInboxId,
+        replyTo,
         senderInboxId: message.senderInboxId,
         sentAt: message.sentAt,
+        seq: message.seq,
         text: typeof payload === 'string' ? payload : undefined,
       };
     }));
@@ -763,7 +888,7 @@ class ConeClientImpl implements ConeClient {
     }
 
     if (!peer) {
-      throw new Error('pairing timed out');
+      throw new ConeError('TIMEOUT', 'pairing timed out');
     }
 
     const contact = await this.saveContact({
@@ -803,7 +928,7 @@ class ConeClientImpl implements ConeClient {
     }
     const conversation = await this.requireGroup(conversationId);
     if (conversation.active === false) {
-      throw new Error('cannot invite: no longer a member of this group');
+      throw new ConeError('NOT_A_MEMBER', 'cannot invite: no longer a member of this group');
     }
     const normalizedCode = normalizeHandshakeCode(code);
     const identity = await this.identity();
@@ -836,7 +961,7 @@ class ConeClientImpl implements ConeClient {
     }
 
     if (!request) {
-      throw new Error('group invite timed out');
+      throw new ConeError('TIMEOUT', 'group invite timed out');
     }
 
     await this.addGroupMembers(conversationId, [{ inboxId: request.inboxId }]);
@@ -892,7 +1017,7 @@ class ConeClientImpl implements ConeClient {
     }
 
     if (!descriptor) {
-      throw new Error('group join timed out');
+      throw new ConeError('TIMEOUT', 'group join timed out');
     }
 
     const pending = await this.pendingGroupJoins();
@@ -945,7 +1070,7 @@ class ConeClientImpl implements ConeClient {
     }
     const conversation = await this.requireGroup(conversationId);
     if (conversation.active === false) {
-      throw new Error('cannot invite: no longer a member of this group');
+      throw new ConeError('NOT_A_MEMBER', 'cannot invite: no longer a member of this group');
     }
     const identity = await this.identity();
     const token = generateGroupInviteToken();
@@ -1312,3 +1437,27 @@ function contactToResolved(contact: Contact): ResolvedIdentity {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// The idempotency ledger protects crash-retry loops, not forever-uniqueness.
+const IDEMPOTENCY_CAP = 200;
+
+// Poll cursors are opaque to callers: base64url JSON holding the highest
+// ingestion sequence already scanned.
+function decodePollCursor(stored: string | undefined): number {
+  if (!stored) {
+    return 0;
+  }
+  try {
+    const parsed = JSON.parse(bytesToUtf8(base64UrlDecode(stored))) as { q?: unknown };
+    return typeof parsed.q === 'number' && Number.isFinite(parsed.q) ? parsed.q : 0;
+  } catch {
+    // An unreadable cursor restarts from the beginning rather than erroring —
+    // agents can handle replays; silently losing their place is worse.
+    return 0;
+  }
+}
+
+function encodePollCursor(seq: number): string {
+  return base64UrlEncode(utf8ToBytes(JSON.stringify({ q: seq })));
+}
+

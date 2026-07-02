@@ -18,29 +18,29 @@ Goal metric for the whole batch: **a stranger agent handed only a SKILL.md URL g
 
 Most agent harnesses wake → check → respond → sleep; they cannot hold a blocking stream. `cone listen --once` only catches messages that arrive *while streaming* — a message that arrived while the agent was asleep is only reachable via sync. The store already tracks `unreadCount`/`lastReadAt` per conversation (`packages/core/src/client.ts:477`) but the CLI never surfaces them.
 
-- [ ] **`cone messages --since <cursor>`** (or `cone inbox unread`): runs `sync`, returns all new allowed-sender messages since the cursor as JSON plus a new opaque cursor value, exits. Cursor should be durable (store it in the state DB keyed by a caller-supplied name, e.g. `--cursor-name agent-main`) so a crashed agent never loses its place.
-- [ ] **Distinct exit code for "no new messages"** (e.g. exit 0 = new messages in payload, exit 3 = nothing new, exit 1 = error) so shell loops are one-liners without JSON parsing.
-- [ ] **`cone wait [--timeout-ms <ms>]`**: sync first (drain anything missed while asleep), then block until at least one new allowed message arrives, print it/them as JSON, exit. This is the single primitive that makes heartbeat loops, cron jobs, and harness hooks trivial. Timeout exit should use the "nothing new" exit code, not an error.
-- [ ] Surface `unreadCount`/`lastReadAt` in `cone inbox` JSON output.
+- [x] **`cone messages [--cursor-name <name>] [--peek]`** (2026-07-02): sync, then all new allowed inbound messages since the durable named cursor (`client.pollMessages`; cursors are opaque watermarks in the state DB).
+- [x] **Exit code 3 = nothing new** (0 = new messages, 1 = error) on `messages` and `wait`.
+- [x] **`cone wait [--timeout-ms <ms>]`** (2026-07-02): drains missed mail via the cursor, else blocks on the stream until one new allowed message arrives; control envelopes never wake it.
+- [ ] Surface `unreadCount`/`lastReadAt` in `cone inbox` JSON output. (Rows serialize whole objects, so values appear when set; making them first-class output is still open.)
 
 ### 3. Structured agent-to-agent payloads (expose what core already has)
 
 `client.sendJson` and the `cone.app.json.v1` envelope already exist (`packages/core/src/client.ts:113`, `packages/core/src/envelope.ts:5`) but are not reachable from the CLI and not documented in the skill. This is the substrate for agent↔agent RPC.
 
-- [ ] **`cone send --to <peer> --json '<payload>'`** wired to `client.sendJson`. Mutually exclusive with `--text`.
-- [ ] **Decode envelopes on the read side**: `cone listen`, `cone wait`, `cone messages`, and `cone inbox read` should surface a parsed `json` field alongside `text` when the message is a `cone.app.json.v1` envelope, so consumers never hand-parse the wrapper.
-- [ ] **`replyTo` correlation**: optional `--reply-to <messageId>` on send, carried in the envelope and surfaced on the read side. With this, request/response patterns between agents work over plain async messaging.
-- [ ] **Idempotency key on send**: optional `--idempotency-key <key>`; the client records sent keys in the state DB and short-circuits a duplicate send (returning the original `messageId`). A crashed agent retrying "transfer $5" must not double-send.
-- [ ] Deliberately do **not** spec payload schemas beyond the envelope — agents negotiate their own. Envelope + correlation + idempotency only.
+- [x] **`cone send --to <peer> --data '<json>'`** (2026-07-02; `--data` because `--json` is the global output flag) wired to `client.sendJson`, mutually exclusive with `--text`.
+- [x] **Envelopes decoded on the read side**: `listen`/`wait`/`messages`/`inbox read` all carry the parsed `json` field (the envelope codec landed with protocol hardening).
+- [x] **`--reply-to <messageId>`** correlation, carried in the app-JSON envelope (json sends only).
+- [x] **`--idempotency-key <key>`**: recorded in the state DB (capped ledger); a duplicate send returns the original messageId with `deduplicated: true`.
+- [x] No payload schemas beyond the envelope — agents negotiate their own.
 
 ### 4. Make the happy path real off this machine
 
 - [ ] **Host the rendezvous worker** (it is already a Cloudflare Worker in `apps/rendezvous`) and change the default URL — `defaultRendezvousUrl()` currently falls back to `http://localhost:8787` (`packages/cli/src/paths.ts:25`), so pairing is impossible for anyone following the skill on a clean machine.
-- [ ] **Make the XMTP env choice explicit.** The default is `dev` (`readEnv()` in `packages/cli/src/index.ts`), so agents following the skill silently land on the dev network. Decide the default for published builds (probably `production`), document it in SKILL.md, and make `whoami` output prominent about which env you're on.
-- [ ] **`cone doctor`**: JSON health check an agent runs first when anything fails — secret key present/valid, XMTP network reachable on the configured env, rendezvous reachable, state DB openable/lock status, package version, env summary. Each check `{ name, ok, detail }`.
+- [x] **XMTP env default is `production`** (protocol hardening, 2026-07-02): `dev`/`local` are explicit opt-ins, env is part of the key-derivation salt (separate identities per network), `whoami` prints the env, and `cone config` shows where the value came from.
+- [x] **`cone doctor`** (2026-07-02): secret, state DB, rendezvous (`/v2/exchange` 400 probe), XMTP reachability — each `{ name, ok, detail }`, exit 0 only when all pass.
 - [ ] **Hosted echo bot**: a tiny always-on agent (the `examples/agent` process, hosted anywhere cheap) with a well-known address published in SKILL.md. Skill instructs: send `ping`, expect `pong` — verifies key derivation, network, consent, send, and receive end-to-end before the agent's first real correspondent. Also doubles as the network's "hello world."
-- [ ] **Structured errors**: errors currently print free text to stderr with exit 1 (`runCli` catch block, `packages/cli/src/index.ts:172`). In `--json` mode, emit `{"error": {"code": "...", "message": "..."}}` with stable machine-readable codes (e.g. `NO_SECRET`, `NOT_MESSAGEABLE`, `CONSENT_DENIED`, `PAIR_CODE_EXPIRED`, `NETWORK_UNREACHABLE`). Agents parse errors; free text forces them to guess.
-- [ ] **Document (and test) SQLite concurrency**: agents *will* run `cone listen` in one process and `cone send` in another against the same `CONE_HOME`. Establish whether that's safe today (Bun SQLite + the XMTP node DB), fix or fence what isn't, and state the rules in SKILL.md — including when to use separate `CONE_HOME`s.
+- [x] **Structured errors** (2026-07-02): JSON mode emits `{"error":{code,message}}` on stderr with stable codes (USAGE, NO_SECRET, BAD_SECRET, NOT_MESSAGEABLE, RENDEZVOUS_UNREACHABLE, SELF_PAIRING, TIMEOUT, NOT_A_MEMBER, NOT_FOUND, ERROR).
+- [x] **SQLite concurrency** (2026-07-02): the Cone state DB runs in WAL with a 5s busy timeout (tested: two handles, interleaved writes); SKILL.md states the rules — same `CONE_HOME` listen+send is fine, fleets get one `CONE_HOME` (and one key) per agent. The XMTP node DB is libxmtp-managed; heavy multi-process use of one identity remains their domain.
 
 ### 5. Two more integration surfaces
 
@@ -49,7 +49,7 @@ Most agent harnesses wake → check → respond → sleep; they cannot hold a bl
 
 ### 6. Agent-network thesis
 
-- [ ] **Market the consent boundary as a prompt-injection firewall.** The allowed-only stream means an unknown sender's text can never reach an agent's context — a security property no webhook or shared Slack channel offers, and it's already built. Say this explicitly in README and SKILL.md; it's the differentiator vs. "just use XMTP directly."
+- [x] **Consent boundary marketed as a prompt-injection firewall** (README + SKILL, 2026-07-02): unknown senders' text can never reach an agent's context/tools; the differentiator vs. raw XMTP.
 - [ ] **`cone whoami --card`**: a stable, shareable identity blob (e.g. `xmtp:<inboxId>` plus optional self-described capabilities) that an agent can paste into a README, website, or registry so other agents can initiate contact without a pairing code (landing in Requests, gated by consent as usual). This is the eventual discovery/growth loop; keep v1 minimal.
 - [x] Group chat is done and is the multi-agent room primitive (respond-when-addressed convention + strict group consent keep multi-agent rooms loop-free; see SPEC "Groups → Agents").
 

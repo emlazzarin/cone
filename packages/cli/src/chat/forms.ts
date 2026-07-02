@@ -115,8 +115,8 @@ export function createPairJoinForm(): ContactEditForm {
     activeField: 0,
     fields: [
       { key: 'code', label: 'Handshake code', value: '' },
-      { key: 'shareName', label: 'Offer them a name for you (optional)', value: '' },
-      { key: 'saveAs', label: 'Save their name as (optional)', value: '' },
+      { key: 'shareName', label: 'My display name (offered to them, optional)', value: '' },
+      { key: 'saveAs', label: 'Save peer as (optional)', value: '' },
     ],
     kind: 'pair-join',
     submitLabel: 'Join',
@@ -173,7 +173,7 @@ export function createGroupJoinForm(): ContactEditForm {
     activeField: 0,
     fields: [
       { key: 'code', label: 'Invite code', value: '' },
-      { key: 'shareName', label: 'Offer them a name for you (optional)', value: '' },
+      { key: 'shareName', label: 'My display name (offered to them, optional)', value: '' },
     ],
     kind: 'group-join',
     submitLabel: 'Join',

@@ -135,10 +135,21 @@ export interface ConeStoreMetadata {
   pendingGroupJoins?: PendingGroupJoin[];
   // Async invite links minted by this account, serviced during sync.
   groupInviteLinks?: GroupInviteLink[];
+  // Durable poll cursors, keyed by caller-supplied name (opaque values —
+  // see ConeClient.pollMessages). A crashed agent never loses its place.
+  pollCursors?: Record<string, string>;
+  // Idempotency-key ledger for sends, newest last, capped (IDEMPOTENCY_CAP).
+  // scope = the resolved recipient; a record without messageId is a claim
+  // whose send is in flight (or died mid-flight).
+  idempotencySends?: Array<{ key: string; scope: string; messageId?: string; conversationId?: string; sentAt?: string }>;
 }
 
 export interface StoredMessage {
   messageId: string;
+  // Store-stamped ingestion order (SQLite rowid / memory counter), assigned on
+  // first insert and preserved across updates. Poll cursors ride this — never
+  // sender-supplied sentAt, which can arrive out of order.
+  seq?: number;
   conversationId: string;
   senderInboxId: string;
   recipientInboxId?: string;
@@ -149,6 +160,13 @@ export interface StoredMessage {
 
 export interface ConeMessage {
   messageId: string;
+  // Local ingestion order (see StoredMessage.seq); basis for poll cursors.
+  seq?: number;
+  // The conversation's kind, resolved from the local row at read time.
+  conversationKind?: ConversationKind;
+  // Correlation id the sender attached via sendJson({ replyTo }) — surfaced
+  // first-class so agents never unwrap envelopes by hand.
+  replyTo?: string;
   conversationId: string;
   senderInboxId: string;
   recipientInboxId?: string;
@@ -173,6 +191,19 @@ export interface SentMessage {
   conversationId?: string;
   sentAt: string;
   deliveryStatus?: MessageDeliveryStatus;
+  // True when an idempotency key matched a previous send and no new message
+  // was published — the recorded original is returned instead.
+  deduplicated?: boolean;
+}
+
+export interface SendOptions {
+  // Correlation id for request/response over async messaging: carried in the
+  // app-JSON envelope (json sends only) and surfaced as `replyTo` on reads.
+  replyTo?: string;
+  // A caller-supplied key recorded on send; a retry with the same key returns
+  // the original result instead of publishing again. A crashed agent retrying
+  // "transfer $5" must not double-send.
+  idempotencyKey?: string;
 }
 
 export interface IncomingMessage {
@@ -426,12 +457,20 @@ export interface ConeClient {
   identity(): Promise<ConeIdentity>;
   resolveIdentity(ref: IdentityRef): Promise<ResolvedIdentity>;
   canMessage(ref: IdentityRef): Promise<boolean>;
-  sendText(to: IdentityRef, text: string): Promise<SentMessage>;
-  sendJson(to: IdentityRef, value: unknown): Promise<SentMessage>;
+  sendText(to: IdentityRef, text: string, options?: SendOptions): Promise<SentMessage>;
+  // replyTo correlation rides the app-JSON envelope, so it is json-only.
+  sendJson(to: IdentityRef, value: unknown, options?: SendOptions): Promise<SentMessage>;
   // Send into an existing conversation by id. DMs route through the identity
   // path (same reachability/consent semantics as sendText); groups publish to
   // the group and imply group consent.
   sendToConversation(conversationId: string, text: string): Promise<SentMessage>;
+  // The poll-shaped read model for turn-based agents (wake → check → sleep):
+  // returns inbound, visible messages from allowed conversations that arrived
+  // since the named cursor's last position. Callers sync() first. With
+  // `advance` (the default) the durable cursor moves past what was returned;
+  // `advance: false` peeks. Cursor values are opaque; names are caller-chosen
+  // (e.g. one per agent) and survive crashes in the state store.
+  pollMessages(options?: { cursorName?: string; advance?: boolean }): Promise<{ messages: ConeMessage[]; cursor: string }>;
   sendReadReceipt(to: IdentityRef): Promise<void>;
   // Create a group with the given members (the creator joins automatically and
   // is the super admin). Members are not auto-saved as contacts.

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-import { parseSecretKey, type SecretKey } from '@cone/core';
+import { ConeError, parseSecretKey, type SecretKey } from '@cone/core';
 
 import { defaultConfigPath } from './paths';
 
@@ -38,7 +38,7 @@ export function loadSecretKey(configPath = defaultConfigPath()): SecretKey {
     return parseSecretKey(config.secretKey);
   }
 
-  throw new Error([
+  throw new ConeError('NO_SECRET', [
     'missing secret key',
     'Provide one with CONE_SECRET_KEY, pass --secret-stdin for this command, or save one locally with:',
     '  cone login --secret-stdin --remember',

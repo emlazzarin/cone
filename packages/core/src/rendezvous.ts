@@ -1,3 +1,4 @@
+import { ConeError } from './errors';
 import type { RendezvousClient, RendezvousRole, RendezvousStoredOffer } from './types';
 
 // The one fallback rendezvous URL, shared by every surface (CLI paths, PWA
@@ -45,10 +46,31 @@ export class HttpRendezvousClient implements RendezvousClient {
       // fetch rejects on network-level failures (connection refused, DNS,
       // mixed content) with an unhelpful "failed to fetch" — say where we
       // tried to go and what usually fixes it.
-      throw new Error(
+      throw new ConeError(
+        'RENDEZVOUS_UNREACHABLE',
         `rendezvous service unreachable at ${this.baseUrl} — pairing and group invites need it. ` +
         'Start it with `bun run dev:rendezvous`, or point CONE_RENDEZVOUS_URL at a deployed worker.',
       );
+    }
+  }
+
+  // Health probe: an empty exchange must be rejected with 400 by a live v2
+  // worker — one request proves reachability, protocol version, and
+  // validation at once. The endpoint knowledge stays in this class so a
+  // future /v3 cannot drift apart from what `cone doctor` checks.
+  async probe(timeoutMs = 3_000): Promise<{ ok: boolean; detail: string }> {
+    try {
+      const response = await fetch(this.endpoint(), {
+        body: '{}',
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      return response.status === 400
+        ? { ok: true, detail: `${this.baseUrl} (v2)` }
+        : { ok: false, detail: `${this.baseUrl} answered ${response.status}; expected 400 — wrong service or protocol version?` };
+    } catch {
+      return { ok: false, detail: `${this.baseUrl} unreachable — pairing and group invites need it (bun run dev:rendezvous, or set CONE_RENDEZVOUS_URL)` };
     }
   }
 

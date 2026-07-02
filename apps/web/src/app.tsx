@@ -917,6 +917,12 @@ export function App({ bootstrap }: AppProps = {}) {
       await refresh(session.client);
       setChatScope('chats');
       openConversation(conversation, false);
+      // Naming is the natural next step after accepting an unknown sender —
+      // open the header's name row so it's one keystroke away, not a hunt.
+      if (!saveName?.trim() && conversation.kind !== 'group') {
+        setPeerNameDraft('');
+        setPeerNameOpen(true);
+      }
       note(`Accepted ${peerLabel(conversation)}`);
     }, 'Accepting…');
   }
@@ -2025,11 +2031,11 @@ export function App({ bootstrap }: AppProps = {}) {
                   <button class="primary" type="button" disabled={busy || !pairCode.trim()} onClick={() => void joinCode()}>Join code <kbd>p</kbd></button>
                 </div>
                 <label class="field">
-                  <span>save their name as</span>
+                  <span>save peer as (your local name for them)</span>
                   <input value={pairPeerName} onInput={(event) => setPairPeerName(event.currentTarget.value)} placeholder="Alice, Codex, Agent A…" />
                 </label>
                 <label class="field">
-                  <span>offer them a name for you</span>
+                  <span>my display name (offered to them)</span>
                   <input value={pairShareName} onInput={(event) => setPairShareName(event.currentTarget.value)} placeholder="My laptop, bot1…" />
                 </label>
               </section>
@@ -2063,7 +2069,7 @@ export function App({ bootstrap }: AppProps = {}) {
                   />
                 </label>
                 <label class="field">
-                  <span>offer them a name for you</span>
+                  <span>my display name (offered to them)</span>
                   <input
                     value={groupJoinShareName}
                     onInput={(event) => setGroupJoinShareName(event.currentTarget.value)}

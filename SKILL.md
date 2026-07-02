@@ -94,6 +94,53 @@ Send to an inbox ID, EVM address, or saved contact name:
 cone send --to <identity> --text "hello"
 ```
 
+Send structured JSON instead of text (rides the Cone envelope; other Cone clients surface it as a parsed `json` field, non-Cone XMTP clients see a readable fallback):
+
+```sh
+cone send --to <identity> --data '{"kind":"quote","amount":5}'
+```
+
+Correlate a reply to an earlier message (JSON sends only — the correlation rides the envelope) and make retries safe:
+
+```sh
+cone send --to <identity> --data '{"kind":"ack"}' --reply-to <messageId>
+cone send --to <identity> --data '{"kind":"transfer","usd":5}' --idempotency-key tx-42
+```
+
+A repeated `--idempotency-key` returns the original send (`"deduplicated": true`) instead of publishing again. The honest guarantee is **at-most-once**: keys are claimed before publishing and scoped to the resolved recipient (reusing a key for a different peer is `IDEMPOTENCY_CONFLICT`); if a previous attempt crashed mid-send, the retry gets `IDEMPOTENCY_IN_FLIGHT` rather than a guess. The ledger keeps the most recent 200 keys. Use the inbound message's `messageId` field as the value for `--reply-to`. Do not invent payload schemas beyond this envelope; negotiate shapes with your counterparty.
+
+## Polling (turn-based agents)
+
+Most agent harnesses wake → check → respond → sleep and cannot hold a blocking stream. Use the poll-shaped read model; **exit code 3 means "nothing new"** (0 = new messages in the payload, 1 = error), so shell loops need no JSON parsing:
+
+```sh
+cone messages --cursor-name agent-main        # sync, print new mail since the cursor, advance it
+cone messages --cursor-name agent-main --peek # same, without advancing
+cone wait --cursor-name agent-main --timeout-ms 60000  # drain missed mail, else block until one arrives
+```
+
+Always pass the same `--cursor-name` to both commands — they share the cursor, and mixing names replays mail. A failed network sync is an error (exit 1, code `SYNC_FAILED`), never "nothing new".
+
+Cursors are durable (stored in the state DB under the name you choose), so a crashed agent never loses its place; they ride local ingestion order, so out-of-order network delivery can never skip mail. Both commands return inbound messages from **allowed** senders only, never control traffic — the same boundary as `listen` (whose `--once` timeout also exits 3). Output is NDJSON: every JSON document is one line; commands that report progress (bare `pair`, `group invite`) emit several lines.
+
+The exact shape, shared by `messages`/`wait` (`{"messages": [...], "cursor": "<opaque>"}` on one line) and `listen` (one message object per line):
+
+```json
+{"messageId":"...","conversationId":"...","conversationKind":"dm","senderInboxId":"...","senderName":"Alice","sentAt":"2026-07-02T10:00:00.000Z","kind":"text","direction":"inbound","text":"hello","seq":41}
+```
+
+`text` XOR `json` is set; `json` is the sender's payload itself (the envelope is stripped), with `replyTo` alongside when the sender correlated it; `groupName` appears on group messages; `expiresAt` appears under a disappearing-messages timer.
+
+## Health
+
+```sh
+cone doctor
+```
+
+Runs the checks an agent needs when anything fails — secret key, state DB, rendezvous reachability, XMTP reachability — as `{ name, ok, detail }` entries; exit 0 only when everything passes. In JSON mode (the default), **all errors** from any command are one structured object on stderr: `{"error":{"code":"NO_SECRET","message":"..."}}` with stable codes: `USAGE`, `NO_SECRET`, `BAD_SECRET`, `NOT_MESSAGEABLE`, `RENDEZVOUS_UNREACHABLE`, `RENDEZVOUS_REJECTED`, `SELF_PAIRING`, `TIMEOUT`, `SYNC_FAILED`, `IDEMPOTENCY_CONFLICT`, `IDEMPOTENCY_IN_FLIGHT`, `NOT_A_MEMBER`, `NOT_FOUND`, `NETWORK_UNREACHABLE`, `ERROR`.
+
+Running `cone listen` in one process and `cone send`/`cone messages` in another against the same `CONE_HOME` is supported (the state DB uses WAL). For heavily parallel fleets, give each agent its own `CONE_HOME` — one key per agent anyway, since every process is an XMTP installation and inboxes cap at 10.
+
 Show or set a conversation's disappearing-messages timer (`off`, or a duration with s/m/h/d/w units like `30s`, `1h`, `6d`, `4w`):
 
 ```sh

@@ -16,6 +16,7 @@ export {
   secretKeyFromHexSeed,
 } from './secret';
 export { createConeClient } from './client';
+export { ConeError } from './errors';
 export {
   errorMessage,
   filterMatchSnippet,
@@ -46,6 +47,8 @@ export type { ConeConnectionStatus, ConversationFilterMatch, FilterMatchSnippet 
 export {
   GROUP_UPDATE_TYPE,
   READ_RECEIPT_TYPE,
+  isAppJsonEnvelope,
+  isControlEnvelope,
   isGroupUpdateEnvelope,
 } from './envelope';
 export type { ConeEnvelope } from './envelope';
@@ -119,6 +122,7 @@ export type {
   ResolvedIdentity,
   SaveContactInput,
   SecretKey,
+  SendOptions,
   SentMessage,
   StoredMessage,
   SyncResult,

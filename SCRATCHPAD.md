@@ -7,25 +7,34 @@ hard-won gotchas that will bite again if forgotten.
 
 ## Active — agent readiness batch (agreed with Eddy 2026-07-02)
 
-Groups completed 2026-07-02 (phases 0–4). Next: TODO's **agent readiness**
-batch, in this order:
+Code-side items **done 2026-07-02**: §2 poll read model (`pollMessages`
+durable cursors, `cone messages`/`cone wait`, exit 3 = nothing new), §3
+structured payloads (`send --data` — `--json` is the output flag — with
+`--reply-to` envelope correlation and `--idempotency-key` dedup ledger),
+`cone doctor`, structured JSON errors with stable codes, SQLite WAL +
+concurrency test, consent-firewall wording in README. Earlier the same day
+(protocol hardening): env default `production`, `cone config` provenance,
+envelope content type, protocol freeze + golden vectors.
 
-1. **§4 — make the happy path real off this machine.** Host the rendezvous
-   service and flip `defaultRendezvousUrl()` off localhost; settle the XMTP
-   env default for real use (and make `whoami` loud about it); `cone doctor`
-   (JSON health check: secret, network, rendezvous, state DB); hosted echo
-   bot with a well-known address in SKILL.md — the concierge example *is*
-   that bot. §4 first because it unblocks everything: pairing for strangers,
-   clickable `#join=` links (with PWA hosting), and SKILL.md's "zero →
-   ping-pong in two minutes, unattended" metric.
-2. **§2 — poll-shaped read model** for turn-based agents: `cone wait`,
-   `cone messages --since <cursor>` with durable named cursors, distinct
-   "nothing new" exit code, unread counts in `cone inbox` JSON.
-3. **§1 — distribution**: npm publish (name: `cone` on npm may be taken —
-   decide), compiled binaries, hosted self-contained SKILL.md. Hard blocker:
-   pin an exact known-good XMTP nightly first.
-4. §3 (structured payloads) and §5 (MCP server, `@cone/agent` library) ride
-   behind those.
+**2026-07-02 review pass complete** — 12 reviewers (8 Claude finder angles +
+4 Codex personas), findings + statuses ledgered in REVIEW-2026-07-02.md; all
+correctness/contract/UX items fixed same day (seq-based poll cursors,
+at-most-once idempotency, unwrapped reads, NDJSON, typed ConeError codes,
+NO_COLOR, segment-fitting footer). Deferred to hosting: the **public echo-bot
+consent policy** (a stranger's ping lands in Requests; the bot needs explicit
+policy-gated auto-accept + rate limits + an isolated key — design before
+deploying) and the Bun rendezvous port.
+
+Sequence from here:
+1. **Eddy's code review pass** — done (see above).
+2. **Hosting prep** (single droplet: Caddy static PWA/docs + Bun rendezvous
+   port reusing `applyExchange` + concierge/echo agent under systemd), then
+   flip `DEFAULT_RENDEZVOUS_URL`, publish the echo bot address in SKILL.
+3. **§1 distribution** (npm name, compiled binaries, hosted self-contained
+   SKILL; hard blocker: pin an exact XMTP nightly) and §5 (MCP server,
+   `@cone/agent` library) after hosting.
+4. Small leftover: first-class `unreadCount`/`lastReadAt` in `cone inbox`
+   JSON output.
 
 ## Deferred, with reasoning
 

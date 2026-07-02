@@ -218,6 +218,144 @@ describe('CLI', () => {
     expect(client.unsubscribed).toBe(true);
   });
 
+  test('send --json rides sendJson with replyTo and idempotency options', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+
+    expect(await runCli(
+      ['send', '--secret-stdin', '--to', 'Alice', '--data', '{"kind":"quote","amount":5}', '--reply-to', 'msg-1', '--idempotency-key', 'tx-9'],
+      io,
+      { createClient: async () => client },
+    )).toBe(0);
+
+    expect(client.jsonSends).toEqual([{ to: 'Alice', value: { kind: 'quote', amount: 5 }, replyTo: 'msg-1', idempotencyKey: 'tx-9' }]);
+    expect(client.sent).toEqual([]);
+  });
+
+  test('send rejects text+json together, bad JSON, and reply-to without json', async () => {
+    const client = new MockClient();
+
+    const both = makeIo(generateSecretKey());
+    expect(await runCli(['send', '--secret-stdin', '--to', 'Alice', '--text', 'hi', '--data', '{}'], both, { createClient: async () => client })).toBe(1);
+    expect(JSON.parse(both.err.join('')).error.code).toBe('USAGE');
+
+    const badJson = makeIo(generateSecretKey());
+    expect(await runCli(['send', '--secret-stdin', '--to', 'Alice', '--data', '{nope'], badJson, { createClient: async () => client })).toBe(1);
+    expect(JSON.parse(badJson.err.join('')).error.code).toBe('USAGE');
+
+    const replyText = makeIo(generateSecretKey());
+    expect(await runCli(['send', '--secret-stdin', '--to', 'Alice', '--text', 'hi', '--reply-to', 'msg-1'], replyText, { createClient: async () => client })).toBe(1);
+    expect(JSON.parse(replyText.err.join('')).error.code).toBe('USAGE');
+  });
+
+  test('messages syncs, prints new mail with a cursor, and exit-codes nothing-new', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.pollResult = {
+      messages: [{
+        conversationId: 'dm-cli', direction: 'inbound', kind: 'text', messageId: 'poll-1',
+        senderInboxId: 'inbox-alice', sentAt: '2026-01-01T10:00:00.000Z', text: 'while you slept',
+      }],
+      cursor: 'cursor-2',
+    };
+
+    expect(await runCli(['messages', '--secret-stdin', '--cursor-name', 'agent-main'], io, { createClient: async () => client })).toBe(0);
+    expect(client.synced).toBe(true);
+    expect(client.pollRequests).toEqual([{ cursorName: 'agent-main', advance: true }]);
+    const output = JSON.parse(io.out.join('')) as { cursor: string; messages: Array<{ messageId: string }> };
+    expect(output.cursor).toBe('cursor-2');
+    expect(output.messages[0]?.messageId).toBe('poll-1');
+
+    const empty = makeIo(generateSecretKey());
+    const quietClient = new MockClient();
+    expect(await runCli(['messages', '--secret-stdin', '--peek'], empty, { createClient: async () => quietClient })).toBe(3);
+    expect(quietClient.pollRequests).toEqual([{ cursorName: undefined, advance: false }]);
+  });
+
+  test('a failed sync is an error, never \'nothing new\'', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.failSync = true;
+
+    expect(await runCli(['messages', '--secret-stdin'], io, { createClient: async () => client })).toBe(1);
+    expect(JSON.parse(io.err.join('')).error.code).toBe('SYNC_FAILED');
+  });
+
+  test('a garbage --timeout-ms fails fast as USAGE instead of hanging', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+
+    expect(await runCli(['wait', '--secret-stdin', '--timeout-ms', 'nope'], io, { createClient: async () => client })).toBe(1);
+    expect(JSON.parse(io.err.join('')).error.code).toBe('USAGE');
+  });
+
+  test('listen --once timeout is nothing-new (exit 3), matching messages/wait', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+
+    expect(await runCli(['listen', '--secret-stdin', '--once', '--timeout-ms', '60'], io, { createClient: async () => client })).toBe(3);
+    expect(JSON.parse(io.out.join('')).timedOut).toBe(true);
+  });
+
+  test('wait drains missed messages without blocking when the poll has mail', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.pollResult = {
+      messages: [{
+        conversationId: 'dm-cli', direction: 'inbound', kind: 'text', messageId: 'missed-1',
+        senderInboxId: 'inbox-alice', sentAt: '2026-01-01T10:00:00.000Z', text: 'missed while asleep',
+      }],
+      cursor: 'cursor-3',
+    };
+
+    expect(await runCli(['wait', '--secret-stdin', '--timeout-ms', '5000'], io, { createClient: async () => client })).toBe(0);
+    expect(client.synced).toBe(true);
+    expect(io.out.join('')).toContain('missed-1');
+  });
+
+  test('wait times out with the nothing-new exit code', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+
+    expect(await runCli(['wait', '--secret-stdin', '--timeout-ms', '60'], io, { createClient: async () => client })).toBe(3);
+    expect(client.unsubscribed).toBe(true);
+    expect(JSON.parse(io.out.join('')).timedOut).toBe(true);
+  });
+
+  test('doctor reports structured checks and fails without a secret', async () => {
+    const previous = {
+      home: process.env.CONE_HOME,
+      secret: process.env.CONE_SECRET_KEY,
+      rendezvous: process.env.CONE_RENDEZVOUS_URL,
+    };
+    process.env.CONE_HOME = `/tmp/cone-doctor-${Date.now()}`;
+    process.env.CONE_RENDEZVOUS_URL = 'http://127.0.0.1:1'; // nothing listens here
+    delete process.env.CONE_SECRET_KEY;
+    try {
+      const io = makeIo();
+      expect(await runCli(['doctor'], io)).toBe(1);
+      const report = JSON.parse(io.out.join('')) as { ok: boolean; checks: Array<{ name: string; ok: boolean }> };
+      expect(report.ok).toBe(false);
+      const byName = Object.fromEntries(report.checks.map((check) => [check.name, check.ok]));
+      expect(byName.secret).toBe(false);
+      expect(byName['state-db']).toBe(true);
+      expect(byName.rendezvous).toBe(false);
+      expect(byName.xmtp).toBe(false);
+    } finally {
+      for (const [key, value] of [
+        ['CONE_HOME', previous.home],
+        ['CONE_SECRET_KEY', previous.secret],
+        ['CONE_RENDEZVOUS_URL', previous.rendezvous],
+      ] as const) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  });
+
   test('listen defaults to explicit-accept for group adds; the flag opts in', async () => {
     const strictIo = makeIo(generateSecretKey());
     const strictClient = new MockClient();
@@ -658,7 +796,10 @@ class MockClient implements ConeClient {
     return Promise.resolve({ messageId: 'msg-cli', sentAt: new Date().toISOString() });
   }
 
-  sendJson(): Promise<SentMessage> {
+  jsonSends: Array<{ to: string; value: unknown; replyTo?: string; idempotencyKey?: string }> = [];
+
+  sendJson(to: unknown, value: unknown, options?: { replyTo?: string; idempotencyKey?: string }): Promise<SentMessage> {
+    this.jsonSends.push({ to: String(to), value, replyTo: options?.replyTo, idempotencyKey: options?.idempotencyKey });
     return Promise.resolve({ messageId: 'msg-json', sentAt: new Date().toISOString() });
   }
 
@@ -764,8 +905,20 @@ class MockClient implements ConeClient {
     return Promise.resolve(0);
   }
 
+  failSync = false;
+
   sync(): Promise<SyncResult> {
     this.synced = true;
+    if (this.failSync) {
+      return Promise.resolve({
+        completedAt: new Date().toISOString(),
+        conversationsSynced: 0,
+        errors: ['xmtp unreachable'],
+        messagesSynced: 0,
+        ok: false,
+        startedAt: new Date().toISOString(),
+      });
+    }
     return Promise.resolve({
       completedAt: new Date().toISOString(),
       conversationsSynced: this.conversations.length,
@@ -855,6 +1008,14 @@ class MockClient implements ConeClient {
 
   listPendingGroupJoins() {
     return Promise.resolve([]);
+  }
+
+  pollRequests: Array<{ cursorName?: string; advance?: boolean }> = [];
+  pollResult: { messages: ConeMessage[]; cursor: string } = { messages: [], cursor: 'cursor-1' };
+
+  pollMessages(options?: { cursorName?: string; advance?: boolean }) {
+    this.pollRequests.push({ cursorName: options?.cursorName, advance: options?.advance });
+    return Promise.resolve(this.pollResult);
   }
 
   cancelGroupJoin(_conversationId: string) {

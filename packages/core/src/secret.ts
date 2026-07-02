@@ -9,6 +9,7 @@ import {
   hexToBytes,
   utf8ToBytes,
 } from './encoding';
+import { ConeError } from './errors';
 import type { DerivedAccount, SecretKey, XmtpEnv } from './types';
 
 const SECRET_PREFIX = 'cone_sk_v1_';
@@ -68,12 +69,12 @@ export function decodeSecretSeed(secret: SecretKey | string): Uint8Array {
     if (secret.startsWith(SECRET_FAMILY_PREFIX)) {
       throw new Error('this SECRET KEY was created by a newer version of Cone — update Cone to use it');
     }
-    throw new Error('invalid secret key prefix');
+    throw new ConeError('BAD_SECRET', 'invalid secret key prefix');
   }
 
   const payload = base64UrlDecode(secret.slice(SECRET_PREFIX.length));
   if (payload.length !== PAYLOAD_LENGTH) {
-    throw new Error('invalid secret key length');
+    throw new ConeError('BAD_SECRET', 'invalid secret key length');
   }
 
   const version = payload[0];
@@ -84,7 +85,7 @@ export function decodeSecretSeed(secret: SecretKey | string): Uint8Array {
   const body = payload.slice(0, 1 + SEED_LENGTH);
   const checksum = payload.slice(1 + SEED_LENGTH);
   if (!constantTimeEqual(checksum, checksumBytes(body))) {
-    throw new Error('invalid secret key checksum');
+    throw new ConeError('BAD_SECRET', 'invalid secret key checksum');
   }
 
   return payload.slice(1, 1 + SEED_LENGTH);

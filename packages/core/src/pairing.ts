@@ -1,3 +1,4 @@
+import { ConeError } from './errors';
 import { codeScopedKey, decryptJson, encryptJson, normalizeHandshakeCode, randomHandshakeCode, randomId, sha256Hex } from './crypto';
 import type { ConeIdentity, HandshakeCode, PairingOffer, RendezvousStoredOffer } from './types';
 
@@ -101,7 +102,8 @@ export async function decryptPeerOffer(
     // The other participant is this same account from another app. Waiting
     // longer can never succeed — fail fast instead of timing out silently.
     if (peer.inboxId === input.identity.inboxId) {
-      throw new Error(
+      throw new ConeError(
+        'SELF_PAIRING',
         'the other side of this code is this same account — pairing connects two different accounts. ' +
         'Two apps unlocked with the same SECRET KEY already share an identity (and their conversations sync); there is nothing to pair.',
       );

@@ -31,19 +31,18 @@ bun run setup
 
 That installs workspace dependencies and links a global `cone` binary (`bun link` → `~/.bun/bin/cone`). There is no build step for the CLI — Bun runs the TypeScript directly.
 
-First run:
+First run (two terminals — pairing and group invites go through the rendezvous service, and nothing is deployed yet):
 
 ```sh
-cone keygen              # prints a SECRET KEY — save it; it IS your account
-cone login --remember    # paste the key once
-cone chat                # open the TUI
-cone pair                # mint a code and wait; the other account enters it (PWA "Join code" or `cone pair <code>`)
+bun run dev:rendezvous   # terminal 1: serves http://localhost:8787, the default CONE_RENDEZVOUS_URL
 ```
 
-Pairing and group invites go through the rendezvous service. Nothing is deployed yet, so for local use run it in another terminal:
-
 ```sh
-bun run dev:rendezvous   # serves http://localhost:8787, the default CONE_RENDEZVOUS_URL
+cone keygen              # terminal 2: prints a SECRET KEY — save it; it IS your account
+cone login --remember    # paste the key once
+cone doctor --plain      # verify secret, state DB, rendezvous, and XMTP reachability
+cone chat                # open the TUI
+cone pair                # mint a code and wait; the other account enters it (PWA "Join code" or `cone pair <code>`)
 ```
 
 Plain messaging (`cone send`, `cone listen`, `cone chat`) talks to XMTP directly and needs no rendezvous.
@@ -66,6 +65,8 @@ The PWA shares the CLI chat vocabulary and keys without copying its modality: th
 Sending is fully optimistic on both surfaces: the message appears in the transcript the instant you press `Enter` and the composer clears. A successful send is silent — XMTP has no per-recipient "delivered" ack, so the meaningful signal is whether a message published to the network. Only a send that fails to publish is marked (`✗` "not delivered", in red), offering **retry or delete** (PWA: buttons; TUI: `Enter` retries, `Ctrl+X` deletes). The local read model is kept to published messages, so a failed send never later masquerades as delivered. Identities are labeled "XMTP inbox ID" where the distinction matters. Handshake codes expire after ten minutes, but the pairing they establish is permanent.
 
 Unknown senders never land in your main inbox: they wait in a **Requests** sub-surface of Chats (see [Consent and Requests](#consent-and-requests)) until you accept or block them, and agents ignore them by default.
+
+For agents, this consent boundary is a **prompt-injection firewall**: an unknown sender's text can never reach an agent's context, tools, or response generation — `cone listen`, `cone wait`, and `cone messages` all deliver allowed senders only, and accepting a request is the explicit human-or-policy gate before any of that runs. No webhook, shared inbox, or public Slack channel offers this property; it is the difference between Cone and "just use XMTP directly."
 
 Group chats follow the same trust model. A group a **contact** adds you to lands straight in Chats ("allow contacts to add you to groups", on by default — `groupAutoAllow` in CLI config); a group a stranger adds you to is a Request; a group a **blocked** sender adds you to is silently discarded. Your block list follows you into groups: a denied sender's messages are dropped even inside groups you've accepted. Agents never auto-accept groups — explicit `cone requests accept` is the boundary. Joining a group never shows pre-join history (MLS forward secrecy), and invites never auto-create contacts.
 
