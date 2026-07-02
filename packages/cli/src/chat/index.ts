@@ -25,7 +25,7 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
     return;
   }
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error('cos chat requires an interactive TTY; use cos chat --plain-log for non-interactive output');
+    throw new Error('cone chat requires an interactive TTY; use cone chat --plain-log for non-interactive output');
   }
 
   const state = createChatState(await client.identity(), await client.listConversations(), await client.listContacts());
@@ -225,7 +225,7 @@ export async function runChat(client: ConeClient, options: ChatOptions = {}): Pr
 
 async function runPlainLog(client: ConeClient, options: ChatOptions): Promise<void> {
   const identity = await client.identity();
-  process.stdout.write(`cos chat ${shortId(identity.inboxId)} ${identity.env}\n`);
+  process.stdout.write(`cone chat ${shortId(identity.inboxId)} ${identity.env}\n`);
   if (options.syncOnOpen !== false) {
     const result = await client.sync();
     process.stdout.write(`${formatSyncStatus(result)}\n`);

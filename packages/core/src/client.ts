@@ -1,5 +1,15 @@
 import { bytesToUtf8, utf8ToBytes } from './encoding';
-import { decryptBytes, decryptJson, encryptBytes, encryptJson, normalizeHandshakeCode, randomId } from './crypto';
+import {
+  decryptBytes,
+  decryptJson,
+  encryptBytes,
+  encryptJson,
+  generateGroupInviteToken,
+  isGroupInviteToken,
+  normalizeHandshakeCode,
+  randomId,
+  secretRoomId,
+} from './crypto';
 import { laterIso } from './display';
 import {
   APP_JSON_TYPE,
@@ -10,6 +20,19 @@ import {
   isControlEnvelope,
 } from './envelope';
 import { PAIRING_TTL_MS, createEncryptedPairingOffer, createHandshakeCode as createCode, decryptPeerOffer } from './pairing';
+import {
+  GROUP_INVITE_LINK_MAX_USES,
+  GROUP_INVITE_LINK_TTL_MS,
+  GROUP_INVITE_TTL_MS,
+  PENDING_GROUP_JOIN_TTL_MS,
+  createEncryptedGroupDescriptor,
+  createEncryptedJoinRequest,
+  decryptGroupDescriptor,
+  decryptJoinRequest,
+  decryptJoinRequests,
+  type GroupInviteDescriptor,
+  type GroupJoinRequest,
+} from './invites';
 import { isExpiredMessage, messageExpiresAt } from './retention';
 import type {
   ConeClient,
@@ -22,7 +45,12 @@ import type {
   Contact,
   CreateConeClientOptions,
   CreateGroupInput,
+  GroupInviteLink,
+  GroupInviteResult,
+  GroupJoinResult,
+  GroupMemberLevel,
   IdentityRef,
+  PendingGroupJoin,
   IncomingMessage,
   PairingOffer,
   PairingResult,
@@ -37,7 +65,7 @@ import { assertValidContactInput, isLikelyInboxId, normalizeContactName, normali
 
 export async function createConeClient(options: CreateConeClientOptions): Promise<ConeClient> {
   const client = new ConeClientImpl(options);
-  await client.ensureSelfContact();
+  await client.removeSelfArtifacts();
   return client;
 }
 
@@ -130,6 +158,9 @@ class ConeClientImpl implements ConeClient {
       }
       return this.sendText({ inboxId: conversation.peerInboxId }, text);
     }
+    if (conversation.active === false) {
+      throw new Error('you are no longer a member of this group');
+    }
     if (text.trim().length === 0) {
       throw new Error('message text is required');
     }
@@ -178,6 +209,12 @@ class ConeClientImpl implements ConeClient {
 
   async addGroupMembers(conversationId: string, members: IdentityRef[]): Promise<void> {
     const resolved = await Promise.all(members.map((member) => this.resolveIdentity(member)));
+    // Reachability gate: fail with a clear error before mutating membership.
+    for (const member of resolved) {
+      if (!(await this.options.xmtp.canMessage(member))) {
+        throw new Error(`not reachable on XMTP: ${member.displayName ?? member.inboxId}`);
+      }
+    }
     await this.options.xmtp.addGroupMembers(conversationId, [...new Set(resolved.map((member) => member.inboxId))]);
     await this.refreshGroupMembers(conversationId);
   }
@@ -190,6 +227,76 @@ class ConeClientImpl implements ConeClient {
 
   async leaveGroup(conversationId: string): Promise<void> {
     await this.options.xmtp.leaveGroup(conversationId);
+    // Mark the row inactive immediately; the network state reconciles on sync.
+    // The row (and its history) is kept — leaving is not deleting.
+    const conversation = await this.options.store.getConversationById(conversationId);
+    if (conversation) {
+      await this.options.store.putConversation({ ...conversation, active: false });
+    }
+  }
+
+  // Rename the group. Mirror-first like consent: the local row updates
+  // immediately, the network metadata write is best-effort, sync reconciles.
+  // Group names are shared state — every member sees the change.
+  async renameGroup(conversationId: string, name: string): Promise<void> {
+    const trimmed = name.trim();
+    if (trimmed.length === 0) {
+      throw new Error('group name is required');
+    }
+    const conversation = await this.requireGroup(conversationId);
+    await this.options.store.putConversation({ ...conversation, groupName: trimmed, title: trimmed });
+    try {
+      await this.options.xmtp.updateGroupName(conversationId, trimmed);
+    } catch {
+      // Best-effort like consent; local-only until a later write or sync.
+    }
+  }
+
+  async setGroupDescription(conversationId: string, description: string): Promise<void> {
+    const conversation = await this.requireGroup(conversationId);
+    const trimmed = description.trim();
+    await this.options.store.putConversation({ ...conversation, groupDescription: trimmed || undefined });
+    try {
+      await this.options.xmtp.updateGroupDescription(conversationId, trimmed);
+    } catch {
+      // Best-effort like consent; local-only until a later write or sync.
+    }
+  }
+
+  // Set a member's role by diffing their current level against the target and
+  // adjusting XMTP's separate admin/super-admin lists. Promoting someone else
+  // to superAdmin is the transfer-ownership move (additive; XMTP forbids the
+  // last super admin leaving, so promote first, then demote/leave).
+  async setGroupMemberLevel(conversationId: string, member: IdentityRef, level: GroupMemberLevel): Promise<void> {
+    await this.requireGroup(conversationId);
+    const resolved = await this.resolveIdentity(member);
+    const members = await this.options.xmtp.listGroupMembers(conversationId);
+    const current = members.find((candidate) => candidate.inboxId === resolved.inboxId)?.level;
+    if (!current) {
+      throw new Error(`not a group member: ${resolved.inboxId}`);
+    }
+    if (current === level) {
+      return;
+    }
+    if (level === 'superAdmin') {
+      await this.options.xmtp.addGroupSuperAdmin(conversationId, resolved.inboxId);
+    } else if (current === 'superAdmin') {
+      await this.options.xmtp.removeGroupSuperAdmin(conversationId, resolved.inboxId);
+    }
+    if (level === 'admin') {
+      await this.options.xmtp.addGroupAdmin(conversationId, resolved.inboxId);
+    } else if (current === 'admin') {
+      await this.options.xmtp.removeGroupAdmin(conversationId, resolved.inboxId);
+    }
+    await this.refreshGroupMembers(conversationId);
+  }
+
+  private async requireGroup(conversationId: string): Promise<ConeConversation> {
+    const conversation = await this.options.store.getConversationById(conversationId);
+    if (!conversation || conversation.kind !== 'group') {
+      throw new Error(`group not found: ${conversationId}`);
+    }
+    return conversation;
   }
 
   private async refreshGroupMembers(conversationId: string): Promise<void> {
@@ -206,7 +313,7 @@ class ConeClientImpl implements ConeClient {
     }
   }
 
-  // Best-effort read receipt: a `cos.read.v1` control message sent into the
+  // Best-effort read receipt: a `cone.read.v1` control message sent into the
   // conversation. Never throws and is not persisted locally — we only need the
   // peer's receipts (which arrive over the stream) to show "Read" on our own
   // messages.
@@ -267,8 +374,16 @@ class ConeClientImpl implements ConeClient {
           messagesSynced += 1;
         }
       }
+      await this.collapseDuplicateDms(result.conversations);
       // The retention mirrors are freshly reconciled; drop expired messages.
       await this.purgeExpiredMessages();
+      // Admit joiners waiting on this account's invite links. Best-effort:
+      // rendezvous trouble never fails a sync; servicing retries next pass.
+      try {
+        await this.serviceGroupInviteLinks();
+      } catch {
+        // Ignored; retried on the next sync.
+      }
     } catch (error) {
       errors.push(error instanceof Error ? error.message : String(error));
     }
@@ -288,23 +403,53 @@ class ConeClientImpl implements ConeClient {
     };
   }
 
+  // XMTP can hold several MLS DMs for one peer pair (both sides initiated a
+  // conversation). The adapter lists only the canonical one, but duplicate
+  // rows persisted earlier — or created mid-session by a streamed message in
+  // a duplicate DM — linger locally. Fold their history into the canonical
+  // thread on every sync so one peer is always exactly one thread.
+  private async collapseDuplicateDms(networkConversations: ConeConversation[]): Promise<void> {
+    const canonicalByPeer = new Map<string, string>();
+    for (const conversation of networkConversations) {
+      if (conversation.kind === 'dm' && conversation.peerInboxId) {
+        canonicalByPeer.set(conversation.peerInboxId, conversation.conversationId);
+      }
+    }
+
+    for (const row of await this.options.store.listConversations()) {
+      if (row.kind !== 'dm' || !row.peerInboxId) {
+        continue;
+      }
+      const canonical = canonicalByPeer.get(row.peerInboxId);
+      if (!canonical || canonical === row.conversationId) {
+        continue;
+      }
+      for (const message of await this.options.store.listMessages(row.conversationId)) {
+        await this.options.store.putMessage({ ...message, conversationId: canonical });
+      }
+      await this.options.store.deleteConversation(row.conversationId);
+    }
+  }
+
   async listConversations(): Promise<ConeConversation[]> {
-    const [conversations, contacts] = await Promise.all([
+    const [conversations, contacts, identity] = await Promise.all([
       this.options.store.listConversations(),
       this.options.store.listContacts(),
+      this.identity(),
     ]);
     const contactsByInbox = new Map(contacts.map((contact) => [contact.inboxId, contact]));
 
-    return conversations.map((conversation) => {
-      // Rows stored before groups existed lack `kind`; they are all DMs.
-      const kind = conversation.kind ?? 'dm';
-      if (kind === 'group') {
-        return { ...conversation, kind, title: conversation.groupName ?? conversation.title };
+    return conversations
+      // Self-DMs are hidden: Cone has no notes-to-self surface yet, and XMTP
+      // models messaging your own inbox awkwardly (duplicate threads).
+      .filter((conversation) => !(conversation.kind === 'dm' && conversation.peerInboxId === identity.inboxId))
+      .map((conversation) => {
+      if (conversation.kind === 'group') {
+        return { ...conversation, title: conversation.groupName ?? conversation.title };
       }
       const contact = conversation.peerInboxId ? contactsByInbox.get(conversation.peerInboxId) : undefined;
       return {
         ...conversation,
-        kind,
         contactId: contact?.contactId ?? conversation.contactId,
         title: contact?.name ?? conversation.title,
       };
@@ -480,7 +625,20 @@ class ConeClientImpl implements ConeClient {
   //   - anyone else                     -> stays unknown, i.e. a Request
   // Idempotent: it re-applies on every sync until a decision propagates.
   private async applyGroupAddPolicy(conversation: ConeConversation): Promise<ConeConversation> {
-    if (conversation.kind !== 'group' || conversation.consentState !== 'unknown' || !conversation.addedByInboxId) {
+    if (conversation.kind !== 'group' || conversation.consentState !== 'unknown') {
+      return conversation;
+    }
+    // A welcome for a group this account asked to join via an invite code:
+    // requesting to join is implied consent, so it skips Requests entirely.
+    const pending = await this.pendingGroupJoins();
+    if (pending.some((join) => join.conversationId === conversation.conversationId)) {
+      await this.options.store.putMetadata({
+        pendingGroupJoins: pending.filter((join) => join.conversationId !== conversation.conversationId),
+      });
+      await this.setGroupConsentSafe(conversation.conversationId, 'allowed');
+      return { ...conversation, consentState: 'allowed' };
+    }
+    if (!conversation.addedByInboxId) {
       return conversation;
     }
     const addedBy = conversation.addedByInboxId;
@@ -573,7 +731,8 @@ class ConeClientImpl implements ConeClient {
 
     while (this.now().getTime() < deadline) {
       const offers = await this.options.rendezvous.exchangeOffer({
-        code: normalizedCode,
+        roomId: secretRoomId(normalizedCode),
+        role: 'pair',
         encryptedOffer: localOffer.encryptedOffer,
         expiresAt: new Date(this.now().getTime() + PAIRING_TTL_MS).toISOString(),
         participantId: localOffer.participantId,
@@ -622,6 +781,314 @@ class ConeClientImpl implements ConeClient {
     };
   }
 
+  // Synchronous group invite, inviter side. Same room mechanics as pairing —
+  // both participants post encrypted payloads under the code — but asymmetric:
+  // we post the group descriptor and wait for a join request, then add the
+  // joiner directly. Auto-add is correct here: the code was created seconds
+  // ago and handed over person-to-person, so intent is unambiguous. The joiner
+  // is never auto-saved as a contact; their proposedName is a UI suggestion.
+  async inviteToGroupWithCode(code: string, conversationId: string, options: { timeoutMs?: number } = {}): Promise<GroupInviteResult> {
+    if (!this.options.rendezvous) {
+      throw new Error('rendezvous client is required for group invite codes');
+    }
+    const conversation = await this.requireGroup(conversationId);
+    if (conversation.active === false) {
+      throw new Error('cannot invite: no longer a member of this group');
+    }
+    const normalizedCode = normalizeHandshakeCode(code);
+    const identity = await this.identity();
+    const deadline = this.now().getTime() + (options.timeoutMs ?? 60_000);
+    const local = await createEncryptedGroupDescriptor({
+      code: normalizedCode,
+      identity,
+      conversation,
+      now: this.now(),
+    });
+
+    let request: GroupJoinRequest | null = null;
+    while (this.now().getTime() < deadline) {
+      const offers = await this.options.rendezvous.exchangeOffer({
+        roomId: secretRoomId(normalizedCode),
+        role: 'descriptor',
+        encryptedOffer: local.encrypted,
+        expiresAt: new Date(this.now().getTime() + GROUP_INVITE_TTL_MS).toISOString(),
+        participantId: local.participantId,
+      });
+      request = await decryptJoinRequest(offers, {
+        code: normalizedCode,
+        identity,
+        participantId: local.participantId,
+      });
+      if (request) {
+        break;
+      }
+      await sleep(500);
+    }
+
+    if (!request) {
+      throw new Error('group invite timed out');
+    }
+
+    await this.addGroupMembers(conversationId, [{ inboxId: request.inboxId }]);
+    return {
+      conversationId,
+      joiner: { inboxId: request.inboxId, address: request.address, proposedName: request.proposedName },
+    };
+  }
+
+  // Joiner side: post a join request and wait for the inviter's descriptor.
+  // The membership change itself arrives later as an XMTP welcome; recording
+  // the join as pending is what lets the welcome auto-allow (requesting to
+  // join is implied consent) instead of landing in Requests. Accepts a spoken
+  // handshake code (case-insensitive) or a pasted invite-link token; a token's
+  // join offer outlives the session so the minter's next sync can admit it.
+  async joinGroupWithCode(code: string, options: { proposedName?: string; timeoutMs?: number } = {}): Promise<GroupJoinResult> {
+    if (!this.options.rendezvous) {
+      throw new Error('rendezvous client is required for group invite codes');
+    }
+    const isToken = isGroupInviteToken(code);
+    const normalizedCode = isToken ? code.trim() : normalizeHandshakeCode(code);
+    const identity = await this.identity();
+    const deadline = this.now().getTime() + (options.timeoutMs ?? 60_000);
+    const local = await createEncryptedJoinRequest({
+      code: normalizedCode,
+      identity,
+      proposedName: options.proposedName,
+      now: this.now(),
+    });
+
+    let descriptor: GroupInviteDescriptor | null = null;
+    while (this.now().getTime() < deadline) {
+      const offers = await this.options.rendezvous.exchangeOffer({
+        roomId: secretRoomId(normalizedCode),
+        role: 'join',
+        encryptedOffer: local.encrypted,
+        expiresAt: new Date(this.now().getTime() + (isToken ? PENDING_GROUP_JOIN_TTL_MS : GROUP_INVITE_TTL_MS)).toISOString(),
+        participantId: local.participantId,
+      });
+      descriptor = await decryptGroupDescriptor(offers, {
+        code: normalizedCode,
+        identity,
+        participantId: local.participantId,
+      });
+      if (descriptor) {
+        break;
+      }
+      await sleep(500);
+    }
+
+    if (!descriptor) {
+      throw new Error('group join timed out');
+    }
+
+    const pending = await this.pendingGroupJoins();
+    const entry: PendingGroupJoin = {
+      conversationId: descriptor.conversationId,
+      inviterInboxId: descriptor.inviterInboxId,
+      groupName: descriptor.groupName,
+      requestedAt: this.nowIso(),
+      expiresAt: new Date(this.now().getTime() + PENDING_GROUP_JOIN_TTL_MS).toISOString(),
+    };
+    await this.options.store.putMetadata({
+      pendingGroupJoins: [...pending.filter((join) => join.conversationId !== entry.conversationId), entry],
+    });
+
+    return {
+      conversationId: descriptor.conversationId,
+      groupName: descriptor.groupName,
+      memberCount: descriptor.memberCount,
+      inviter: { inboxId: descriptor.inviterInboxId, address: descriptor.inviterAddress },
+    };
+  }
+
+  async listPendingGroupJoins(): Promise<PendingGroupJoin[]> {
+    return this.pendingGroupJoins();
+  }
+
+  async cancelGroupJoin(conversationId: string): Promise<void> {
+    const pending = await this.pendingGroupJoins();
+    await this.options.store.putMetadata({
+      pendingGroupJoins: pending.filter((join) => join.conversationId !== conversationId),
+    });
+  }
+
+  // Expired entries are filtered on read: a welcome that arrives after the
+  // pending window falls through to the normal group-add policy (a Request).
+  private async pendingGroupJoins(): Promise<PendingGroupJoin[]> {
+    const now = this.now().getTime();
+    return ((await this.options.store.getMetadata()).pendingGroupJoins ?? []).filter(
+      (join) => Date.parse(join.expiresAt) > now,
+    );
+  }
+
+  // Mint an async invite link: post the group descriptor into the token's
+  // room with a long TTL. The token is a capability — holding it is admission
+  // — so links default to a single use. Only this client services the link;
+  // no group member (and no agent) is assumed present or online.
+  async createGroupInviteLink(conversationId: string, options: { ttlMs?: number; maxUses?: number } = {}): Promise<GroupInviteLink> {
+    if (!this.options.rendezvous) {
+      throw new Error('rendezvous client is required for group invite links');
+    }
+    const conversation = await this.requireGroup(conversationId);
+    if (conversation.active === false) {
+      throw new Error('cannot invite: no longer a member of this group');
+    }
+    const identity = await this.identity();
+    const token = generateGroupInviteToken();
+    const expiresAt = new Date(this.now().getTime() + (options.ttlMs ?? GROUP_INVITE_LINK_TTL_MS)).toISOString();
+    const descriptor = await createEncryptedGroupDescriptor({
+      code: token,
+      identity,
+      conversation,
+      now: this.now(),
+    });
+    await this.options.rendezvous.exchangeOffer({
+      roomId: secretRoomId(token),
+      role: 'descriptor',
+      encryptedOffer: descriptor.encrypted,
+      expiresAt,
+      participantId: descriptor.participantId,
+    });
+
+    const link: GroupInviteLink = {
+      linkId: randomId('link'),
+      conversationId,
+      token,
+      nonce: descriptor.descriptor.nonce,
+      createdAt: this.nowIso(),
+      expiresAt,
+      maxUses: options.maxUses ?? GROUP_INVITE_LINK_MAX_USES,
+      uses: 0,
+      servicedParticipantIds: [],
+    };
+    await this.options.store.putMetadata({ groupInviteLinks: [...(await this.groupInviteLinks()), link] });
+    return link;
+  }
+
+  async listGroupInviteLinks(conversationId?: string): Promise<GroupInviteLink[]> {
+    const links = await this.groupInviteLinks();
+    return conversationId ? links.filter((link) => link.conversationId === conversationId) : links;
+  }
+
+  async revokeGroupInviteLink(linkId: string): Promise<void> {
+    const links = await this.groupInviteLinks();
+    const link = links.find((candidate) => candidate.linkId === linkId);
+    await this.options.store.putMetadata({ groupInviteLinks: links.filter((candidate) => candidate.linkId !== linkId) });
+    if (link && this.options.rendezvous) {
+      try {
+        await this.options.rendezvous.deleteRoom(secretRoomId(link.token));
+      } catch {
+        // Best-effort: without the room the link still dies locally, and the
+        // descriptor expires from the room on its own TTL.
+      }
+    }
+  }
+
+  // Poll this account's live links and admit new joiners. Runs on every
+  // sync(); a failure on one link never blocks the others, and a failed add
+  // (unreachable joiner, revoked permissions) is marked serviced so a single
+  // bad request cannot wedge the link — but it does not consume a use.
+  async serviceGroupInviteLinks(): Promise<GroupInviteResult[]> {
+    if (!this.options.rendezvous) {
+      return [];
+    }
+    const links = await this.groupInviteLinks();
+    const identity = await this.identity();
+    const results: GroupInviteResult[] = [];
+    const kept: GroupInviteLink[] = [];
+
+    for (const link of links) {
+      const conversation = await this.options.store.getConversationById(link.conversationId);
+      if (!conversation || conversation.kind !== 'group' || conversation.active === false) {
+        // The group is gone or we left it; the link cannot be honored.
+        try {
+          await this.options.rendezvous.deleteRoom(secretRoomId(link.token));
+        } catch {
+          // Best-effort.
+        }
+        continue;
+      }
+
+      let updated = link;
+      try {
+        const descriptor = await createEncryptedGroupDescriptor({
+          code: link.token,
+          identity,
+          conversation,
+          nonce: link.nonce,
+          now: this.now(),
+        });
+        const offers = await this.options.rendezvous.exchangeOffer({
+          roomId: secretRoomId(link.token),
+          role: 'descriptor',
+          encryptedOffer: descriptor.encrypted,
+          expiresAt: link.expiresAt,
+          participantId: descriptor.participantId,
+        });
+        const joins = await decryptJoinRequests(offers, {
+          code: link.token,
+          identity,
+          participantId: descriptor.participantId,
+        });
+
+        for (const join of joins) {
+          if (updated.uses >= updated.maxUses) {
+            break;
+          }
+          if (updated.servicedParticipantIds.includes(join.participantId)) {
+            continue;
+          }
+          try {
+            await this.addGroupMembers(link.conversationId, [{ inboxId: join.request.inboxId }]);
+            results.push({
+              conversationId: link.conversationId,
+              joiner: {
+                inboxId: join.request.inboxId,
+                address: join.request.address,
+                proposedName: join.request.proposedName,
+              },
+            });
+            updated = {
+              ...updated,
+              uses: updated.uses + 1,
+              servicedParticipantIds: [...updated.servicedParticipantIds, join.participantId],
+            };
+          } catch {
+            updated = {
+              ...updated,
+              servicedParticipantIds: [...updated.servicedParticipantIds, join.participantId],
+            };
+          }
+        }
+      } catch {
+        // Rendezvous unreachable: keep the link untouched and retry next sync.
+        kept.push(updated);
+        continue;
+      }
+
+      if (updated.uses >= updated.maxUses) {
+        // Exhausted: retire the link and tear the room down.
+        try {
+          await this.options.rendezvous.deleteRoom(secretRoomId(link.token));
+        } catch {
+          // Best-effort.
+        }
+        continue;
+      }
+      kept.push(updated);
+    }
+
+    await this.options.store.putMetadata({ groupInviteLinks: kept });
+    return results;
+  }
+
+  private async groupInviteLinks(): Promise<GroupInviteLink[]> {
+    const now = this.now().getTime();
+    return ((await this.options.store.getMetadata()).groupInviteLinks ?? []).filter(
+      (link) => Date.parse(link.expiresAt) > now,
+    );
+  }
+
   async exportBackup(): Promise<Uint8Array> {
     // A backup must not smuggle out messages that have already disappeared.
     await this.purgeExpiredMessages();
@@ -644,18 +1111,15 @@ class ConeClientImpl implements ConeClient {
     await this.options.store.close?.();
   }
 
-  async ensureSelfContact(): Promise<void> {
-    const identity = await this.identity();
-    const existing = await this.options.store.getContactByInboxId(identity.inboxId);
-    if (existing) {
-      return;
+  // Cone has no notes-to-self surface (yet). The auto-created "Me" contact
+  // invited self-DMs, which XMTP models awkwardly (duplicate threads), so it
+  // is no longer created — and one created by an earlier build is removed.
+  async removeSelfArtifacts(): Promise<void> {
+    for (const contact of await this.options.store.listContacts()) {
+      if (contact.source === 'self') {
+        await this.options.store.deleteContact(contact.contactId);
+      }
     }
-    await this.saveContact({
-      name: 'Me',
-      inboxId: identity.inboxId,
-      address: identity.address,
-      source: 'self',
-    });
   }
 
   private async persistOutbound(sent: SentMessage, resolved: ResolvedIdentity, kind: StoredMessage['kind'], payload: unknown) {

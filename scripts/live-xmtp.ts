@@ -7,7 +7,7 @@ import { generateSecretKey } from '@cone/core';
 const root = resolve(import.meta.dir, '..');
 const runId = new Date().toISOString().replaceAll(/[:.]/gu, '-');
 const runDir = join(root, '.cone', 'live-runs', runId);
-const rendezvousUrl = process.env.COS_RENDEZVOUS_URL ?? 'http://localhost:8787';
+const rendezvousUrl = process.env.CONE_RENDEZVOUS_URL ?? 'http://localhost:8787';
 const cli = ['bun', 'run', 'packages/cli/src/bin.ts'];
 
 interface CommandResult {
@@ -16,10 +16,17 @@ interface CommandResult {
   stdout: string;
 }
 
+// Every spawned `bun` re-loads the repo .env, which may pin
+// CONE_STATE_PATH/CONE_CONFIG_PATH for interactive use. Those take precedence
+// over CONE_HOME, so every actor would share one state (and one XMTP DB,
+// keyed per secret — PRAGMA key mismatch). Real env vars beat .env, so pin
+// them explicitly per actor instead of relying on CONE_HOME alone.
 const baseEnv = {
   ...process.env,
-  COS_OUTPUT: 'json',
-  COS_RENDEZVOUS_URL: rendezvousUrl,
+  CONE_OUTPUT: 'json',
+  CONE_RENDEZVOUS_URL: rendezvousUrl,
+  CONE_STATE_PATH: join(runDir, 'shared', 'state.sqlite'),
+  CONE_CONFIG_PATH: join(runDir, 'shared', 'config.json'),
   XMTP_ENV: process.env.XMTP_ENV ?? 'dev',
 };
 
@@ -49,7 +56,7 @@ try {
   const aliceIdentity = JSON.parse((await assertCommand(['whoami'], { actor: 'alice' })).stdout) as { inboxId: string };
   const bobIdentity = JSON.parse((await assertCommand(['whoami'], { actor: 'bob' })).stdout) as { inboxId: string };
 
-  const code = JSON.parse((await assertCommand(['pair'])).stdout) as { code: string };
+  const code = JSON.parse((await assertCommand(['pair', '--print'])).stdout) as { code: string };
   await Promise.all([
     assertCommand(['pair', code.code, '--share-name', 'alice', '--save-as', 'bob'], { actor: 'alice' }),
     assertCommand(['pair', code.code, '--share-name', 'bob', '--save-as', 'alice'], { actor: 'bob' }),
@@ -155,10 +162,106 @@ try {
     'group creator is not super admin',
   );
 
+  // --- Phase 2: admin ops. Rename propagates (and renders as a system line
+  // for other members); promote changes the role; remove deactivates the
+  // removed member's copy while keeping their history.
+  await assertCommand(['group', 'rename', group.conversationId, '--name', 'Live Crew v2'], { actor: 'alice' });
+  await assertCommand(['group', 'promote', group.conversationId, '--member', bobIdentity.inboxId], { actor: 'alice' });
+  await sleep(5_000);
+  await assertCommand(['inbox', 'sync'], { actor: 'bob' });
+  const bobGroupInfo = JSON.parse((await assertCommand(['group', 'info', group.conversationId], { actor: 'bob' })).stdout) as {
+    conversation: { title: string };
+    members: Array<{ inboxId: string; level: string }>;
+  };
+  assertEqual(bobGroupInfo.conversation.title, 'Live Crew v2', 'Bob did not see the shared rename');
+  assertEqual(
+    bobGroupInfo.members.find((member) => member.inboxId === bobIdentity.inboxId)?.level ?? 'missing',
+    'admin',
+    'Bob was not promoted to admin',
+  );
+  assertIncludes(
+    (await assertCommand(['inbox', 'read', group.conversationId, '--plain'], { actor: 'bob' })).stdout,
+    'renamed the group to Live Crew v2',
+    'Bob transcript did not include the rename system line',
+  );
+
+  // --- Invite codes (3b): Bob mints a code, Dave (a stranger to everyone)
+  // joins with it and is auto-allowed by his pending join — no Request row.
+  const daveSecret = generateSecretKey();
+  await assertCommand(['login', '--secret-stdin', '--remember'], { actor: 'dave', stdin: daveSecret });
+  const daveIdentity = JSON.parse((await assertCommand(['whoami'], { actor: 'dave' })).stdout) as { inboxId: string };
+
+  const inviteCode = JSON.parse((await assertCommand(['pair', '--print'])).stdout) as { code: string };
+  const [inviteResult] = await Promise.all([
+    assertCommand(['group', 'invite', group.conversationId, '--code', inviteCode.code, '--timeout-ms', '120000'], { actor: 'bob' }),
+    assertCommand(['group', 'join', inviteCode.code, '--share-name', 'dave', '--timeout-ms', '120000'], { actor: 'dave' }),
+  ]);
+  assertIncludes(inviteResult.stdout, daveIdentity.inboxId, 'Bob invite did not report Dave as the joiner');
+  assertIncludes(inviteResult.stdout, 'dave', 'Bob invite did not carry Dave proposed name');
+
+  await sleep(5_000); // welcome propagation
+  await assertCommand(['inbox', 'sync'], { actor: 'dave' });
+  // Bob is a stranger to Dave, so without the pending join this welcome would
+  // be a Request; presence in the allowed-only inbox proves the auto-allow.
+  const daveInbox = JSON.parse((await assertCommand(['inbox'], { actor: 'dave' })).stdout) as {
+    conversations: Array<{ conversationId: string; kind?: string }>;
+  };
+  if (!daveInbox.conversations.some((conversation) => conversation.conversationId === group.conversationId)) {
+    throw new Error('Dave did not auto-allow the group he joined by invite code');
+  }
+  const davePending = JSON.parse((await assertCommand(['group', 'joins'], { actor: 'dave' })).stdout) as unknown[];
+  if (davePending.length !== 0) {
+    throw new Error('Dave still has a pending join after the welcome arrived');
+  }
+
+  // --- Async invite links (3c-lite): Bob mints a token; Erin pastes it and
+  // is admitted by Bob's next sync — no process waits on either side.
+  const erinSecret = generateSecretKey();
+  await assertCommand(['login', '--secret-stdin', '--remember'], { actor: 'erin', stdin: erinSecret });
+  const erinIdentity = JSON.parse((await assertCommand(['whoami'], { actor: 'erin' })).stdout) as { inboxId: string };
+
+  const linkOutput = (await assertCommand(['group', 'invite', group.conversationId, '--link', '--plain'], { actor: 'bob' })).stdout;
+  const token = linkOutput.match(/cone_gi_v1_[A-Za-z0-9_-]+/u)?.[0];
+  if (!token) {
+    throw new Error(`no invite token in link output:\n${linkOutput}`);
+  }
+
+  await assertCommand(['group', 'join', token, '--share-name', 'erin', '--timeout-ms', '30000'], { actor: 'erin' });
+  await assertCommand(['inbox', 'sync'], { actor: 'bob' }); // Bob's sync services the link.
+  await sleep(5_000); // welcome propagation
+  await assertCommand(['inbox', 'sync'], { actor: 'erin' });
+  const erinInbox = JSON.parse((await assertCommand(['inbox'], { actor: 'erin' })).stdout) as {
+    conversations: Array<{ conversationId: string }>;
+  };
+  if (!erinInbox.conversations.some((conversation) => conversation.conversationId === group.conversationId)) {
+    throw new Error('Erin did not auto-allow the group she joined by invite link');
+  }
+  // Single use: the exhausted link is retired.
+  const bobLinks = JSON.parse((await assertCommand(['group', 'links'], { actor: 'bob' })).stdout) as unknown[];
+  if (bobLinks.length !== 0) {
+    throw new Error('Bob still lists an exhausted invite link');
+  }
+
+  await assertCommand(['group', 'remove', group.conversationId, '--member', carolIdentity.inboxId], { actor: 'alice' });
+  await sleep(5_000);
+  await assertCommand(['inbox', 'sync'], { actor: 'carol' });
+  const carolGroupInfo = JSON.parse((await assertCommand(['group', 'info', group.conversationId], { actor: 'carol' })).stdout) as {
+    conversation: { active?: boolean };
+  };
+  assertEqual(String(carolGroupInfo.conversation.active), 'false', 'Carol is still marked active after removal');
+  // Carol's history is kept even though she can no longer send.
+  assertIncludes(
+    (await assertCommand(['inbox', 'read', group.conversationId, '--plain'], { actor: 'carol' })).stdout,
+    'live group hello',
+    'Carol lost her group history after removal',
+  );
+
   console.log(JSON.stringify({
     alice: aliceIdentity.inboxId,
     bob: bobIdentity.inboxId,
     carol: carolIdentity.inboxId,
+    dave: daveIdentity.inboxId,
+    erin: erinIdentity.inboxId,
     group: group.conversationId,
     messages: [sentToBob.messageId, sentToAlice.messageId, groupSent.messageId],
     ok: true,
@@ -198,7 +301,9 @@ function commandEnv(actor?: string): Record<string, string | undefined> {
   }
   return {
     ...baseEnv,
-    COS_HOME: join(runDir, actor),
+    CONE_HOME: join(runDir, actor),
+    CONE_STATE_PATH: join(runDir, actor, 'state.sqlite'),
+    CONE_CONFIG_PATH: join(runDir, actor, 'config.json'),
   };
 }
 

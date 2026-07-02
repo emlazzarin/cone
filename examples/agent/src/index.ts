@@ -4,7 +4,7 @@ import { loadSecretKey } from '../../../packages/cli/src/config';
 import { createCliClient } from '../../../packages/cli/src/index';
 
 // Agent boundary: explicit accept only. Never auto-allow groups, even when a
-// contact adds this agent — group consent is granted via `cos requests accept`.
+// contact adds this agent — group consent is granted via `cone requests accept`.
 const client = await createCliClient(loadSecretKey(), { autoAllowGroupsFromContacts: false });
 const identity = await client.identity();
 

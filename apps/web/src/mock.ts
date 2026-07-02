@@ -41,7 +41,6 @@ export function createMockBootstrap(options: MockOptions = {}) {
   const identity: ConeIdentity = { inboxId: ME, address: '0x9f2c4d7b1a3e6f8c0d2b4a6e8f1c3d5b7a9e0c2d', env: 'dev' };
 
   const contacts: Contact[] = [
-    contact('self-me', 'Me', ME, '0x9f2c4d7b1a3e6f8c0d2b4a6e8f1c3d5b7a9e0c2d', 'self'),
     contact('c-alice', 'Alice', ALICE, '0x3a9f1c2d4e6b8a0c2d4f6b8a1c3e5d7f9b0a2c4e', 'paired'),
     contact('c-codex', 'Codex', CODEX, undefined, 'paired'),
     contact('c-bob', 'bob.eth', BOB, '0x5d7f9b1a3c5e7d9f1b3a5c7e9d1f3b5a7c9e1d3f', 'manual'),
@@ -154,7 +153,26 @@ export function createMockBootstrap(options: MockOptions = {}) {
     listGroupMembers: async () => groupMembers.map((member) => ({ ...member })),
     addGroupMembers: async () => undefined,
     removeGroupMembers: async () => undefined,
-    leaveGroup: async () => undefined,
+    leaveGroup: async (conversationId: string) => {
+      const conversation = conversations.find((entry) => entry.conversationId === conversationId);
+      if (conversation) {
+        conversation.active = false;
+      }
+    },
+    renameGroup: async (conversationId: string, name: string) => {
+      const conversation = conversations.find((entry) => entry.conversationId === conversationId);
+      if (conversation) {
+        conversation.groupName = name;
+        conversation.title = name;
+      }
+    },
+    setGroupDescription: async (conversationId: string, description: string) => {
+      const conversation = conversations.find((entry) => entry.conversationId === conversationId);
+      if (conversation) {
+        conversation.groupDescription = description || undefined;
+      }
+    },
+    setGroupMemberLevel: async () => undefined,
     setConsent: async (to: IdentityRef, state) => {
       const inboxId = typeof to === 'string' ? to : to.inboxId;
       for (const conversation of conversations) {
@@ -231,7 +249,31 @@ export function createMockBootstrap(options: MockOptions = {}) {
       contacts.push(peer);
       return { contact: peer, peer: { inboxId: peer.inboxId, env: 'dev' }, sentConfirmation: true };
     },
-    exportBackup: async () => new TextEncoder().encode('{"type":"cos.backup.v1"}'),
+    inviteToGroupWithCode: async (_code: string, conversationId: string) => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return { conversationId, joiner: { inboxId: STRANGER, proposedName: 'Sam' } };
+    },
+    joinGroupWithCode: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return { conversationId: 'group:crew', groupName: 'crew', memberCount: 3, inviter: { inboxId: ALICE } };
+    },
+    listPendingGroupJoins: async () => [],
+    cancelGroupJoin: async () => undefined,
+    createGroupInviteLink: async (conversationId: string) => ({
+      linkId: `link-${Date.now()}`,
+      conversationId,
+      token: 'cone_gi_v1_M0ckT0kenM0ckT0ken',
+      nonce: 'mock-nonce',
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60_000).toISOString(),
+      maxUses: 1,
+      uses: 0,
+      servicedParticipantIds: [],
+    }),
+    listGroupInviteLinks: async () => [],
+    revokeGroupInviteLink: async () => undefined,
+    serviceGroupInviteLinks: async () => [],
+    exportBackup: async () => new TextEncoder().encode('{"type":"cone.backup.v1"}'),
     importBackup: async () => undefined,
     close: async () => undefined,
   };

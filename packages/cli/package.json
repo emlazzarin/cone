@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "bin": {
-    "cos": "./src/bin.ts"
+    "cone": "./src/bin.ts"
   },
   "exports": {
     ".": "./src/index.ts"
@@ -11,9 +11,5 @@
   "dependencies": {
     "@cone/core": "workspace:*",
     "@cone/xmtp-node": "workspace:*"
-  },
-  "scripts": {
-    "test": "bun test",
-    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   }
 }

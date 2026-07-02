@@ -28,7 +28,7 @@ export function writeConfig(config: CliConfig, path = defaultConfigPath()): void
 }
 
 export function loadSecretKey(configPath = defaultConfigPath()): SecretKey {
-  const envSecret = process.env.COS_SECRET_KEY;
+  const envSecret = process.env.CONE_SECRET_KEY;
   if (envSecret) {
     return parseSecretKey(envSecret);
   }
@@ -40,8 +40,8 @@ export function loadSecretKey(configPath = defaultConfigPath()): SecretKey {
 
   throw new Error([
     'missing secret key',
-    'Provide one with COS_SECRET_KEY, pass --secret-stdin for this command, or save one locally with:',
-    '  cos login --secret-stdin --remember',
+    'Provide one with CONE_SECRET_KEY, pass --secret-stdin for this command, or save one locally with:',
+    '  cone login --secret-stdin --remember',
     'The SECRET_KEY determines the XMTP account/inbox.',
   ].join('\n'));
 }

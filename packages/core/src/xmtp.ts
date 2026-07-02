@@ -87,7 +87,9 @@ export interface SdkGroupMember {
 // Structural view of an SDK group. The metadata accessors are sync getter
 // properties on both SDKs (browser reads a cached snapshot and may yield
 // undefined until a sync). addMembers/removeMembers take canonical inbox IDs;
-// requestRemoval is "leave".
+// requestRemoval is "leave". isActive is intentionally absent: it is a getter
+// on node and an async method on browser, so the groupIsActive bridge resolves
+// it (same split as peerInboxId on DMs).
 export interface SdkGroup extends SdkConversation {
   readonly name?: string;
   readonly description?: string;
@@ -96,6 +98,12 @@ export interface SdkGroup extends SdkConversation {
   addMembers(inboxIds: string[]): Promise<void>;
   removeMembers(inboxIds: string[]): Promise<void>;
   requestRemoval(): Promise<void>;
+  updateName(name: string): Promise<void>;
+  updateDescription(description: string): Promise<void>;
+  addAdmin(inboxId: string): Promise<void>;
+  removeAdmin(inboxId: string): Promise<void>;
+  addSuperAdmin(inboxId: string): Promise<void>;
+  removeSuperAdmin(inboxId: string): Promise<void>;
 }
 
 // Structural view of the SDK client surface this adapter uses. Methods that
@@ -111,7 +119,7 @@ export interface SdkClient {
       conversationType?: unknown;
     }): Promise<{ return(): unknown }>;
     syncAll(consentStates?: unknown[]): Promise<unknown>;
-    listDms(options?: { consentStates?: unknown[] }): MaybePromise<SdkDm[]>;
+    listDms(options?: { consentStates?: unknown[]; includeDuplicateDms?: boolean }): MaybePromise<SdkDm[]>;
     listGroups(options?: { consentStates?: unknown[] }): MaybePromise<SdkGroup[]>;
     createGroup(inboxIds: string[], options?: Record<string, unknown>): Promise<SdkGroup>;
     getConversationById(conversationId: string): MaybePromise<SdkConversation | null | undefined>;
@@ -174,6 +182,8 @@ export interface SdkXmtpAdapterOptions {
   groupConversationType: unknown;
   /** Resolves a DM's peer inbox ID (property on node, async method on browser). */
   peerInboxId(dm: SdkDm): MaybePromise<string>;
+  /** Resolves whether this account is still a group member (getter on node, async method on browser). */
+  groupIsActive(group: SdkGroup): MaybePromise<boolean>;
 }
 
 export function createSdkXmtpAdapter(options: SdkXmtpAdapterOptions): XmtpAdapter {
@@ -269,9 +279,11 @@ class SdkXmtpAdapter implements XmtpAdapter {
   async sync(filter?: ConsentFilter): Promise<XmtpSyncResult> {
     const consentStates = this.consentFilter(filter);
     await this.client.conversations.syncAll(consentStates);
-    const listOptions = consentStates ? { consentStates } : undefined;
-    const dms = await this.client.conversations.listDms(listOptions);
-    const groups = await this.client.conversations.listGroups(listOptions);
+    // XMTP can hold several MLS DMs for one peer pair (both sides initiated);
+    // the SDK stitches them, and listing must ask for the canonical one only —
+    // otherwise every duplicate becomes its own thread in the read model.
+    const dms = await this.client.conversations.listDms({ ...(consentStates ? { consentStates } : {}), includeDuplicateDms: false });
+    const groups = await this.client.conversations.listGroups(consentStates ? { consentStates } : undefined);
     const conversations = await Promise.all([
       ...dms.map((dm) => this.toDmConversation(dm)),
       ...groups.map((group) => this.toGroupConversation(group)),
@@ -287,9 +299,8 @@ class SdkXmtpAdapter implements XmtpAdapter {
 
   async listConversations(filter?: ConsentFilter): Promise<ConeConversation[]> {
     const consentStates = this.consentFilter(filter);
-    const listOptions = consentStates ? { consentStates } : undefined;
-    const dms = await this.client.conversations.listDms(listOptions);
-    const groups = await this.client.conversations.listGroups(listOptions);
+    const dms = await this.client.conversations.listDms({ ...(consentStates ? { consentStates } : {}), includeDuplicateDms: false });
+    const groups = await this.client.conversations.listGroups(consentStates ? { consentStates } : undefined);
     return Promise.all([
       ...dms.map((dm) => this.toDmConversation(dm)),
       ...groups.map((group) => this.toGroupConversation(group)),
@@ -348,6 +359,30 @@ class SdkXmtpAdapter implements XmtpAdapter {
 
   async leaveGroup(conversationId: string): Promise<void> {
     await (await this.getGroup(conversationId)).requestRemoval();
+  }
+
+  async updateGroupName(conversationId: string, name: string): Promise<void> {
+    await (await this.getGroup(conversationId)).updateName(name);
+  }
+
+  async updateGroupDescription(conversationId: string, description: string): Promise<void> {
+    await (await this.getGroup(conversationId)).updateDescription(description);
+  }
+
+  async addGroupAdmin(conversationId: string, inboxId: string): Promise<void> {
+    await (await this.getGroup(conversationId)).addAdmin(inboxId);
+  }
+
+  async removeGroupAdmin(conversationId: string, inboxId: string): Promise<void> {
+    await (await this.getGroup(conversationId)).removeAdmin(inboxId);
+  }
+
+  async addGroupSuperAdmin(conversationId: string, inboxId: string): Promise<void> {
+    await (await this.getGroup(conversationId)).addSuperAdmin(inboxId);
+  }
+
+  async removeGroupSuperAdmin(conversationId: string, inboxId: string): Promise<void> {
+    await (await this.getGroup(conversationId)).removeSuperAdmin(inboxId);
   }
 
   async sendToConversation(conversationId: string, text: string): Promise<SentMessage> {
@@ -455,6 +490,7 @@ class SdkXmtpAdapter implements XmtpAdapter {
       memberCount: members.length,
       addedByInboxId: group.addedByInboxId,
       members,
+      active: await this.options.groupIsActive(group),
       updatedAt: group.createdAt?.toISOString(),
       consentState: this.fromSdkConsent(await group.consentState()),
       retention: fromSdkRetention(await group.messageDisappearingSettings()),
@@ -540,7 +576,7 @@ function toIncomingMessage(message: unknown, kind: ConversationKind = 'dm'): Inc
 // XMTP delivers membership/metadata changes as GroupUpdated system messages
 // (contentType typeId 'group_updated', content decoded by the bindings).
 // Normalize them into Cone's control envelope so they store and render like
-// any other cos.* control message.
+// any other cone.* control message.
 function decodeGroupUpdate(record: Record<string, unknown>): GroupUpdateEnvelope | undefined {
   const contentType = record.contentType as { typeId?: unknown } | null | undefined;
   if (contentType?.typeId !== 'group_updated') {
@@ -551,6 +587,10 @@ function decodeGroupUpdate(record: Record<string, unknown>): GroupUpdateEnvelope
     addedInboxes?: unknown;
     removedInboxes?: unknown;
     leftInboxes?: unknown;
+    addedAdminInboxes?: unknown;
+    removedAdminInboxes?: unknown;
+    addedSuperAdminInboxes?: unknown;
+    removedSuperAdminInboxes?: unknown;
     metadataFieldChanges?: unknown;
   };
   return {
@@ -559,6 +599,10 @@ function decodeGroupUpdate(record: Record<string, unknown>): GroupUpdateEnvelope
     added: inboxIdList(content.addedInboxes),
     removed: inboxIdList(content.removedInboxes),
     left: inboxIdList(content.leftInboxes),
+    adminsAdded: inboxIdList(content.addedAdminInboxes),
+    adminsRemoved: inboxIdList(content.removedAdminInboxes),
+    superAdminsAdded: inboxIdList(content.addedSuperAdminInboxes),
+    superAdminsRemoved: inboxIdList(content.removedSuperAdminInboxes),
     metadataChanges: metadataChangeList(content.metadataFieldChanges),
   };
 }

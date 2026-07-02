@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import type { ConeClient, ConeMessage, SentMessage } from '@cone/core';
+import type { ConeClient, ConeMessage, Contact, SentMessage } from '@cone/core';
 
 import {
   applyConversationMeta,
@@ -19,7 +19,7 @@ import {
   wrapText,
 } from '../src/chat';
 
-describe('cos chat', () => {
+describe('cone chat', () => {
   test('renders select mode with a useful top bar and mode-specific footer', () => {
     const state = createChatState(
       { env: 'dev', inboxId: 'inbox-alice-long' },
@@ -43,7 +43,7 @@ describe('cos chat', () => {
 
     const output = renderChat(state, 100, 24);
 
-    expect(output).toContain('Cone of Silence ·dev');
+    expect(output).toContain('Cone ·dev');
     expect(output).toContain('1 Chats');
     expect(output).toContain('2 Contacts');
     expect(output).toContain('live');
@@ -164,7 +164,7 @@ describe('cos chat', () => {
     expect(renderChat(pairState, 90, 18)).toContain('Save their name as (optional)');
     expect(renderChat(codeState, 90, 18)).toContain('forest-wormhole-direction');
     expect(renderChat(codeState, 90, 18)).toContain('Code expires at');
-    expect(renderChat(codeState, 90, 18)).toContain('CLI: cos pair forest-wormhole-direction');
+    expect(renderChat(codeState, 90, 18)).toContain('CLI: cone pair forest-wormhole-direction');
   });
 
   test('renders local chat deletion as a structured confirmation form', () => {
@@ -313,7 +313,7 @@ describe('cos chat', () => {
     state.messages = [
       { conversationId: 'dm-bob', direction: 'outbound', kind: 'text', messageId: 'o1', senderInboxId: 'inbox-alice', sentAt: '2026-01-01T10:00:00.000Z', text: 'first' },
       { conversationId: 'dm-bob', direction: 'outbound', kind: 'text', messageId: 'o2', senderInboxId: 'inbox-alice', sentAt: '2026-01-01T10:01:00.000Z', text: 'second' },
-      { conversationId: 'dm-bob', direction: 'inbound', kind: 'control', messageId: 'r1', senderInboxId: 'inbox-bob', sentAt: '2026-01-01T10:02:00.000Z', json: { type: 'cos.read.v1' } },
+      { conversationId: 'dm-bob', direction: 'inbound', kind: 'control', messageId: 'r1', senderInboxId: 'inbox-bob', sentAt: '2026-01-01T10:02:00.000Z', json: { type: 'cone.read.v1' } },
     ];
 
     const output = renderChat(state, 80, 16);
@@ -334,7 +334,7 @@ describe('cos chat', () => {
     state.readReceipts = false;
     state.messages = [
       { conversationId: 'dm-bob', direction: 'outbound', kind: 'text', messageId: 'o1', senderInboxId: 'inbox-alice', sentAt: '2026-01-01T10:00:00.000Z', text: 'first' },
-      { conversationId: 'dm-bob', direction: 'inbound', kind: 'control', messageId: 'r1', senderInboxId: 'inbox-bob', sentAt: '2026-01-01T10:02:00.000Z', json: { type: 'cos.read.v1' } },
+      { conversationId: 'dm-bob', direction: 'inbound', kind: 'control', messageId: 'r1', senderInboxId: 'inbox-bob', sentAt: '2026-01-01T10:02:00.000Z', json: { type: 'cone.read.v1' } },
     ];
 
     const output = renderChat(state, 80, 16);
@@ -484,6 +484,50 @@ describe('cos chat', () => {
     expect(pairCalls).toBe(1);
   });
 
+  test('c mints a pairing code and waits on it in the background', async () => {
+    const noop = async () => {};
+    const pairedCodes: string[] = [];
+    let resolvePair!: (value: { contact: Contact; peer: { env: 'dev'; inboxId: string }; sentConfirmation: boolean }) => void;
+    const client = stubClient({
+      pairWithCode: async (code) => {
+        pairedCodes.push(code);
+        return new Promise((resolve) => {
+          resolvePair = resolve;
+        });
+      },
+    });
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, []);
+
+    await handleInput('c', client, state, noop, noop, noop);
+
+    // Minting joins its own room immediately; the code stays visible while
+    // this side waits, so it can be read out to the other person.
+    expect(state.editForm?.kind).toBe('pair-create');
+    expect(state.editForm?.pending).toBe(true);
+    expect(pairedCodes).toEqual(['forest-wormhole-direction']);
+    const waiting = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    expect(waiting).toContain('forest-wormhole-direction');
+    expect(waiting).toContain('Waiting for the other side');
+
+    resolvePair({
+      contact: {
+        contactId: 'contact-peer',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        inboxId: 'inbox-peer',
+        name: 'Peer',
+        source: 'paired',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+      peer: { env: 'dev', inboxId: 'inbox-peer' },
+      sentConfirmation: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(state.editForm?.pending).toBe(false);
+    const done = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    expect(done).toContain('Paired with Peer.');
+  });
+
   test('shows a short form for an unnamed peer whose title is the raw inbox id', () => {
     const longId = 'inbox-0123456789abcdef0123456789abcdef0123456789';
     const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [
@@ -572,7 +616,7 @@ describe('cos chat', () => {
     const appJson: ConeMessage = {
       conversationId: 'dm-bob',
       direction: 'inbound',
-      json: { type: 'cos.app.json.v1', value: 'plain value' },
+      json: { type: 'cone.app.json.v1', value: 'plain value' },
       kind: 'json',
       messageId: 'msg-json',
       senderInboxId: 'inbox-bob',
@@ -583,7 +627,7 @@ describe('cos chat', () => {
     const control: ConeMessage = {
       conversationId: 'dm-bob',
       direction: 'inbound',
-      json: { type: 'cos.pair.confirm.v1' },
+      json: { type: 'cone.pair.confirm.v1' },
       kind: 'control',
       messageId: 'msg-control',
       senderInboxId: 'inbox-bob',
@@ -824,6 +868,232 @@ describe('cos chat', () => {
     expect(joinState.editForm?.kind).toBe('pair-join');
   });
 
+  test('i opens group info with roles; DMs point at r instead', async () => {
+    const noop = async () => {};
+    const client = stubClient();
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [
+      {
+        conversationId: 'group-crew',
+        kind: 'group' as const,
+        title: 'Crew',
+        groupName: 'Crew',
+        memberCount: 3,
+        consentState: 'allowed' as const,
+        addedByInboxId: 'inbox-owner',
+        members: [
+          { inboxId: 'inbox-owner', level: 'superAdmin' as const, consentState: 'allowed' as const },
+          { inboxId: 'inbox-alice', level: 'member' as const, consentState: 'allowed' as const },
+          { inboxId: 'inbox-bob', level: 'member' as const, consentState: 'allowed' as const },
+        ],
+      },
+    ], [
+      { contactId: 'c-owner', name: 'Olive', inboxId: 'inbox-owner', source: 'paired', createdAt: '', updatedAt: '' },
+    ]);
+
+    await handleInput('i', client, state, noop, noop, noop);
+    expect(state.mode).toBe('group-info');
+    const plain = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    expect(plain).toContain('[group info] Crew');
+    expect(plain).toContain('Olive [owner]');
+    expect(plain).toContain('you');
+    expect(plain).toContain('3 members');
+    expect(plain).toContain('+/- role');
+
+    // Esc returns to the chat list; on a DM, i points at r.
+    await handleInput('\u001b', client, state, noop, noop, noop);
+    expect(state.mode).toBe('chat-select');
+    state.conversations = [{ conversationId: 'dm-x', kind: 'dm' as const, peerInboxId: 'inbox-x', title: 'X', consentState: 'allowed' as const }];
+    await handleInput('i', client, state, noop, noop, noop);
+    expect(state.mode).toBe('chat-select');
+    expect(state.status).toContain('info is for groups');
+  });
+
+  test('group info manages roles and membership with two-press confirms', async () => {
+    const noop = async () => {};
+    const levelChanges: Array<{ member: unknown; level: string }> = [];
+    const removed: unknown[] = [];
+    const client = stubClient({
+      setGroupMemberLevel: async (_id, member, level) => {
+        levelChanges.push({ member, level });
+      },
+      removeGroupMembers: async (_id, members) => {
+        removed.push(...members);
+      },
+    });
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [
+      {
+        conversationId: 'group-crew',
+        kind: 'group' as const,
+        title: 'Crew',
+        consentState: 'allowed' as const,
+        members: [
+          { inboxId: 'inbox-alice', level: 'superAdmin' as const, consentState: 'allowed' as const },
+          { inboxId: 'inbox-bob', level: 'member' as const, consentState: 'allowed' as const },
+        ],
+      },
+    ]);
+    await handleInput('i', client, state, noop, noop, noop);
+
+    // Promote the selected member (j moves to Bob).
+    await handleInput('j', client, state, noop, noop, noop);
+    await handleInput('+', client, state, noop, noop, noop);
+    expect(levelChanges).toEqual([{ member: { inboxId: 'inbox-bob' }, level: 'admin' }]);
+
+    // Removing needs a second press.
+    await handleInput('d', client, state, noop, noop, noop);
+    expect(removed).toHaveLength(0);
+    expect(state.status).toContain('press d again');
+    await handleInput('d', client, state, noop, noop, noop);
+    expect(removed).toEqual([{ inboxId: 'inbox-bob' }]);
+
+    // The sole owner cannot leave; the guard explains the transfer move.
+    await handleInput('x', client, state, noop, noop, noop);
+    expect(state.status).toContain('only owner');
+  });
+
+  test('group rename flows through a form and returns to group info', async () => {
+    const noop = async () => {};
+    const renames: Array<{ conversationId: string; name: string }> = [];
+    const client = stubClient({
+      renameGroup: async (conversationId, name) => {
+        renames.push({ conversationId, name });
+      },
+    });
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [
+      {
+        conversationId: 'group-crew',
+        kind: 'group' as const,
+        title: 'Crew',
+        groupName: 'Crew',
+        consentState: 'allowed' as const,
+        members: [{ inboxId: 'inbox-alice', level: 'superAdmin' as const, consentState: 'allowed' as const }],
+      },
+    ]);
+    await handleInput('i', client, state, noop, noop, noop);
+    await handleInput('r', client, state, noop, noop, noop);
+    expect(state.mode).toBe('chat-compose');
+    expect(state.editForm?.kind).toBe('group-rename');
+
+    state.editForm!.fields[0]!.value = 'New Crew';
+    await handleInput('\r', client, state, noop, noop, noop);
+    expect(renames).toEqual([{ conversationId: 'group-crew', name: 'New Crew' }]);
+    expect(state.mode).toBe('group-info');
+  });
+
+  test('v mints a group invite code, keeps it on screen while waiting, and reports the joiner', async () => {
+    const noop = async () => {};
+    let resolveInvite!: (value: { conversationId: string; joiner: { inboxId: string; proposedName?: string } }) => void;
+    const client = stubClient({
+      inviteToGroupWithCode: async () => new Promise((resolve) => {
+        resolveInvite = resolve;
+      }),
+    });
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [
+      {
+        conversationId: 'group-crew',
+        kind: 'group' as const,
+        title: 'Crew',
+        groupName: 'Crew',
+        consentState: 'allowed' as const,
+        members: [{ inboxId: 'inbox-alice', level: 'superAdmin' as const, consentState: 'allowed' as const }],
+      },
+    ]);
+    await handleInput('i', client, state, noop, noop, noop);
+    await handleInput('v', client, state, noop, noop, noop);
+
+    expect(state.editForm?.kind).toBe('group-invite');
+    expect(state.editForm?.pending).toBe(true);
+    const waiting = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    expect(waiting).toContain('forest-wormhole-direction');
+    expect(waiting).toContain('Waiting for someone to join');
+
+    // Enter while pending must not close or resubmit the form.
+    await handleInput('\r', client, state, noop, noop, noop);
+    expect(state.editForm?.pending).toBe(true);
+
+    resolveInvite({ conversationId: 'group-crew', joiner: { inboxId: 'inbox-joiner', proposedName: 'Sam' } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(state.editForm?.pending).toBe(false);
+    const done = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    expect(done).toContain('Added Sam to Crew.');
+
+    // Enter returns to the group-info pane the invite came from.
+    await handleInput('\r', client, state, noop, noop, noop);
+    expect(state.mode).toBe('group-info');
+  });
+
+  test('g joins a group by invite code and reports the pending welcome', async () => {
+    const noop = async () => {};
+    const joins: Array<{ code: string; proposedName?: string }> = [];
+    const client = stubClient({
+      joinGroupWithCode: async (code, options) => {
+        joins.push({ code, proposedName: options?.proposedName });
+        return { conversationId: 'group-crew', groupName: 'Crew', memberCount: 2, inviter: { inboxId: 'inbox-owner' } };
+      },
+    });
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, []);
+
+    await handleInput('g', client, state, noop, noop, noop);
+    expect(state.editForm?.kind).toBe('group-join');
+    state.editForm!.fields[0]!.value = 'anchor-beacon-cedar-drift-ember';
+    state.editForm!.fields[1]!.value = 'Sam';
+
+    await handleInput('\r', client, state, noop, noop, noop);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(joins).toEqual([{ code: 'anchor-beacon-cedar-drift-ember', proposedName: 'Sam' }]);
+    expect(state.editForm?.pending).toBe(false);
+    const plain = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    expect(plain).toContain('Requested to join Crew (2 members).');
+  });
+
+  test('group transcripts show the join notice, sender names, and system lines', () => {
+    const state = createChatState({ env: 'dev', inboxId: 'inbox-alice' }, [
+      {
+        conversationId: 'group-crew',
+        kind: 'group' as const,
+        title: 'Crew',
+        consentState: 'allowed' as const,
+        addedByInboxId: 'inbox-owner',
+      },
+    ], [
+      { contactId: 'c-owner', name: 'Olive', inboxId: 'inbox-owner', source: 'paired', createdAt: '', updatedAt: '' },
+    ]);
+    state.messages = [
+      {
+        conversationId: 'group-crew',
+        direction: 'inbound',
+        kind: 'text',
+        messageId: 'g-1',
+        senderInboxId: 'inbox-owner',
+        sentAt: '2026-01-01T16:00:00',
+        text: 'welcome to the crew',
+      },
+      {
+        conversationId: 'group-crew',
+        direction: 'inbound',
+        kind: 'control',
+        messageId: 'g-2',
+        senderInboxId: 'inbox-owner',
+        sentAt: '2026-01-01T16:05:00',
+        json: {
+          type: 'cone.group.update.v1',
+          initiatedByInboxId: 'inbox-owner',
+          added: ['inbox-alice'],
+          removed: [],
+          left: [],
+          metadataChanges: [],
+        },
+      },
+    ];
+
+    const plain = renderChat(state, 100, 24).replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, '');
+    expect(plain).toContain("you joined — earlier messages aren't visible");
+    expect(plain).toContain('16:00 - Olive: welcome to the crew');
+    expect(plain).toContain('Olive added you');
+  });
+
   test('decodes coalesced and split terminal input chunks', () => {
     const decoder = new InputDecoder();
 
@@ -859,6 +1129,24 @@ function stubClient(overrides: Partial<ConeClient> = {}): ConeClient {
       peer: { env: 'dev', inboxId: 'inbox-peer' },
       sentConfirmation: true,
     }),
+    inviteToGroupWithCode: async (_code, conversationId) => ({ conversationId, joiner: { inboxId: 'inbox-joiner' } }),
+    joinGroupWithCode: async () => ({ conversationId: 'group-joined', groupName: 'Crew', memberCount: 2, inviter: { inboxId: 'inbox-peer' } }),
+    listPendingGroupJoins: async () => [],
+    cancelGroupJoin: async () => {},
+    createGroupInviteLink: async (conversationId) => ({
+      linkId: 'link-1',
+      conversationId,
+      token: 'cone_gi_v1_test-token',
+      nonce: 'nonce-1',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      expiresAt: '2026-01-08T00:00:00.000Z',
+      maxUses: 1,
+      uses: 0,
+      servicedParticipantIds: [],
+    }),
+    listGroupInviteLinks: async () => [],
+    revokeGroupInviteLink: async () => {},
+    serviceGroupInviteLinks: async () => [],
     resolveIdentity: async () => ({ inboxId: 'inbox-peer', source: 'contact' }),
     saveContact: async (input) => ({
       contactId: 'contact-peer',
@@ -884,6 +1172,9 @@ function stubClient(overrides: Partial<ConeClient> = {}): ConeClient {
     addGroupMembers: async () => {},
     removeGroupMembers: async () => {},
     leaveGroup: async () => {},
+    renameGroup: async () => {},
+    setGroupDescription: async () => {},
+    setGroupMemberLevel: async () => {},
     setConsent: async () => {},
     setConversationConsent: async () => {},
     setRetention: async () => {},

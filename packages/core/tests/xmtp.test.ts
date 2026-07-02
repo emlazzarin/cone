@@ -20,6 +20,7 @@ interface Captured {
   streams: CapturedStream[];
   consentWrites: SdkConsentRecord[];
   groupCreates: Array<{ inboxIds: string[]; options?: Record<string, unknown> }>;
+  dmListOptions: Array<Record<string, unknown> | undefined>;
 }
 
 function makeGroup(overrides: Partial<SdkGroup> & { id: string }): SdkGroup {
@@ -41,6 +42,12 @@ function makeGroup(overrides: Partial<SdkGroup> & { id: string }): SdkGroup {
     addMembers: async () => undefined,
     removeMembers: async () => undefined,
     requestRemoval: async () => undefined,
+    updateName: async () => undefined,
+    updateDescription: async () => undefined,
+    addAdmin: async () => undefined,
+    removeAdmin: async () => undefined,
+    addSuperAdmin: async () => undefined,
+    removeSuperAdmin: async () => undefined,
     ...overrides,
   };
 }
@@ -55,7 +62,10 @@ function makeSdkClient(captured: Captured, options: { groups?: SdkGroup[] } = {}
         return { return: () => undefined };
       },
       async syncAll() {},
-      listDms: () => [],
+      listDms: (listOptions?: Record<string, unknown>) => {
+        captured.dmListOptions.push(listOptions);
+        return [];
+      },
       listGroups: () => options.groups ?? [],
       async createGroup(inboxIds, createOptions) {
         captured.groupCreates.push({ inboxIds, options: createOptions });
@@ -93,11 +103,12 @@ function makeAdapter(captured: Captured, options: { groups?: SdkGroup[] } = {}) 
     dmConversationType: DM_TYPE,
     groupConversationType: GROUP_TYPE,
     peerInboxId: () => 'inbox-peer',
+    groupIsActive: () => true,
   });
 }
 
 function emptyCaptured(): Captured {
-  return { streams: [], consentWrites: [], groupCreates: [] };
+  return { streams: [], consentWrites: [], groupCreates: [], dmListOptions: [] };
 }
 
 describe('SdkXmtpAdapter streaming', () => {
@@ -149,7 +160,7 @@ describe('SdkXmtpAdapter streaming', () => {
   });
 
   // XMTP delivers membership/metadata changes as GroupUpdated system messages;
-  // the adapter normalizes them into Cone's cos.group.update.v1 control shape.
+  // the adapter normalizes them into Cone's cone.group.update.v1 control shape.
   test('decodes GroupUpdated messages into the group-update control envelope', async () => {
     const captured = emptyCaptured();
     const adapter = makeAdapter(captured);
@@ -179,8 +190,30 @@ describe('SdkXmtpAdapter streaming', () => {
       added: ['inbox-bob'],
       removed: [],
       left: ['inbox-carol'],
+      adminsAdded: [],
+      adminsRemoved: [],
+      superAdminsAdded: [],
+      superAdminsRemoved: [],
       metadataChanges: [{ field: 'group_name', oldValue: 'Old', newValue: 'New' }],
     });
+  });
+});
+
+describe('SdkXmtpAdapter DM listing', () => {
+  // XMTP can hold several MLS DMs per peer pair; the SDK stitches them, and
+  // every DM listing must ask for the canonical one only — otherwise each
+  // duplicate becomes its own thread in the read model.
+  test('sync and list exclude duplicate DMs explicitly', async () => {
+    const captured = emptyCaptured();
+    const adapter = makeAdapter(captured);
+
+    await adapter.sync({ consentStates: ['allowed', 'unknown'] });
+    await adapter.listConversations();
+
+    expect(captured.dmListOptions).toHaveLength(2);
+    for (const options of captured.dmListOptions) {
+      expect(options?.includeDuplicateDms).toBe(false);
+    }
   });
 });
 

@@ -2,25 +2,25 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 export function defaultStatePath(): string {
-  if (process.env.COS_STATE_PATH) {
-    return process.env.COS_STATE_PATH;
+  if (process.env.CONE_STATE_PATH) {
+    return process.env.CONE_STATE_PATH;
   }
-  if (process.env.COS_HOME) {
-    return join(process.env.COS_HOME, 'state.sqlite');
+  if (process.env.CONE_HOME) {
+    return join(process.env.CONE_HOME, 'state.sqlite');
   }
-  return join(homedir(), '.local', 'share', 'cone-of-silence', 'state.sqlite');
+  return join(homedir(), '.local', 'share', 'cone', 'state.sqlite');
 }
 
 export function defaultConfigPath(): string {
-  if (process.env.COS_CONFIG_PATH) {
-    return process.env.COS_CONFIG_PATH;
+  if (process.env.CONE_CONFIG_PATH) {
+    return process.env.CONE_CONFIG_PATH;
   }
-  if (process.env.COS_HOME) {
-    return join(process.env.COS_HOME, 'config.json');
+  if (process.env.CONE_HOME) {
+    return join(process.env.CONE_HOME, 'config.json');
   }
-  return join(homedir(), '.config', 'cone-of-silence', 'config.json');
+  return join(homedir(), '.config', 'cone', 'config.json');
 }
 
 export function defaultRendezvousUrl(): string {
-  return process.env.COS_RENDEZVOUS_URL ?? 'http://localhost:8787';
+  return process.env.CONE_RENDEZVOUS_URL ?? 'http://localhost:8787';
 }

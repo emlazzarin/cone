@@ -4,6 +4,7 @@ import {
   formatRetention,
   parseRetention,
   type ConeClient,
+  type ConeConversation,
   type Contact,
 } from '@cone/core';
 
@@ -12,6 +13,11 @@ import {
   createAddContactForm,
   createDeleteContactForm,
   createDeleteConversationForm,
+  createGroupAddMemberForm,
+  createGroupInviteForm,
+  createGroupJoinForm,
+  createGroupLinkResultForm,
+  createGroupRenameForm,
   createNamePeerForm,
   createNewMessageForm,
   createPairCreateResultForm,
@@ -29,10 +35,14 @@ import {
   enterChatSelect,
   enterChatTalk,
   enterContactsSelect,
+  enterGroupInfo,
+  groupInfoMembers,
+  memberDisplayName,
   refreshMessages,
   saveDraft,
   selectContact,
   selectConversation,
+  selectGroupMember,
   selectedContact,
   selectedConversation,
   sendTargetForState,
@@ -87,6 +97,10 @@ export async function handleInput(
     await handleChatSelectInput(input, client, state, refresh, syncNow, quit);
     return;
   }
+  if (state.mode === 'group-info') {
+    await handleGroupInfoInput(input, client, state, refresh);
+    return;
+  }
   if (state.mode === 'chat-talk') {
     await handleChatTalkInput(input, client, state, refresh);
     return;
@@ -96,7 +110,7 @@ export async function handleInput(
     return;
   }
   if (state.mode === 'contacts-select') {
-    await handleContactsSelectInput(input, client, state, quit);
+    await handleContactsSelectInput(input, client, state, refresh, quit);
     return;
   }
   await handleContactsEditInput(input, client, state, refresh);
@@ -158,11 +172,29 @@ async function handleChatSelectInput(
       return;
     }
     if (conversation.kind === 'group') {
-      state.status = 'groups have no single peer to name';
+      state.status = 'groups are renamed from group info — press i';
       return;
     }
     const existing = state.contacts.find((contact) => contact.inboxId === conversation.peerInboxId && contact.source !== 'self');
     startChatCompose(state, createNamePeerForm(conversation, existing?.name ?? ''));
+    return;
+  }
+  // 'i' opens the group info pane: members with roles, add/remove, rename,
+  // promote/demote, leave/block.
+  if (state.scope === 'chats' && input === 'i') {
+    const conversation = selectedConversation(state);
+    if (!conversation) {
+      state.status = 'no chat selected';
+      return;
+    }
+    if (conversation.kind !== 'group') {
+      state.status = 'info is for groups (r names a DM peer)';
+      return;
+    }
+    enterGroupInfo(state);
+    // Refresh the member mirror in the background; sync persists it and the
+    // next refresh reconciles the pane.
+    void syncNow({ quiet: true });
     return;
   }
   // 'e' sets the selected chat's disappearing-messages timer (expiry).
@@ -178,11 +210,16 @@ async function handleChatSelectInput(
   if (state.scope === 'chats' && input === 'c') {
     const created = await client.createHandshakeCode();
     startContactsEdit(state, createPairCreateResultForm(created.code, created.expiresAt));
-    state.status = 'created pairing code';
+    startPairWait(client, state, refresh, created.code);
     return;
   }
   if (state.scope === 'chats' && input === 'p') {
     startContactsEdit(state, createPairJoinForm());
+    return;
+  }
+  // 'g' joins a group by invite code (the joiner side of `i` → `v`).
+  if (state.scope === 'chats' && input === 'g') {
+    startContactsEdit(state, createGroupJoinForm());
     return;
   }
   if (input === KEY.ctrlX) {
@@ -225,6 +262,161 @@ async function handleChatSelectInput(
     }
     enterChatTalk(state);
   }
+}
+
+// The group-info pane: member list with roles, membership and role management,
+// rename, timer, and the leave/block pair. Destructive actions (remove, leave,
+// block) are two-press confirms; permission failures surface in the status line
+// — the policy is enforced by XMTP, not guessed here.
+async function handleGroupInfoInput(input: string, client: ConeClient, state: ChatState, refresh: RefreshChat): Promise<void> {
+  const conversation = selectedConversation(state);
+  if (!conversation || conversation.kind !== 'group') {
+    enterChatSelect(state);
+    return;
+  }
+  if (input === KEY.esc || input === 'i' || input === 'q') {
+    enterChatSelect(state);
+    return;
+  }
+  if (input === KEY.up || input === 'k') {
+    selectGroupMember(state, -1);
+    return;
+  }
+  if (input === KEY.down || input === 'j') {
+    selectGroupMember(state, 1);
+    return;
+  }
+  if (input === 'a') {
+    state.pendingGroupAction = undefined;
+    startChatCompose(state, createGroupAddMemberForm(conversation));
+    return;
+  }
+  if (input === 'r') {
+    state.pendingGroupAction = undefined;
+    startChatCompose(state, createGroupRenameForm(conversation));
+    return;
+  }
+  // 'v' mints a single-use invite code and waits for a joiner in the
+  // background — the code stays on screen so it can be read out while waiting.
+  if (input === 'v') {
+    state.pendingGroupAction = undefined;
+    if (conversation.active === false) {
+      state.status = 'no longer a member — cannot invite';
+      return;
+    }
+    const created = await client.createHandshakeCode();
+    startChatCompose(state, createGroupInviteForm(conversation, created.code, created.expiresAt));
+    startGroupInvite(client, state, refresh, conversation, created.code);
+    return;
+  }
+  // 'l' mints an async invite link — nothing to wait for; joiners are
+  // admitted by this account's sync (the TUI's auto-sync covers it).
+  if (input === 'l') {
+    state.pendingGroupAction = undefined;
+    if (conversation.active === false) {
+      state.status = 'no longer a member — cannot invite';
+      return;
+    }
+    try {
+      const link = await client.createGroupInviteLink(conversation.conversationId);
+      startChatCompose(state, createGroupLinkResultForm(conversation, link));
+      state.status = 'invite link created';
+    } catch (error) {
+      state.status = `invite link failed: ${errorMessage(error)}`;
+    }
+    return;
+  }
+  if (input === 'e') {
+    state.pendingGroupAction = undefined;
+    startChatCompose(state, { ...createTimerForm(conversation), returnTo: 'group-info' });
+    return;
+  }
+  const member = groupInfoMembers(state)[state.groupInfoIndex];
+  if (input === '+' || input === '-') {
+    state.pendingGroupAction = undefined;
+    if (!member) {
+      state.status = 'no member selected';
+      return;
+    }
+    const next = input === '+'
+      ? member.level === 'member' ? 'admin' : member.level === 'admin' ? 'superAdmin' : undefined
+      : member.level === 'superAdmin' ? 'admin' : member.level === 'admin' ? 'member' : undefined;
+    if (!next) {
+      state.status = input === '+' ? `${memberDisplayName(state, member.inboxId)} is already an owner` : `${memberDisplayName(state, member.inboxId)} is already a member`;
+      return;
+    }
+    try {
+      await client.setGroupMemberLevel(conversation.conversationId, { inboxId: member.inboxId }, next);
+      state.status = `${memberDisplayName(state, member.inboxId)} is now ${next === 'superAdmin' ? 'an owner' : next === 'admin' ? 'an admin' : 'a member'}`;
+      await refresh({ preserveScroll: true });
+    } catch (error) {
+      state.status = `role change failed: ${errorMessage(error)}`;
+    }
+    return;
+  }
+  if (input === 'd') {
+    if (!member) {
+      state.status = 'no member selected';
+      return;
+    }
+    if (member.inboxId === state.identity.inboxId) {
+      state.status = 'x leaves the group (removing yourself is leaving)';
+      return;
+    }
+    const action = `remove:${member.inboxId}`;
+    if (state.pendingGroupAction !== action) {
+      state.pendingGroupAction = action;
+      state.status = `press d again to remove ${memberDisplayName(state, member.inboxId)}`;
+      return;
+    }
+    state.pendingGroupAction = undefined;
+    try {
+      await client.removeGroupMembers(conversation.conversationId, [{ inboxId: member.inboxId }]);
+      state.status = `removed ${memberDisplayName(state, member.inboxId)}`;
+      await refresh({ preserveScroll: true });
+    } catch (error) {
+      state.status = `remove failed: ${errorMessage(error)}`;
+    }
+    return;
+  }
+  if (input === 'x') {
+    // XMTP forbids the last super admin leaving — say so before the network does.
+    const members = groupInfoMembers(state);
+    const self = members.find((candidate) => candidate.inboxId === state.identity.inboxId);
+    const otherOwner = members.some((candidate) => candidate.level === 'superAdmin' && candidate.inboxId !== state.identity.inboxId);
+    if (self?.level === 'superAdmin' && !otherOwner) {
+      state.status = 'you are the only owner — promote someone first (+ twice on a member)';
+      return;
+    }
+    if (state.pendingGroupAction !== 'leave') {
+      state.pendingGroupAction = 'leave';
+      state.status = `press x again to leave ${conversation.title} (visible to the group)`;
+      return;
+    }
+    state.pendingGroupAction = undefined;
+    try {
+      await client.leaveGroup(conversation.conversationId);
+      state.status = `left ${conversation.title} — history kept`;
+      await refresh({ preserveScroll: true });
+    } catch (error) {
+      state.status = `leave failed: ${errorMessage(error)}`;
+    }
+    return;
+  }
+  if (input === 'b') {
+    if (state.pendingGroupAction !== 'block') {
+      state.pendingGroupAction = 'block';
+      state.status = `press b again to block ${conversation.title} (hides it without telling anyone)`;
+      return;
+    }
+    state.pendingGroupAction = undefined;
+    await client.setConversationConsent(conversation.conversationId, 'denied');
+    enterChatSelect(state);
+    state.status = `blocked ${conversation.title}`;
+    await refresh();
+    return;
+  }
+  state.pendingGroupAction = undefined;
 }
 
 // Accept (allowed) or block (denied) the selected Request. Accept moves it to
@@ -362,6 +554,10 @@ async function handleChatTalkInput(
     const text = state.input.trim();
     const conversation = selectedConversation(state);
     const group = conversation?.kind === 'group' ? conversation : undefined;
+    if (group?.active === false) {
+      state.status = 'you are no longer a member of this group';
+      return;
+    }
     const target = sendTargetForState(state);
     const key = composerKey(state);
     if (!text || !key || (!target && !group)) {
@@ -422,8 +618,20 @@ async function handleChatComposeInput(
     return;
   }
   if (input === KEY.esc) {
-    enterChatSelect(state);
+    if (form.returnTo === 'group-info') {
+      enterGroupInfo(state);
+    } else {
+      enterChatSelect(state);
+    }
     state.status = 'cancelled';
+    return;
+  }
+  // A pending invite ignores everything but Esc, same as pairing.
+  if (form.pending) {
+    return;
+  }
+  if (isEnter(input) && (form.kind === 'group-invite' || form.kind === 'group-link')) {
+    leaveGroupForm(state, form);
     return;
   }
   if (input === KEY.up || input === KEY.down) {
@@ -441,6 +649,14 @@ async function handleChatComposeInput(
     }
     if (form.kind === 'name-peer') {
       await submitNamePeer(client, state, refresh);
+      return;
+    }
+    if (form.kind === 'group-rename') {
+      await submitGroupRename(client, state, refresh);
+      return;
+    }
+    if (form.kind === 'group-add-member') {
+      await submitGroupAddMember(client, state, refresh);
       return;
     }
     if (form.kind === 'timer') {
@@ -489,9 +705,60 @@ async function submitTimer(client: ConeClient, state: ChatState, refresh: Refres
     return;
   }
   await client.setRetention(form.targetConversationId, durationMs);
-  enterChatSelect(state);
+  leaveGroupForm(state, form);
   state.status = durationMs === null ? 'disappearing messages off' : `disappearing messages: ${formatRetention(durationMs)}`;
   await refresh();
+}
+
+// Group forms return to the group-info pane they were opened from.
+function leaveGroupForm(state: ChatState, form: ContactEditForm): void {
+  if (form.returnTo === 'group-info') {
+    enterGroupInfo(state);
+  } else {
+    enterChatSelect(state);
+  }
+}
+
+async function submitGroupRename(client: ConeClient, state: ChatState, refresh: RefreshChat): Promise<void> {
+  const form = state.editForm;
+  if (!form || !form.targetConversationId) {
+    return;
+  }
+  const name = formValue(form, 'name');
+  if (!name) {
+    form.error = 'Group name is required.';
+    return;
+  }
+  try {
+    await client.renameGroup(form.targetConversationId, name);
+  } catch (error) {
+    form.error = errorMessage(error);
+    return;
+  }
+  leaveGroupForm(state, form);
+  state.status = `renamed group to ${name}`;
+  await refresh({ preserveScroll: true });
+}
+
+async function submitGroupAddMember(client: ConeClient, state: ChatState, refresh: RefreshChat): Promise<void> {
+  const form = state.editForm;
+  if (!form || !form.targetConversationId) {
+    return;
+  }
+  const identity = formValue(form, 'identity');
+  if (!identity) {
+    form.error = 'A contact name, inbox ID, or address is required.';
+    return;
+  }
+  try {
+    await client.addGroupMembers(form.targetConversationId, [identity]);
+  } catch (error) {
+    form.error = errorMessage(error);
+    return;
+  }
+  leaveGroupForm(state, form);
+  state.status = `added ${identity}`;
+  await refresh({ preserveScroll: true });
 }
 
 // Save the active conversation's peer as a (named) contact. saveContact dedupes
@@ -522,6 +789,7 @@ async function handleContactsSelectInput(
   input: string,
   client: ConeClient,
   state: ChatState,
+  refresh: RefreshChat,
   quit: () => Promise<void>,
 ): Promise<void> {
   if (input === 'q') {
@@ -544,7 +812,7 @@ async function handleContactsSelectInput(
   if (input === 'c') {
     const created = await client.createHandshakeCode();
     startContactsEdit(state, createPairCreateResultForm(created.code, created.expiresAt));
-    state.status = 'created pairing code';
+    startPairWait(client, state, refresh, created.code);
     return;
   }
   if (input === 'p') {
@@ -686,6 +954,10 @@ async function submitContactEditForm(client: ConeClient, state: ChatState, refre
     enterContactsSelect(state);
     return;
   }
+  if (form.kind === 'group-join') {
+    submitGroupJoin(client, state, refresh);
+    return;
+  }
   submitPairJoin(client, state, refresh);
 }
 
@@ -791,6 +1063,36 @@ async function submitDeleteContact(client: ConeClient, state: ChatState, refresh
   await refresh();
 }
 
+// Minting a code joins its room immediately — pairing needs both sides
+// waiting, and "create, then separately join your own code" was a trap. The
+// wait runs in the background like every rendezvous flow.
+function startPairWait(client: ConeClient, state: ChatState, refresh: RefreshChat, code: string): void {
+  const form = state.editForm;
+  state.status = 'waiting for the other side to enter the code (up to 60s)';
+
+  void client.pairWithCode(code)
+    .then(async (result) => {
+      if (state.editForm === form && form) {
+        form.pending = false;
+        form.resultLines = [
+          `Paired with ${result.contact.name}.`,
+          `Inbox ${shortId(result.contact.inboxId)}`,
+          'Press r on their chat to give them a better name.',
+        ];
+      }
+      state.status = `paired with ${result.contact.name}`;
+      await refresh();
+    })
+    .catch(async (error: unknown) => {
+      if (state.editForm === form && form) {
+        form.pending = false;
+        form.error = `Pairing failed: ${errorMessage(error)}`;
+      }
+      state.status = `pairing failed: ${errorMessage(error)}`;
+      await refresh();
+    });
+}
+
 // Pairing blocks on the rendezvous for up to a minute. We must NOT await it in
 // the input handler — that would freeze the whole TUI. Instead we kick it off
 // in the background, show a waiting line, and reconcile when it settles.
@@ -841,6 +1143,87 @@ function submitPairJoin(client: ConeClient, state: ChatState, refresh: RefreshCh
         form.error = `Pairing failed: ${errorMessage(error)}`;
       }
       state.status = `pairing failed: ${errorMessage(error)}`;
+      await refresh();
+    });
+}
+
+// Inviter side of the synchronous group code. Like pairing, the rendezvous
+// wait must never block the input loop; the form shows the code while pending
+// and reconciles when the joiner arrives (or the code times out).
+function startGroupInvite(
+  client: ConeClient,
+  state: ChatState,
+  refresh: RefreshChat,
+  conversation: ConeConversation,
+  code: string,
+): void {
+  const form = state.editForm;
+  state.status = 'waiting for someone to join the code (up to 60s)';
+
+  void client.inviteToGroupWithCode(code, conversation.conversationId)
+    .then(async (result) => {
+      const joinerName = result.joiner.proposedName ?? shortId(result.joiner.inboxId);
+      if (state.editForm === form && form) {
+        form.pending = false;
+        form.resultLines = [
+          `Added ${joinerName} to ${conversation.title}.`,
+          ...(result.joiner.proposedName
+            ? [`They call themselves ${result.joiner.proposedName} — save a contact to keep the name.`]
+            : []),
+        ];
+      }
+      state.status = `added ${joinerName} to ${conversation.title}`;
+      await refresh({ preserveScroll: true });
+    })
+    .catch(async (error: unknown) => {
+      if (state.editForm === form && form) {
+        form.pending = false;
+        form.error = `Invite failed: ${errorMessage(error)}`;
+      }
+      state.status = `invite failed: ${errorMessage(error)}`;
+      await refresh({ preserveScroll: true });
+    });
+}
+
+// Joiner side: the join request also waits on the rendezvous in the
+// background. Success means the request reached the inviter — membership
+// itself arrives with the XMTP welcome on a later sync.
+function submitGroupJoin(client: ConeClient, state: ChatState, refresh: RefreshChat): void {
+  const form = state.editForm;
+  if (!form || form.pending) {
+    return;
+  }
+
+  const code = formValue(form, 'code');
+  if (!code) {
+    form.error = 'Invite code is required.';
+    return;
+  }
+
+  const shareName = formValue(form, 'shareName') || undefined;
+  form.pending = true;
+  form.error = undefined;
+  state.status = 'joining… waiting for the inviter (up to 60s)';
+
+  void client.joinGroupWithCode(code, { proposedName: shareName })
+    .then(async (result) => {
+      const groupLabel = result.groupName ?? 'the group';
+      if (state.editForm === form) {
+        form.pending = false;
+        form.resultLines = [
+          `Requested to join ${groupLabel} (${result.memberCount} members).`,
+          'The inviter adds you over XMTP — the chat appears after the next sync.',
+        ];
+      }
+      state.status = `join requested: ${groupLabel}`;
+      await refresh();
+    })
+    .catch(async (error: unknown) => {
+      if (state.editForm === form) {
+        form.pending = false;
+        form.error = `Join failed: ${errorMessage(error)}`;
+      }
+      state.status = `join failed: ${errorMessage(error)}`;
       await refresh();
     });
 }

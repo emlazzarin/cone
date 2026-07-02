@@ -12,12 +12,12 @@ function message(partial: Partial<ConeMessage> & Pick<ConeMessage, 'messageId' |
   };
 }
 
-const READ = { type: 'cos.read.v1' };
+const READ = { type: 'cone.read.v1' };
 
 describe('read receipts', () => {
   test('isReadReceipt recognizes only the read-receipt envelope', () => {
     expect(isReadReceipt({ json: READ })).toBe(true);
-    expect(isReadReceipt({ json: { type: 'cos.pair.confirm.v1' } })).toBe(false);
+    expect(isReadReceipt({ json: { type: 'cone.pair.confirm.v1' } })).toBe(false);
     expect(isReadReceipt({ json: undefined })).toBe(false);
     expect(isReadReceipt({ json: { value: 'hi' } })).toBe(false);
   });
@@ -89,7 +89,7 @@ describe('delivery status', () => {
 
 describe('group updates', () => {
   const update = {
-    type: 'cos.group.update.v1' as const,
+    type: 'cone.group.update.v1' as const,
     initiatedByInboxId: 'inbox-alice',
     added: ['inbox-bob'],
     removed: [] as string[],
@@ -104,6 +104,34 @@ describe('group updates', () => {
       'Alice added Bob',
       'Carol left',
       'Alice renamed the group to Crew',
+    ]);
+  });
+
+  test('a disappearing-timer change renders once, with the duration', async () => {
+    const { formatGroupUpdate } = await import('../src/index');
+    // One timer change arrives as two metadata field changes (from_ns + in_ns).
+    const timerUpdate = {
+      ...update,
+      added: [],
+      left: [],
+      metadataChanges: [
+        { field: 'message_disappear_from_ns', oldValue: '0', newValue: '1750000000000000000' },
+        { field: 'message_disappear_in_ns', oldValue: '0', newValue: '3600000000000' },
+      ],
+    };
+    expect(formatGroupUpdate(timerUpdate, () => 'Alice')).toEqual([
+      'Alice set disappearing messages to 1h',
+    ]);
+
+    const offUpdate = {
+      ...timerUpdate,
+      metadataChanges: [
+        { field: 'message_disappear_from_ns', oldValue: '1750000000000000000', newValue: '0' },
+        { field: 'message_disappear_in_ns', oldValue: '3600000000000', newValue: '0' },
+      ],
+    };
+    expect(formatGroupUpdate(offUpdate, () => 'Alice')).toEqual([
+      'Alice turned disappearing messages off',
     ]);
   });
 

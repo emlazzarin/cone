@@ -5,13 +5,16 @@
   "type": "module",
   "dependencies": {
     "@cone/core": "workspace:*",
-    "@cone/xmtp-browser": "workspace:*"
+    "@cone/xmtp-browser": "workspace:*",
+    "preact": "^10.27.2"
   },
   "scripts": {
     "build": "vite build",
     "dev": "vite --host 0.0.0.0",
-    "preview": "vite preview --host 0.0.0.0",
-    "test": "bun test",
-    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.2",
+    "vite": "^7.2.4"
   }
 }

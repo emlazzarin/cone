@@ -6,10 +6,9 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@cone/core": "workspace:*"
-  },
-  "scripts": {
-    "test": "bun test",
-    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+    "@cone/core": "workspace:*",
+    "@xmtp/node-bindings": ">=1.11.0-nightly <2.0.0-0",
+    "@xmtp/node-sdk": ">=6.1.0-nightly <6.2.0",
+    "viem": "^2.40.0"
   }
 }

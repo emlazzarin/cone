@@ -11,7 +11,7 @@ import {
 } from './encoding';
 import type { DerivedAccount, SecretKey, XmtpEnv } from './types';
 
-const SECRET_PREFIX = 'cos_sk_v1_';
+const SECRET_PREFIX = 'cone_sk_v1_';
 const SECRET_VERSION = 1;
 const SEED_LENGTH = 32;
 const CHECKSUM_LENGTH = 4;
@@ -39,7 +39,7 @@ export function deriveAccount(
   const env = options.env ?? 'dev';
   const accountId = options.accountId ?? 'main';
   const seed = decodeSecretSeed(secret);
-  const salt = utf8ToBytes(`cone-of-silence/v1/${env}/${accountId}`);
+  const salt = utf8ToBytes(`cone/v1/${env}/${accountId}`);
 
   return {
     accountId,

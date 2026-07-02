@@ -62,6 +62,44 @@ export function codeScopedKey(code: string): Uint8Array {
   return sha256(utf8ToBytes(`cone-pairing-code:v1:${normalizeHandshakeCode(code)}`)).slice(0, AES_KEY_LENGTH);
 }
 
+// Rendezvous v2: the room is addressed by a hash of the shared secret, so the
+// worker relays ciphertext it can never decrypt (v1 sent the raw code, which
+// is also the encryption key's input). Domain-separated from the encryption
+// keys so a room id can never double as key material.
+export function secretRoomId(secret: string): string {
+  return sha256Hex(`cone-rendezvous-room:v1:${normalizeRendezvousSecret(secret)}`);
+}
+
+// Async group invite tokens are base64url and therefore case-sensitive —
+// unlike spoken handshake codes they must NOT be lowercased.
+export const GROUP_INVITE_TOKEN_PREFIX = 'cone_gi_v1_';
+
+export function isGroupInviteToken(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.startsWith(GROUP_INVITE_TOKEN_PREFIX) && trimmed.length > GROUP_INVITE_TOKEN_PREFIX.length;
+}
+
+export function generateGroupInviteToken(): string {
+  const secret = crypto.getRandomValues(new Uint8Array(16));
+  return `${GROUP_INVITE_TOKEN_PREFIX}${base64UrlEncode(secret)}`;
+}
+
+// The shared secret behind a rendezvous exchange: a handshake code (spoken,
+// case-insensitive) or an invite token (pasted, case-sensitive).
+export function normalizeRendezvousSecret(secret: string): string {
+  const trimmed = secret.trim();
+  return isGroupInviteToken(trimmed) ? trimmed : normalizeHandshakeCode(trimmed);
+}
+
+// Encryption key for group-invite payloads under a code or token.
+export function inviteScopedKey(secret: string): Uint8Array {
+  const trimmed = secret.trim();
+  if (isGroupInviteToken(trimmed)) {
+    return sha256(utf8ToBytes(`cone-invite-token:v1:${trimmed}`)).slice(0, AES_KEY_LENGTH);
+  }
+  return codeScopedKey(trimmed);
+}
+
 export function normalizeHandshakeCode(code: string): string {
   return code.trim().toLowerCase().replaceAll(/\s+/gu, '-');
 }

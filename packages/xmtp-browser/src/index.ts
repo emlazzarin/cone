@@ -1,6 +1,6 @@
 import { Client, ConsentEntityType, ConsentState, ConversationType, GroupPermissionsOptions, IdentifierKind, PermissionLevel, type ClientOptions, type Identifier, type XmtpEnv as SdkXmtpEnv } from '@xmtp/browser-sdk';
 import { hexToBytes, type DerivedAccount, type XmtpAdapter } from '@cone/core';
-import { createSdkXmtpAdapter, type SdkClient, type SdkDm } from '@cone/core/xmtp';
+import { createSdkXmtpAdapter, type SdkClient, type SdkDm, type SdkGroup } from '@cone/core/xmtp';
 import { privateKeyToAccount } from 'viem/accounts';
 
 export { IndexedDbStore } from './store';
@@ -51,7 +51,8 @@ export async function createBrowserXmtpAdapter(options: BrowserXmtpAdapterOption
     adminOnlyPermissions: GroupPermissionsOptions.AdminOnly,
     dmConversationType: ConversationType.Dm,
     groupConversationType: ConversationType.Group,
-    // peerInboxId is an async method on browser-sdk DMs.
+    // peerInboxId and isActive are async methods on browser-sdk conversations.
     peerInboxId: (dm: SdkDm) => (dm as unknown as { peerInboxId(): Promise<string> }).peerInboxId(),
+    groupIsActive: (group: SdkGroup) => (group as unknown as { isActive(): Promise<boolean> }).isActive(),
   });
 }

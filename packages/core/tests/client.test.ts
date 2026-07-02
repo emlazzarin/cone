@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   createConeClient,
   deriveAccount,
+  encryptJson,
   MemoryStore,
   secretKeyFromHexSeed,
   type ConeConsentState,
@@ -70,6 +71,7 @@ describe('ConeClient', () => {
     });
     await adapter.emit({
       conversationId: 'dm-inbound',
+      conversationKind: 'dm',
       messageId: 'msg-inbound',
       raw: {},
       senderAddress: '0x2222222222222222222222222222222222222222',
@@ -126,6 +128,7 @@ describe('ConeClient', () => {
     await client.streamMessages(() => {}, { consentStates: ['allowed', 'unknown'] });
     await adapter.emit({
       conversationId: 'dm-req',
+      conversationKind: 'dm',
       messageId: 'msg-req',
       raw: {},
       senderInboxId: 'inbox-stranger',
@@ -150,6 +153,7 @@ describe('ConeClient', () => {
 
     await adapter.emit({
       conversationId: 'dm-frank',
+      conversationKind: 'dm',
       messageId: 'msg-frank',
       raw: {},
       senderInboxId: 'inbox-frank',
@@ -167,8 +171,9 @@ describe('ConeClient', () => {
     await client.streamMessages(() => {});
     await adapter.emit({
       conversationId: 'dm-control',
+      conversationKind: 'dm',
       json: {
-        type: 'cos.pair.confirm.v1',
+        type: 'cone.pair.confirm.v1',
         inboxId: 'inbox-peer',
         codeAcceptedAt: new Date().toISOString(),
       },
@@ -176,21 +181,21 @@ describe('ConeClient', () => {
       raw: {},
       senderInboxId: 'inbox-peer',
       sentAt: new Date().toISOString(),
-      text: JSON.stringify({ type: 'cos.pair.confirm.v1' }),
+      text: JSON.stringify({ type: 'cone.pair.confirm.v1' }),
     });
 
     const [message] = await client.listMessages('dm-control');
     expect(message?.kind).toBe('control');
-    expect(message?.json).toMatchObject({ type: 'cos.pair.confirm.v1' });
+    expect(message?.json).toMatchObject({ type: 'cone.pair.confirm.v1' });
   });
 
-  test('sendReadReceipt publishes a cos.read.v1 envelope without persisting it locally', async () => {
+  test('sendReadReceipt publishes a cone.read.v1 envelope without persisting it locally', async () => {
     const adapter = new FakeAdapter();
     const client = await makeClient(adapter);
 
     await client.sendReadReceipt({ inboxId: 'inbox-peer' });
 
-    expect(adapter.sent.at(-1)).toEqual({ inboxId: 'inbox-peer', text: JSON.stringify({ type: 'cos.read.v1' }) });
+    expect(adapter.sent.at(-1)).toEqual({ inboxId: 'inbox-peer', text: JSON.stringify({ type: 'cone.read.v1' }) });
     // Our own receipts are fire-and-forget; only the peer's receipts matter.
     expect(await client.listMessages()).toHaveLength(0);
   });
@@ -205,6 +210,7 @@ describe('ConeClient', () => {
     }];
     adapter.networkMessages = [{
       conversationId: 'dm-synced',
+      conversationKind: 'dm',
       messageId: 'msg-synced',
       raw: {},
       senderInboxId: 'inbox-peer',
@@ -522,6 +528,63 @@ describe('ConeClient', () => {
     expect(conversation?.peerInboxId).toBeUndefined();
   });
 
+  test('renameGroup is mirror-first: the local row updates even when the network write fails', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+    const created = await client.createGroup({ name: 'Crew', members: [{ inboxId: 'inbox-bob' }] });
+
+    await client.renameGroup(created.conversationId, 'New Crew');
+    expect(adapter.metadataUpdates).toEqual([{ conversationId: created.conversationId, name: 'New Crew' }]);
+    let conversation = (await client.listConversations()).find((entry) => entry.conversationId === created.conversationId);
+    expect(conversation?.title).toBe('New Crew');
+    expect(conversation?.groupName).toBe('New Crew');
+
+    adapter.failGroupMetadataWrites = true;
+    await client.renameGroup(created.conversationId, 'Offline Name');
+    conversation = (await client.listConversations()).find((entry) => entry.conversationId === created.conversationId);
+    expect(conversation?.title).toBe('Offline Name');
+  });
+
+  test('setGroupMemberLevel diffs the current role into admin/super-admin list changes', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+    const created = await client.createGroup({ name: 'Crew', members: [{ inboxId: 'inbox-bob' }] });
+
+    // member -> admin
+    await client.setGroupMemberLevel(created.conversationId, { inboxId: 'inbox-bob' }, 'admin');
+    expect(adapter.adminChanges).toEqual([{ conversationId: created.conversationId, inboxId: 'inbox-bob', op: 'addAdmin' }]);
+
+    // admin -> superAdmin (transfer ownership is this, pointed at someone else)
+    adapter.adminChanges = [];
+    await client.setGroupMemberLevel(created.conversationId, { inboxId: 'inbox-bob' }, 'superAdmin');
+    expect(adapter.adminChanges.map((change) => change.op)).toEqual(['addSuperAdmin', 'removeAdmin']);
+
+    // superAdmin -> member
+    adapter.adminChanges = [];
+    await client.setGroupMemberLevel(created.conversationId, { inboxId: 'inbox-bob' }, 'member');
+    expect(adapter.adminChanges.map((change) => change.op)).toEqual(['removeSuperAdmin']);
+
+    // Same level is a no-op; a non-member is an error.
+    adapter.adminChanges = [];
+    await client.setGroupMemberLevel(created.conversationId, { inboxId: 'inbox-bob' }, 'member');
+    expect(adapter.adminChanges).toEqual([]);
+    await expect(client.setGroupMemberLevel(created.conversationId, { inboxId: 'inbox-nobody' }, 'admin')).rejects.toThrow(/not a group member/);
+  });
+
+  test('leaving a group marks the row inactive and blocks further sends', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+    const created = await client.createGroup({ name: 'Crew', members: [{ inboxId: 'inbox-bob' }] });
+
+    await client.leaveGroup(created.conversationId);
+
+    expect(adapter.leftGroups).toEqual([created.conversationId]);
+    const conversation = (await client.listConversations()).find((entry) => entry.conversationId === created.conversationId);
+    // The row and its history survive; it is just no longer sendable.
+    expect(conversation?.active).toBe(false);
+    await expect(client.sendToConversation(created.conversationId, 'hello?')).rejects.toThrow(/no longer a member/);
+  });
+
   test('group accept/block targets the group id, not a member inbox', async () => {
     const adapter = new FakeAdapter();
     const client = await makeClient(adapter);
@@ -554,6 +617,7 @@ describe('ConeClient', () => {
     }];
     adapter.networkMessages = [{
       conversationId: 'dm-local',
+      conversationKind: 'dm',
       messageId: 'msg-local',
       raw: {},
       senderInboxId: 'inbox-peer',
@@ -567,6 +631,78 @@ describe('ConeClient', () => {
 
     expect(await client.listConversations()).toHaveLength(0);
     expect(await client.listMessages('dm-local')).toHaveLength(0);
+  });
+
+  test('sync folds a duplicate DM row into the canonical thread', async () => {
+    const adapter = new FakeAdapter();
+    const store = new MemoryStore();
+    // A duplicate MLS DM persisted earlier (or created by a streamed message),
+    // with history in it.
+    await store.putConversation({
+      conversationId: 'dm-duplicate',
+      kind: 'dm',
+      peerInboxId: 'inbox-peer',
+      title: 'inbox-peer',
+      consentState: 'allowed',
+    });
+    await store.putMessage({
+      messageId: 'msg-old',
+      conversationId: 'dm-duplicate',
+      senderInboxId: 'inbox-peer',
+      sentAt: '2026-01-01T00:00:00.000Z',
+      kind: 'text',
+      encryptedPayload: await encryptJson(deriveAccount(secretKeyFromHexSeed('01'.repeat(32)), { env: 'dev' }).coneStorageKey, 'cone.message.v1', 'old hello'),
+    });
+    // The network lists only the canonical DM for that peer.
+    adapter.conversations = [{
+      conversationId: 'dm-canonical',
+      kind: 'dm',
+      peerInboxId: 'inbox-peer',
+      title: 'inbox-peer',
+      consentState: 'allowed',
+    }];
+
+    const client = await makeClient(adapter, store);
+    await client.sync();
+
+    const rows = (await client.listConversations()).filter((row) => row.peerInboxId === 'inbox-peer');
+    expect(rows.map((row) => row.conversationId)).toEqual(['dm-canonical']);
+    // The duplicate's history now lives under the canonical thread.
+    expect((await client.listMessages('dm-canonical')).map((message) => message.messageId)).toContain('msg-old');
+    expect(await client.listMessages('dm-duplicate')).toHaveLength(0);
+  });
+
+  test('self contacts are removed and self-DMs are hidden', async () => {
+    const adapter = new FakeAdapter();
+    const store = new MemoryStore();
+    // A "Me" contact created by an earlier build.
+    await store.putContact({
+      contactId: 'contact-self',
+      name: 'Me',
+      inboxId: 'inbox-self',
+      source: 'self',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+    await store.putConversation({
+      conversationId: 'dm-self',
+      kind: 'dm',
+      peerInboxId: 'inbox-self',
+      title: 'Me',
+      consentState: 'allowed',
+    });
+    await store.putConversation({
+      conversationId: 'dm-peer',
+      kind: 'dm',
+      peerInboxId: 'inbox-peer',
+      title: 'Peer',
+      consentState: 'allowed',
+    });
+
+    const client = await makeClient(adapter, store);
+
+    expect((await client.listContacts()).some((contact) => contact.source === 'self')).toBe(false);
+    expect((await client.listConversations()).map((row) => row.conversationId)).toEqual(['dm-peer']);
   });
 });
 
@@ -591,6 +727,9 @@ class FakeAdapter implements XmtpAdapter {
   createdGroups: Array<{ memberInboxIds: string[]; options?: CreateGroupOptions }> = [];
   memberChanges: Array<{ conversationId: string; added?: string[]; removed?: string[] }> = [];
   leftGroups: string[] = [];
+  metadataUpdates: Array<{ conversationId: string; name?: string; description?: string }> = [];
+  adminChanges: Array<{ conversationId: string; inboxId: string; op: 'addAdmin' | 'removeAdmin' | 'addSuperAdmin' | 'removeSuperAdmin' }> = [];
+  failGroupMetadataWrites = false;
   retention = new Map<string, MessageRetention>();
   failRetentionWrites = false;
   clock: (() => Date) | null = null;
@@ -737,6 +876,67 @@ class FakeAdapter implements XmtpAdapter {
 
   leaveGroup(conversationId: string): Promise<void> {
     this.leftGroups.push(conversationId);
+    return Promise.resolve();
+  }
+
+  updateGroupName(conversationId: string, name: string): Promise<void> {
+    if (this.failGroupMetadataWrites) {
+      return Promise.reject(new Error('network unavailable'));
+    }
+    this.metadataUpdates.push({ conversationId, name });
+    return Promise.resolve();
+  }
+
+  updateGroupDescription(conversationId: string, description: string): Promise<void> {
+    if (this.failGroupMetadataWrites) {
+      return Promise.reject(new Error('network unavailable'));
+    }
+    this.metadataUpdates.push({ conversationId, description });
+    return Promise.resolve();
+  }
+
+  addGroupAdmin(conversationId: string, inboxId: string): Promise<void> {
+    return this.recordAdminChange(conversationId, inboxId, 'addAdmin');
+  }
+
+  removeGroupAdmin(conversationId: string, inboxId: string): Promise<void> {
+    return this.recordAdminChange(conversationId, inboxId, 'removeAdmin');
+  }
+
+  addGroupSuperAdmin(conversationId: string, inboxId: string): Promise<void> {
+    return this.recordAdminChange(conversationId, inboxId, 'addSuperAdmin');
+  }
+
+  removeGroupSuperAdmin(conversationId: string, inboxId: string): Promise<void> {
+    return this.recordAdminChange(conversationId, inboxId, 'removeSuperAdmin');
+  }
+
+  private recordAdminChange(conversationId: string, inboxId: string, op: 'addAdmin' | 'removeAdmin' | 'addSuperAdmin' | 'removeSuperAdmin'): Promise<void> {
+    this.adminChanges.push({ conversationId, inboxId, op });
+    // Keep the fake's member mirror consistent so setGroupMemberLevel diffs
+    // work. XMTP tracks two separate lists and reports the highest — so
+    // removeAdmin must not downgrade a super admin.
+    const group = this.groups.get(conversationId);
+    if (group?.members) {
+      this.groups.set(conversationId, {
+        ...group,
+        members: group.members.map((member) => {
+          if (member.inboxId !== inboxId) {
+            return member;
+          }
+          if (op === 'addSuperAdmin') {
+            return { ...member, level: 'superAdmin' as const };
+          }
+          if (op === 'addAdmin') {
+            return member.level === 'superAdmin' ? member : { ...member, level: 'admin' as const };
+          }
+          if (op === 'removeAdmin') {
+            return member.level === 'admin' ? { ...member, level: 'member' as const } : member;
+          }
+          return member.level === 'superAdmin' ? { ...member, level: 'member' as const } : member;
+        }),
+      });
+    }
     return Promise.resolve();
   }
 

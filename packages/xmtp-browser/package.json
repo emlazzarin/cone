@@ -6,10 +6,8 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@cone/core": "workspace:*"
-  },
-  "scripts": {
-    "test": "bun test",
-    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+    "@cone/core": "workspace:*",
+    "@xmtp/browser-sdk": "^7.0.0",
+    "viem": "^2.40.0"
   }
 }

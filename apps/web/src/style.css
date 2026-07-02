@@ -1,4 +1,4 @@
-/* Cone of Silence — unified dark CRT terminal.
+/* Cone — unified dark CRT terminal.
    One surface system for login + app. Amber is the single signature accent;
    green means live/sent, red means trouble. Everything else stays neutral so
    the screen feels calm even when it's dense. */
@@ -727,8 +727,129 @@ kbd {
   font-size: 11px;
 }
 
+/* Group meta doubles as the info-panel toggle. */
+.thread__peer--btn {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 2px 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+
+.thread__peer--btn:hover,
+.thread__peer--btn.active {
+  border-color: var(--line);
+  color: var(--text-dim);
+}
+
 .thread__spacer {
   flex: 1;
+}
+
+/* Group info panel: members with roles, add/remove, rename, leave/block. */
+.group-info {
+  border-bottom: 1px solid var(--line);
+  padding: 10px 14px;
+  display: grid;
+  gap: 8px;
+  font-size: 13px;
+  max-height: 45%;
+  overflow-y: auto;
+}
+
+.group-info__desc {
+  margin: 0;
+  color: var(--text-dim);
+}
+
+.group-info__note {
+  margin: 0;
+  color: var(--text-faint);
+}
+
+.group-info__rename,
+.group-info__add {
+  display: flex;
+  gap: 6px;
+}
+
+.group-info__rename input,
+.group-info__add input {
+  flex: 1;
+  min-height: 30px;
+  font-size: 13px;
+}
+
+.group-info__members {
+  display: grid;
+  gap: 2px;
+}
+
+.group-info__member {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.group-info__name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-info__actions {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.group-info__actions button {
+  min-height: 24px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.group-info__foot {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.group-info__invite {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.group-info__invite .code {
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  color: var(--amber);
+  overflow-wrap: anywhere;
+}
+
+.role-chip {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 10px;
+  color: var(--text-dim);
+  vertical-align: middle;
+}
+
+.role-chip.owner {
+  color: var(--amber);
+  border-color: var(--amber-dim);
+}
+
+.role-chip.blocked {
+  color: var(--red);
+  border-color: var(--red);
 }
 
 /* Disappearing-messages timer in the chat header: ⌛ glyph + compact select. */
@@ -883,6 +1004,17 @@ kbd {
 
 .sys b {
   color: var(--text-dim);
+}
+
+/* Inline system lines inside a live transcript (group updates, join notice)
+   sit in the flow instead of centering like the empty-state block. */
+.sys--inline {
+  margin: 0;
+  padding: 2px 0;
+}
+
+.sys--inline p {
+  margin: 0;
 }
 
 /* Composer */

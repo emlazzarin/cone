@@ -1,27 +1,16 @@
-export {
-  base64UrlDecode,
-  base64UrlEncode,
-  bytesToHex,
-  bytesToUtf8,
-  concatBytes,
-  hexToBytes,
-  utf8ToBytes,
-} from './encoding';
+// Public surface of @cone/core: what the CLI, PWA, adapters, and tests
+// actually consume. Internal helpers (encoding, validation, envelope plumbing)
+// stay module-private — import them directly within core, not from here.
+export { hexToBytes } from './encoding';
 export {
   codeScopedKey,
-  decryptBytes,
   decryptJson,
-  encryptBytes,
   encryptJson,
-  normalizeHandshakeCode,
-  randomHandshakeCode,
-  randomId,
-  sha256Hex,
+  isGroupInviteToken,
+  secretRoomId,
 } from './crypto';
 export {
-  decodeSecretSeed,
   deriveAccount,
-  encodeSecretSeed,
   generateSecretKey,
   parseSecretKey,
   secretKeyFromHexSeed,
@@ -33,12 +22,12 @@ export {
   formatConversationPreview,
   formatMessageLine,
   formatSyncStatus,
-  formatTranscriptLine,
   formatTranscriptTime,
   formatGroupUpdate,
+  groupHistoryNotice,
   isAllowedConversation,
   isDeniedConversation,
-  isGroupConversation,
+  isGroupUpdateMessage,
   isReadReceipt,
   isRequestConversation,
   isVisibleChatMessage,
@@ -50,24 +39,27 @@ export {
   normalizeDeliveryStatus,
   relativeTime,
 } from './display';
-export type { ConeConnectionStatus, TranscriptLineInput } from './display';
+export type { ConeConnectionStatus } from './display';
 export {
-  APP_JSON_TYPE,
   GROUP_UPDATE_TYPE,
-  PAIR_CONFIRM_TYPE,
   READ_RECEIPT_TYPE,
-  envelopeType,
-  isAppJsonEnvelope,
-  isControlEnvelope,
   isGroupUpdateEnvelope,
 } from './envelope';
-export type { GroupUpdateEnvelope } from './envelope';
 export {
-  PAIRING_TTL_MS,
   createEncryptedPairingOffer,
   createHandshakeCode,
   decryptPeerOffer,
 } from './pairing';
+export {
+  GROUP_INVITE_LINK_TTL_MS,
+  GROUP_INVITE_TTL_MS,
+  createEncryptedGroupDescriptor,
+  createEncryptedJoinRequest,
+  decryptGroupDescriptor,
+  decryptJoinRequest,
+  decryptJoinRequests,
+} from './invites';
+export type { GroupInviteDescriptor } from './invites';
 export {
   RETENTION_PRESETS_MS,
   formatRetention,
@@ -77,15 +69,6 @@ export {
 } from './retention';
 export { MemoryStore } from './store';
 export { HttpRendezvousClient } from './rendezvous';
-export {
-  assertValidContactInput,
-  contactMatchesName,
-  isEvmAddress,
-  isLikelyInboxId,
-  normalizeContactName,
-  normalizeIdentityRef,
-} from './validation';
-export { CONSENT_STATES } from './types';
 export type {
   ConeClient,
   ConeConsentState,
@@ -104,6 +87,9 @@ export type {
   CreateGroupInput,
   CreateGroupOptions,
   DerivedAccount,
+  GroupInviteLink,
+  GroupInviteResult,
+  GroupJoinResult,
   GroupMemberLevel,
   HandshakeCode,
   IdentityRef,
@@ -115,7 +101,9 @@ export type {
   MessageRetention,
   PairingOffer,
   PairingResult,
+  PendingGroupJoin,
   RendezvousClient,
+  RendezvousRole,
   RendezvousStoredOffer,
   ResolvedIdentity,
   SaveContactInput,

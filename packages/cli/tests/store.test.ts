@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Database } from 'bun:sqlite';
 import { existsSync, rmSync } from 'node:fs';
 
 import { deriveAccount, encryptJson, secretKeyFromHexSeed, type ConeConversation, type Contact, type StoredMessage } from '@cone/core';
@@ -93,30 +92,6 @@ describe('BunSQLiteStore', () => {
     reopened.close();
   });
 
-  test('migrates a pre-groups database whose peer column was NOT NULL', async () => {
-    const path = tempPath();
-    // Recreate the legacy schema by hand, with a row in it.
-    const legacy = new Database(path, { create: true });
-    legacy.exec(`
-      create table conversations (
-        conversation_id text primary key,
-        peer_inbox_id text not null,
-        title text not null,
-        updated_at text,
-        data text not null
-      );
-    `);
-    const dm = { conversationId: 'dm-old', kind: 'dm', peerInboxId: 'inbox-old', title: 'Old', consentState: 'allowed' };
-    legacy.query(`insert into conversations values (?, ?, ?, ?, ?)`).run('dm-old', 'inbox-old', 'Old', null, JSON.stringify(dm));
-    legacy.close();
-
-    const store = new BunSQLiteStore(path);
-    // The legacy row survives the rebuild, and group rows now insert cleanly.
-    expect(await store.getConversationById('dm-old')).toEqual(dm as ConeConversation);
-    await store.putConversation({ conversationId: 'group-new', kind: 'group', title: 'Crew', consentState: 'allowed' });
-    expect((await store.listConversations()).map((conversation) => conversation.conversationId).sort()).toEqual(['dm-old', 'group-new']);
-    store.close();
-  });
 });
 
 function tempPath(): string {

@@ -6,7 +6,7 @@ describe('secret keys', () => {
   test('generates parseable Cone secret keys', () => {
     const secret = generateSecretKey();
 
-    expect(secret.startsWith('cos_sk_v1_')).toBe(true);
+    expect(secret.startsWith('cone_sk_v1_')).toBe(true);
     expect(parseSecretKey(secret)).toBe(secret);
   });
 
@@ -25,7 +25,7 @@ describe('secret keys', () => {
 
   test('rejects corrupted checksums', () => {
     const secret = generateSecretKey();
-    const index = 'cos_sk_v1_'.length + 8;
+    const index = 'cone_sk_v1_'.length + 8;
     const replacement = secret[index] === 'A' ? 'B' : 'A';
     const corrupted = `${secret.slice(0, index)}${replacement}${secret.slice(index + 1)}`;
 

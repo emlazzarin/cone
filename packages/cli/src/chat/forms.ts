@@ -90,16 +90,20 @@ export function createNewMessageForm(): ContactEditForm {
   };
 }
 
+// Minting a code immediately joins its room: pairing needs both sides
+// waiting, so the code stays on screen while this side polls in the
+// background (the same non-blocking pattern as group invites).
 export function createPairCreateResultForm(code: string, expiresAt: string): ContactEditForm {
   return {
     activeField: 0,
     fields: [],
     kind: 'pair-create',
+    pending: true,
     resultLines: [
       code,
       `Code expires at ${formatTranscriptTime(expiresAt)} — the pairing itself is permanent.`,
       'Give this code to the other person or agent.',
-      `CLI: cos pair ${code}`,
+      `CLI: cone pair ${code}`,
     ],
     submitLabel: 'Done',
     title: 'Pairing code created',
@@ -117,6 +121,87 @@ export function createPairJoinForm(): ContactEditForm {
     kind: 'pair-join',
     submitLabel: 'Join',
     title: 'Join pairing code',
+  };
+}
+
+// Synchronous group invite: the code stays on screen while the background
+// invite waits for a join request. Single use, expires with the code.
+export function createGroupInviteForm(conversation: ConeConversation, code: string, expiresAt: string): ContactEditForm {
+  return {
+    activeField: 0,
+    fields: [],
+    kind: 'group-invite',
+    pending: true,
+    resultLines: [
+      code,
+      `Code expires at ${formatTranscriptTime(expiresAt)} — single use.`,
+      'Give this code to the person joining.',
+      `CLI: cone group join ${code}`,
+    ],
+    returnTo: 'group-info',
+    submitLabel: 'Done',
+    targetConversationId: conversation.conversationId,
+    title: `Invite to ${conversation.title}`,
+  };
+}
+
+// Async invite link: no waiting — the token is a capability, and joiners are
+// admitted by this account's next sync (the TUI's auto-sync covers it).
+export function createGroupLinkResultForm(
+  conversation: ConeConversation,
+  link: { token: string; expiresAt: string; maxUses: number },
+): ContactEditForm {
+  return {
+    activeField: 0,
+    fields: [],
+    kind: 'group-link',
+    resultLines: [
+      link.token,
+      `Expires ${formatTranscriptTime(link.expiresAt)} — ${link.maxUses} use${link.maxUses === 1 ? '' : 's'}.`,
+      'Anyone with the token can join; they are added when this account syncs.',
+      `CLI: cone group join ${link.token}`,
+    ],
+    returnTo: 'group-info',
+    submitLabel: 'Done',
+    targetConversationId: conversation.conversationId,
+    title: `Invite link — ${conversation.title}`,
+  };
+}
+
+export function createGroupJoinForm(): ContactEditForm {
+  return {
+    activeField: 0,
+    fields: [
+      { key: 'code', label: 'Invite code', value: '' },
+      { key: 'shareName', label: 'Offer them a name for you (optional)', value: '' },
+    ],
+    kind: 'group-join',
+    submitLabel: 'Join',
+    title: 'Join group by code',
+  };
+}
+
+export function createGroupRenameForm(conversation: ConeConversation): ContactEditForm {
+  return {
+    activeField: 0,
+    fields: [{ key: 'name', label: 'Group name (shared — every member sees it)', value: conversation.groupName ?? '' }],
+    kind: 'group-rename',
+    returnTo: 'group-info',
+    submitLabel: 'Rename',
+    targetConversationId: conversation.conversationId,
+    title: `Rename group ${conversation.title}`,
+  };
+}
+
+export function createGroupAddMemberForm(conversation: ConeConversation): ContactEditForm {
+  return {
+    activeField: 0,
+    fields: [{ key: 'identity', label: 'Contact name, XMTP inbox ID, or EVM address', value: '' }],
+    kind: 'group-add-member',
+    returnTo: 'group-info',
+    submitLabel: 'Add',
+    targetConversationId: conversation.conversationId,
+    title: `Add member to ${conversation.title}`,
   };
 }
 

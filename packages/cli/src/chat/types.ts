@@ -7,7 +7,7 @@ export interface ChatOptions {
   onReadReceiptsChange?: (value: boolean) => void;
 }
 
-export type ChatMode = 'chat-compose' | 'chat-select' | 'chat-talk' | 'contacts-select' | 'contacts-edit';
+export type ChatMode = 'chat-compose' | 'chat-select' | 'chat-talk' | 'contacts-select' | 'contacts-edit' | 'group-info';
 // Within the Chats pane, the list shows either the allowed inbox or the
 // unknown-sender Requests sub-surface. Denied conversations appear in neither.
 export type ChatScope = 'chats' | 'requests';
@@ -15,6 +15,11 @@ export type ContactEditKind =
   | 'add'
   | 'conversation-delete'
   | 'delete'
+  | 'group-add-member'
+  | 'group-invite'
+  | 'group-join'
+  | 'group-link'
+  | 'group-rename'
   | 'message'
   | 'name-peer'
   | 'pair-create'
@@ -50,6 +55,9 @@ export interface ContactEditForm {
   // so the TUI never freezes. While pending, the form shows a waiting line and
   // ignores input except Esc.
   pending?: boolean;
+  // Where Esc/submit lands afterwards; default is the mode's usual home
+  // (chat-select or contacts-select). Group forms return to group-info.
+  returnTo?: 'group-info';
   submitLabel?: string;
   targetConversationId?: string;
   targetContactId?: string;
@@ -75,6 +83,11 @@ export interface ChatState {
   // Two-press confirm for blocking a request: holds the conversationId armed
   // for block until a second press (or any other action clears it).
   pendingBlockId?: string;
+  // Selected member row in the group-info pane.
+  groupInfoIndex: number;
+  // Two-press confirm for destructive group actions ('remove:<inboxId>',
+  // 'leave', 'block'), cleared by any other key.
+  pendingGroupAction?: string;
   pendingMessages: PendingMessage[];
   previewByConversation: Record<string, string>;
   readReceipts: boolean;

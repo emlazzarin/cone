@@ -15,6 +15,7 @@ import {
   type MessageHandler,
   type PairingOffer,
   type RendezvousClient,
+  type RendezvousRole,
   type RendezvousStoredOffer,
   type ResolvedIdentity,
   type SentMessage,
@@ -61,15 +62,45 @@ describe('pairing protocol', () => {
     await expect(decryptJson<PairingOffer>(codeScopedKey('wrong-code-value'), encrypted.encryptedOffer)).rejects.toThrow();
   });
 
+  test('pairing the same account with itself fails fast instead of timing out', async () => {
+    const rendezvous = new MemoryRendezvous();
+    // Two apps (two adapters), one identity — e.g. the PWA and the CLI
+    // unlocked with the same SECRET KEY.
+    const firstApp = new PairingAdapter('inbox-same', '0x1111111111111111111111111111111111111111');
+    const secondApp = new PairingAdapter('inbox-same', '0x1111111111111111111111111111111111111111');
+    const first = await createConeClient({
+      account: deriveAccount(secretKeyFromHexSeed('06'.repeat(32)), { env: 'dev' }),
+      rendezvous,
+      store: new MemoryStore(),
+      xmtp: firstApp,
+    });
+    const second = await createConeClient({
+      account: deriveAccount(secretKeyFromHexSeed('06'.repeat(32)), { env: 'dev' }),
+      rendezvous,
+      store: new MemoryStore(),
+      xmtp: secondApp,
+    });
+
+    const outcomes = await Promise.allSettled([
+      first.pairWithCode('anchor-beacon-cedar-drift-ember', { timeoutMs: 5_000 }),
+      second.pairWithCode('anchor-beacon-cedar-drift-ember', { timeoutMs: 5_000 }),
+    ]);
+
+    for (const outcome of outcomes) {
+      expect(outcome.status).toBe('rejected');
+      expect((outcome as PromiseRejectedResult).reason.message).toMatch(/same account/);
+    }
+  });
+
   test('rendezvous rejects a third participant', async () => {
     const rendezvous = new MemoryRendezvous();
     const offer = await fakeStoredOffer('a');
 
-    await rendezvous.exchangeOffer({ code: 'room-code', participantId: 'one', encryptedOffer: offer.encryptedOffer, expiresAt: offer.expiresAt });
-    await rendezvous.exchangeOffer({ code: 'room-code', participantId: 'two', encryptedOffer: offer.encryptedOffer, expiresAt: offer.expiresAt });
+    await rendezvous.exchangeOffer({ roomId: 'room-hash', role: 'pair', participantId: 'one', encryptedOffer: offer.encryptedOffer, expiresAt: offer.expiresAt });
+    await rendezvous.exchangeOffer({ roomId: 'room-hash', role: 'pair', participantId: 'two', encryptedOffer: offer.encryptedOffer, expiresAt: offer.expiresAt });
 
     await expect(
-      rendezvous.exchangeOffer({ code: 'room-code', participantId: 'three', encryptedOffer: offer.encryptedOffer, expiresAt: offer.expiresAt }),
+      rendezvous.exchangeOffer({ roomId: 'room-hash', role: 'pair', participantId: 'three', encryptedOffer: offer.encryptedOffer, expiresAt: offer.expiresAt }),
     ).rejects.toThrow(/full/i);
   });
 
@@ -78,25 +109,28 @@ describe('pairing protocol', () => {
     const expired = await fakeStoredOffer('expired', new Date(Date.now() - 1000).toISOString());
     const active = await fakeStoredOffer('active');
 
-    await rendezvous.exchangeOffer({ code: 'ttl-code', participantId: 'expired', encryptedOffer: expired.encryptedOffer, expiresAt: expired.expiresAt });
-    const offers = await rendezvous.exchangeOffer({ code: 'ttl-code', participantId: 'active', encryptedOffer: active.encryptedOffer, expiresAt: active.expiresAt });
+    await rendezvous.exchangeOffer({ roomId: 'ttl-hash', role: 'pair', participantId: 'expired', encryptedOffer: expired.encryptedOffer, expiresAt: expired.expiresAt });
+    const offers = await rendezvous.exchangeOffer({ roomId: 'ttl-hash', role: 'pair', participantId: 'active', encryptedOffer: active.encryptedOffer, expiresAt: active.expiresAt });
 
     expect(offers.map((offer) => offer.participantId)).toEqual(['active']);
   });
 });
 
+// Mirrors the v2 worker semantics: rooms keyed by a hash of the secret,
+// capacity 2 for 'pair', join offers visible only to the descriptor holder.
 class MemoryRendezvous implements RendezvousClient {
   private readonly rooms = new Map<string, RendezvousStoredOffer[]>();
 
   async exchangeOffer(input: {
-    code: string;
+    roomId: string;
     participantId: string;
+    role: RendezvousRole;
     encryptedOffer: RendezvousStoredOffer['encryptedOffer'];
     expiresAt: string;
   }): Promise<RendezvousStoredOffer[]> {
-    const active = (this.rooms.get(input.code) ?? []).filter((offer) => Date.parse(offer.expiresAt) > Date.now());
+    const active = (this.rooms.get(input.roomId) ?? []).filter((offer) => Date.parse(offer.expiresAt) > Date.now());
     const existingIndex = active.findIndex((offer) => offer.participantId === input.participantId);
-    if (existingIndex === -1 && active.length >= 2) {
+    if (existingIndex === -1 && input.role === 'pair' && active.length >= 2) {
       throw new Error('pairing room is full');
     }
 
@@ -105,14 +139,21 @@ class MemoryRendezvous implements RendezvousClient {
       expiresAt: input.expiresAt,
       offerId: input.encryptedOffer.iv,
       participantId: input.participantId,
+      role: input.role,
     };
     if (existingIndex >= 0) {
       active[existingIndex] = offer;
     } else {
       active.push(offer);
     }
-    this.rooms.set(input.code, active);
-    return active;
+    this.rooms.set(input.roomId, active);
+    return input.role === 'join'
+      ? active.filter((stored) => stored.role === 'descriptor' || stored.participantId === input.participantId)
+      : active;
+  }
+
+  async deleteRoom(roomId: string): Promise<void> {
+    this.rooms.delete(roomId);
   }
 }
 
@@ -191,6 +232,30 @@ class PairingAdapter implements XmtpAdapter {
   }
 
   leaveGroup(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  updateGroupName(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  updateGroupDescription(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  addGroupAdmin(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  removeGroupAdmin(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  addGroupSuperAdmin(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  removeGroupSuperAdmin(): Promise<void> {
     return Promise.resolve();
   }
 

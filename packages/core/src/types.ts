@@ -14,7 +14,6 @@ export type ContactSource = 'manual' | 'paired' | 'self';
 // blocked and hidden from normal lists and streams. Maps 1:1 to the XMTP SDK
 // ConsentState enum (Unknown/Allowed/Denied) at the adapter boundary.
 export type ConeConsentState = 'unknown' | 'allowed' | 'denied';
-export const CONSENT_STATES: readonly ConeConsentState[] = ['unknown', 'allowed', 'denied'];
 
 export interface DerivedAccount {
   accountId: string;
@@ -91,8 +90,6 @@ export interface ConeGroupMember {
 
 export interface ConeConversation {
   conversationId: string;
-  // Rows stored before groups existed lack `kind`; readers treat undefined as
-  // 'dm' (all pre-group conversations are DMs), so branches test `=== 'group'`.
   kind: ConversationKind;
   // DM-only: the single peer. Groups have members instead.
   peerInboxId?: string;
@@ -111,6 +108,10 @@ export interface ConeConversation {
   memberCount?: number;
   addedByInboxId?: string;
   members?: ConeGroupMember[];
+  // Group-only: false once this account was removed or left (XMTP isActive).
+  // Undefined means active — DMs and pre-Phase-2 rows never carry it. The row
+  // is kept so history stays readable; sends into an inactive group fail fast.
+  active?: boolean;
   // Local mirror of the conversation's XMTP consent state (the peer inbox for
   // DMs, the group id for groups). Stamped on every persisted conversation
   // (from the network on sync, or 'allowed'/'unknown' when created locally)
@@ -129,6 +130,10 @@ export interface ConeStoreMetadata {
   // XMTP gates group delivery at the conversation level only, so this is what
   // lets the read model drop a denied sender's messages inside allowed groups.
   deniedInboxIds?: string[];
+  // Group joins requested via invite code, awaiting their XMTP welcome.
+  pendingGroupJoins?: PendingGroupJoin[];
+  // Async invite links minted by this account, serviced during sync.
+  groupInviteLinks?: GroupInviteLink[];
 }
 
 export interface StoredMessage {
@@ -172,9 +177,7 @@ export interface SentMessage {
 export interface IncomingMessage {
   messageId: string;
   conversationId: string;
-  // Which kind of conversation the message belongs to. Optional because
-  // pre-group emitters never set it; readers treat undefined as 'dm'.
-  conversationKind?: ConversationKind;
+  conversationKind: ConversationKind;
   senderInboxId: string;
   senderAddress?: string;
   sentAt: string;
@@ -234,20 +237,88 @@ export interface PairingOffer {
   createdAt: string;
 }
 
+// The rendezvous service stores opaque ciphertext: pairing offers, group
+// invite descriptors, and group join requests all ride the same room shape.
+// v2: rooms are addressed by a hash of the shared secret (the worker never
+// sees key material), and each offer declares a cleartext role so the worker
+// can enforce capacity and visibility without decrypting anything:
+//   - 'pair': symmetric pairing; capacity 2; everyone sees everything.
+//   - 'descriptor': the single group-invite descriptor; its poster sees all.
+//   - 'join': a join request; its poster sees only the descriptor + itself,
+//     so joiners under a shared link never learn each other's identities.
+export type RendezvousRole = 'pair' | 'descriptor' | 'join';
+
 export interface RendezvousStoredOffer {
   offerId: string;
   participantId: string;
-  encryptedOffer: EncryptedJson<PairingOffer>;
+  role: RendezvousRole;
+  encryptedOffer: EncryptedJson;
   expiresAt: string;
 }
 
 export interface RendezvousClient {
   exchangeOffer(input: {
-    code: string;
+    roomId: string;
     participantId: string;
-    encryptedOffer: EncryptedJson<PairingOffer>;
+    role: RendezvousRole;
+    encryptedOffer: EncryptedJson;
     expiresAt: string;
   }): Promise<RendezvousStoredOffer[]>;
+  // Revocation: anyone holding the secret can delete the room. Best-effort.
+  deleteRoom(roomId: string): Promise<void>;
+}
+
+// An async invite link this account minted. The token is a capability —
+// holding it is admission — so links default to a single use. Only the
+// minting client services its links (during sync); nothing is distributed
+// into the group and no other member or agent is relied on.
+export interface GroupInviteLink {
+  linkId: string;
+  conversationId: string;
+  token: string;
+  // Stable descriptor nonce: servicing re-posts the descriptor each pass, and
+  // a stable participant id makes the re-post replace instead of duplicate.
+  nonce: string;
+  createdAt: string;
+  expiresAt: string;
+  maxUses: number;
+  uses: number;
+  // Join requests already admitted (or rejected), so servicing is idempotent.
+  servicedParticipantIds: string[];
+}
+
+// A group join this account requested via an invite code. The welcome arrives
+// asynchronously over XMTP; a matching pending join auto-allows the group
+// (requesting to join is implied consent) instead of landing in Requests.
+export interface PendingGroupJoin {
+  conversationId: string;
+  inviterInboxId: string;
+  groupName?: string;
+  requestedAt: string;
+  expiresAt: string;
+}
+
+// Inviter-side result: the joiner has been added to the group. No contact is
+// auto-saved; proposedName is a suggestion the UI may offer to save.
+export interface GroupInviteResult {
+  conversationId: string;
+  joiner: {
+    inboxId: string;
+    address?: string;
+    proposedName?: string;
+  };
+}
+
+// Joiner-side result: the join request reached the inviter's descriptor room
+// and is recorded locally as pending; membership lands with the XMTP welcome.
+export interface GroupJoinResult {
+  conversationId: string;
+  groupName?: string;
+  memberCount: number;
+  inviter: {
+    inboxId: string;
+    address?: string;
+  };
 }
 
 export interface CreateGroupOptions {
@@ -285,6 +356,16 @@ export interface XmtpAdapter {
   addGroupMembers(conversationId: string, memberInboxIds: string[]): Promise<void>;
   removeGroupMembers(conversationId: string, memberInboxIds: string[]): Promise<void>;
   leaveGroup(conversationId: string): Promise<void>;
+  // Shared group metadata (any member may edit under the default policy).
+  updateGroupName(conversationId: string, name: string): Promise<void>;
+  updateGroupDescription(conversationId: string, description: string): Promise<void>;
+  // Admin/super-admin lists are additive and separate in XMTP; permission to
+  // change them is policy-enforced by every member's client (super admin only
+  // under both presets) — a disallowed call fails, it isn't advisory.
+  addGroupAdmin(conversationId: string, inboxId: string): Promise<void>;
+  removeGroupAdmin(conversationId: string, inboxId: string): Promise<void>;
+  addGroupSuperAdmin(conversationId: string, inboxId: string): Promise<void>;
+  removeGroupSuperAdmin(conversationId: string, inboxId: string): Promise<void>;
   // Conversation-level disappearing-messages settings; null = timer off.
   setRetention(conversationId: string, retention: MessageRetention | null): Promise<void>;
   getRetention(conversationId: string): Promise<MessageRetention | null>;
@@ -350,6 +431,15 @@ export interface ConeClient {
   addGroupMembers(conversationId: string, members: IdentityRef[]): Promise<void>;
   removeGroupMembers(conversationId: string, members: IdentityRef[]): Promise<void>;
   leaveGroup(conversationId: string): Promise<void>;
+  // Shared metadata, mirror-first like consent: the local row updates
+  // immediately, the network write is best-effort, sync reconciles.
+  renameGroup(conversationId: string, name: string): Promise<void>;
+  setGroupDescription(conversationId: string, description: string): Promise<void>;
+  // Set a member's role. Diffs against their current level and issues the
+  // matching admin/super-admin list changes; promoting another member to
+  // superAdmin is how ownership transfers (additive — multiple super admins
+  // are legal, and XMTP forbids the last one leaving).
+  setGroupMemberLevel(conversationId: string, member: IdentityRef, level: GroupMemberLevel): Promise<void>;
   sync(): Promise<SyncResult>;
   // Streams default to allowed-only — this is the agent trust boundary. Human
   // surfaces pass { consentStates: ['allowed', 'unknown'] } so Requests update
@@ -378,6 +468,27 @@ export interface ConeClient {
   deleteContact(contactId: string): Promise<void>;
   createHandshakeCode(): Promise<HandshakeCode>;
   pairWithCode(code: string, options?: { proposedName?: string; timeoutMs?: number }): Promise<PairingResult>;
+  // Synchronous group invite code, inviter side: post the group descriptor to
+  // the code's rendezvous room, wait for a join request, and add the joiner.
+  // Auto-add is correct here — the code was created seconds ago, so intent is
+  // unambiguous. The joiner is never auto-saved as a contact.
+  inviteToGroupWithCode(code: string, conversationId: string, options?: { timeoutMs?: number }): Promise<GroupInviteResult>;
+  // Joiner side: post a join request, wait for the group descriptor, and
+  // record the join as pending. Membership arrives with the XMTP welcome; a
+  // matching pending join auto-allows the group (joining is implied consent).
+  // Accepts a synchronous handshake code or an async invite link token.
+  joinGroupWithCode(codeOrToken: string, options?: { proposedName?: string; timeoutMs?: number }): Promise<GroupJoinResult>;
+  listPendingGroupJoins(): Promise<PendingGroupJoin[]>;
+  cancelGroupJoin(conversationId: string): Promise<void>;
+  // Async invite links: capability tokens with a long TTL. The token is
+  // admission; links default to a single use. Serviced only by this (minting)
+  // client during sync() — no other member, and no agent, is relied on.
+  createGroupInviteLink(conversationId: string, options?: { ttlMs?: number; maxUses?: number }): Promise<GroupInviteLink>;
+  listGroupInviteLinks(conversationId?: string): Promise<GroupInviteLink[]>;
+  revokeGroupInviteLink(linkId: string): Promise<void>;
+  // Poll this account's live links and admit new joiners. Runs inside sync();
+  // exposed for explicit servicing. Returns the members added this pass.
+  serviceGroupInviteLinks(): Promise<GroupInviteResult[]>;
   exportBackup(): Promise<Uint8Array>;
   importBackup(data: Uint8Array): Promise<void>;
   close(): Promise<void>;

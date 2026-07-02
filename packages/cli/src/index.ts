@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline/promises';
 
 import {
+  GROUP_INVITE_TTL_MS,
   HttpRendezvousClient,
   createConeClient,
   createHandshakeCode,
@@ -92,7 +93,7 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
           writeValue(io, context, {
             ok: true,
             remembered: false,
-          }, () => 'Secret key is valid. Use COS_SECRET_KEY or pass --remember to persist it.\n');
+          }, () => 'Secret key is valid. Use CONE_SECRET_KEY or pass --remember to persist it.\n');
         }
         return 0;
       }
@@ -118,10 +119,10 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
       case 'listen': {
         // Agent trust boundary: streamMessages defaults to allowed senders
         // only, so an unknown sender can never drive an agent's workflow.
-        // Unknown senders surface only through the explicit `cos requests`.
+        // Unknown senders surface only through the explicit `cone requests`.
         const client = await getClient();
         if (context.output === 'plain') {
-          io.stdout('Listening for Cone of Silence messages (allowed senders only)...\n');
+          io.stdout('Listening for Cone messages (allowed senders only)...\n');
         }
         const once = context.args.includes('--once');
         const timeoutMs = Number(optionalOption(context.args, '--timeout-ms') ?? (once ? '30000' : '0'));
@@ -251,7 +252,7 @@ async function handleContacts(args: string[], io: CliIo, context: CliContext, cl
     const contactId = args[1];
     const name = args[2];
     if (!contactId || !name) {
-      throw new Error('usage: cos contacts rename <contactId> <name>');
+      throw new Error('usage: cone contacts rename <contactId> <name>');
     }
     const existing = (await client.listContacts()).find((contact) => contact.contactId === contactId);
     if (!existing) {
@@ -264,13 +265,13 @@ async function handleContacts(args: string[], io: CliIo, context: CliContext, cl
   if (command === 'delete') {
     const contactId = args[1];
     if (!contactId) {
-      throw new Error('usage: cos contacts delete <contactId>');
+      throw new Error('usage: cone contacts delete <contactId>');
     }
     await client.deleteContact(contactId);
     writeValue(io, context, { contactId, deleted: true }, () => 'Contact deleted.\n');
     return 0;
   }
-  throw new Error('usage: cos contacts <list|add|rename|delete>');
+  throw new Error('usage: cone contacts <list|add|rename|delete>');
 }
 
 async function handleInbox(args: string[], io: CliIo, context: CliContext, client: ConeClient): Promise<number> {
@@ -278,7 +279,7 @@ async function handleInbox(args: string[], io: CliIo, context: CliContext, clien
   const command = commandIndex === undefined ? undefined : args[commandIndex];
   const rest = commandIndex === undefined ? args : args.slice(commandIndex + 1);
   if (!command || command === 'list') {
-    // Main inbox is allowed-only; unknown senders live under `cos requests`,
+    // Main inbox is allowed-only; unknown senders live under `cone requests`,
     // denied are hidden.
     const conversations = (await client.listConversations()).filter(isAllowedConversation);
     const requestCount = (await client.listConversations()).filter(isRequestConversation).length;
@@ -288,7 +289,7 @@ async function handleInbox(args: string[], io: CliIo, context: CliContext, clien
         return `${conversation.title} (${conversation.conversationId})${updated}`;
       });
       const header = value.conversations.length === 0 ? 'No conversations.' : lines.join('\n');
-      const footer = value.requestCount > 0 ? `\n${value.requestCount} request${value.requestCount === 1 ? '' : 's'} — see cos requests.` : '';
+      const footer = value.requestCount > 0 ? `\n${value.requestCount} request${value.requestCount === 1 ? '' : 's'} — see cone requests.` : '';
       return `${header}${footer}\n`;
     });
     return 0;
@@ -307,7 +308,7 @@ async function handleInbox(args: string[], io: CliIo, context: CliContext, clien
   if (command === 'read') {
     const target = firstPositional(rest) ?? optionalOption(args, '--conversation') ?? optionalOption(args, '--contact');
     if (!target) {
-      throw new Error('usage: cos inbox read <conversationId|contactName|inboxId>');
+      throw new Error('usage: cone inbox read <conversationId|contactName|inboxId>');
     }
     const conversation = await findInboxConversation(client, target);
     const messages = await client.listMessages(conversation.conversationId);
@@ -323,7 +324,7 @@ async function handleInbox(args: string[], io: CliIo, context: CliContext, clien
     });
     return 0;
   }
-  throw new Error('usage: cos inbox [list|sync|read]');
+  throw new Error('usage: cone inbox [list|sync|read]');
 }
 
 async function findInboxConversation(client: ConeClient, target: string, pool?: ConeConversation[]) {
@@ -349,7 +350,7 @@ async function findInboxConversation(client: ConeClient, target: string, pool?: 
   throw new Error(`inbox conversation not found: ${target}`);
 }
 
-// `cos group` — create and manage group conversations. Members resolve through
+// `cone group` — create and manage group conversations. Members resolve through
 // contacts/identities; the creator is added (and made super admin) by XMTP.
 async function handleGroup(args: string[], io: CliIo, context: CliContext, client: ConeClient): Promise<number> {
   const command = args[0];
@@ -359,7 +360,7 @@ async function handleGroup(args: string[], io: CliIo, context: CliContext, clien
   if (command === 'create') {
     const members = collectOptions(rest, '--member');
     if (members.length === 0) {
-      throw new Error('usage: cos group create --member <inboxId|address|contactName> [--member ...] [--name <name>] [--description <text>] [--locked]');
+      throw new Error('usage: cone group create --member <inboxId|address|contactName> [--member ...] [--name <name>] [--description <text>] [--locked]');
     }
     const conversation = await client.createGroup({
       name: optionalOption(rest, '--name'),
@@ -374,12 +375,15 @@ async function handleGroup(args: string[], io: CliIo, context: CliContext, clien
 
   if (command === 'info') {
     const conversation = await findGroupConversation(client, requireGroupTarget(rest, groupValueOptions, 'info'));
-    const members = await client.listGroupMembers(conversation.conversationId);
+    const members = conversation.active === false
+      ? conversation.members ?? []
+      : await client.listGroupMembers(conversation.conversationId);
     writeValue(io, context, { conversation, members }, (value) => {
       const lines = [
         `${value.conversation.title} (${value.conversation.conversationId})`,
         value.conversation.groupDescription ? `Description: ${value.conversation.groupDescription}` : undefined,
         `Consent: ${value.conversation.consentState}`,
+        value.conversation.active === false ? 'Status: no longer a member (history kept)' : undefined,
         `Members (${value.members.length}):`,
         ...value.members.map((member) => `  ${member.inboxId}${member.level === 'member' ? '' : ` [${member.level}]`}`),
       ];
@@ -388,10 +392,52 @@ async function handleGroup(args: string[], io: CliIo, context: CliContext, clien
     return 0;
   }
 
+  if (command === 'rename') {
+    const name = requiredOption(rest, '--name');
+    const conversation = await findGroupConversation(client, requireGroupTarget(rest, groupValueOptions, 'rename'));
+    await client.renameGroup(conversation.conversationId, name);
+    writeValue(io, context, { conversationId: conversation.conversationId, name }, (value) =>
+      `Renamed group to ${value.name}. Group names are shared — every member sees the change.\n`);
+    return 0;
+  }
+
+  if (command === 'describe') {
+    const text = optionalOption(rest, '--text') ?? '';
+    const conversation = await findGroupConversation(client, requireGroupTarget(rest, groupValueOptions, 'describe'));
+    await client.setGroupDescription(conversation.conversationId, text);
+    writeValue(io, context, { conversationId: conversation.conversationId, description: text }, () =>
+      text ? `Updated the description of ${conversation.title}.\n` : `Cleared the description of ${conversation.title}.\n`);
+    return 0;
+  }
+
+  if (command === 'remove') {
+    const members = collectOptions(rest, '--member');
+    if (members.length === 0) {
+      throw new Error('usage: cone group remove <conversationId|name> --member <inboxId|address|contactName> [--member ...]');
+    }
+    const conversation = await findGroupConversation(client, requireGroupTarget(rest, groupValueOptions, 'remove'));
+    await client.removeGroupMembers(conversation.conversationId, members);
+    writeValue(io, context, { conversationId: conversation.conversationId, removed: members }, (value) =>
+      `Removed ${value.removed.length} member${value.removed.length === 1 ? '' : 's'} from ${conversation.title}.\n`);
+    return 0;
+  }
+
+  if (command === 'promote' || command === 'demote') {
+    const member = requiredOption(rest, '--member');
+    const level = command === 'demote' ? 'member' : rest.includes('--super') ? 'superAdmin' : 'admin';
+    const conversation = await findGroupConversation(client, requireGroupTarget(rest, groupValueOptions, command));
+    await client.setGroupMemberLevel(conversation.conversationId, member, level);
+    writeValue(io, context, { conversationId: conversation.conversationId, member, level }, (value) =>
+      command === 'demote'
+        ? `Demoted ${value.member} to member in ${conversation.title}.\n`
+        : `Promoted ${value.member} to ${value.level === 'superAdmin' ? 'owner (super admin)' : 'admin'} in ${conversation.title}.\n`);
+    return 0;
+  }
+
   if (command === 'add') {
     const members = collectOptions(rest, '--member');
     if (members.length === 0) {
-      throw new Error('usage: cos group add <conversationId|name> --member <inboxId|address|contactName> [--member ...]');
+      throw new Error('usage: cone group add <conversationId|name> --member <inboxId|address|contactName> [--member ...]');
     }
     const conversation = await findGroupConversation(client, requireGroupTarget(rest, groupValueOptions, 'add'));
     await client.addGroupMembers(conversation.conversationId, members);
@@ -416,13 +462,116 @@ async function handleGroup(args: string[], io: CliIo, context: CliContext, clien
     return 0;
   }
 
-  throw new Error('usage: cos group <create|info|add|send|leave>');
+  // Synchronous invite code, inviter side: mint a code, print it right away
+  // (that's what gets spoken/pasted to the joiner), then wait for the join
+  // request and add the joiner. Single use, 10-minute TTL, no auto-contact.
+  // --link mints an async capability token instead: no waiting — joiners are
+  // admitted by this account's next sync (`cone inbox sync`, listen, or chat).
+  if (command === 'invite') {
+    const inviteValueOptions = new Set([...groupValueOptions, '--code', '--max-uses', '--ttl', '--timeout-ms']);
+    const conversation = await findGroupConversation(client, requireGroupTarget(rest, inviteValueOptions, 'invite'));
+    if (rest.includes('--link')) {
+      const ttl = optionalOption(rest, '--ttl');
+      const maxUses = optionalOption(rest, '--max-uses');
+      const link = await client.createGroupInviteLink(conversation.conversationId, {
+        ttlMs: ttl ? parseRetention(ttl) ?? undefined : undefined,
+        maxUses: maxUses ? Number(maxUses) : undefined,
+      });
+      writeValue(io, context, link, (value) => [
+        `Invite link token for ${conversation.title}: ${value.token}`,
+        `Expires at: ${value.expiresAt} — ${value.maxUses} use${value.maxUses === 1 ? '' : 's'}.`,
+        `Anyone with the token joins with: cone group join ${value.token}`,
+        'They are admitted the next time this account syncs (cone inbox sync, listen, or chat).',
+        `Revoke with: cone group links revoke ${value.linkId}`,
+      ].join('\n') + '\n');
+      return 0;
+    }
+    // --code lets scripts coordinate a pre-minted code (like `cone pair`).
+    const providedCode = optionalOption(rest, '--code');
+    const code = providedCode
+      ? { code: providedCode, expiresAt: new Date(Date.now() + GROUP_INVITE_TTL_MS).toISOString() }
+      : await client.createHandshakeCode();
+    writeValue(io, context, { ...code, conversationId: conversation.conversationId, waiting: true }, (value) =>
+      `Invite code for ${conversation.title}: ${value.code}\nExpires at: ${value.expiresAt}\nWaiting for someone to join with this code...\n`);
+    const timeoutMs = Number(optionalOption(rest, '--timeout-ms') ?? '60000');
+    const result = await client.inviteToGroupWithCode(code.code, conversation.conversationId, { timeoutMs });
+    writeValue(io, context, result, (value) => {
+      const name = value.joiner.proposedName ? `${value.joiner.proposedName} (${value.joiner.inboxId})` : value.joiner.inboxId;
+      const save = value.joiner.proposedName
+        ? `\nSave them with: cone contacts add --name ${JSON.stringify(value.joiner.proposedName)} --identity ${value.joiner.inboxId}`
+        : '';
+      return `Added ${name} to ${conversation.title}.${save}\n`;
+    });
+    return 0;
+  }
+
+  // Joiner side: post a join request under the code and wait for the group
+  // descriptor. Membership arrives with the XMTP welcome (next sync), which a
+  // pending join auto-allows — requesting to join is implied consent.
+  if (command === 'join') {
+    const joinValueOptions = new Set(['--share-name', '--timeout-ms']);
+    const code = positionalArgs(rest, joinValueOptions)[0];
+    if (!code) {
+      throw new Error('usage: cone group join <code> [--share-name <name>] [--timeout-ms <ms>]');
+    }
+    const timeoutMs = Number(optionalOption(rest, '--timeout-ms') ?? '60000');
+    const result = await client.joinGroupWithCode(code, {
+      proposedName: optionalOption(rest, '--share-name'),
+      timeoutMs,
+    });
+    writeValue(io, context, result, (value) =>
+      `Requested to join ${value.groupName ?? value.conversationId} (${value.memberCount} members, invited by ${value.inviter.inboxId}).\n` +
+      `The inviter adds you over XMTP; run: cone inbox sync\n`);
+    return 0;
+  }
+
+  // Async invite links minted by this account: list, revoke.
+  if (command === 'links') {
+    if (rest[0] === 'revoke') {
+      const linkId = rest[1];
+      if (!linkId) {
+        throw new Error('usage: cone group links revoke <linkId>');
+      }
+      await client.revokeGroupInviteLink(linkId);
+      writeValue(io, context, { linkId, revoked: true }, () => `Revoked invite link ${linkId}.\n`);
+      return 0;
+    }
+    const links = await client.listGroupInviteLinks();
+    writeValue(io, context, links, (value) =>
+      value.length === 0
+        ? 'No active invite links.\n'
+        : value.map((link) =>
+            `${link.linkId} — ${link.conversationId}, ${link.uses}/${link.maxUses} uses, expires ${link.expiresAt}`,
+          ).join('\n') + '\n');
+    return 0;
+  }
+
+  // Pending join requests (welcomes not yet arrived): list and cancel.
+  if (command === 'joins') {
+    if (rest[0] === 'cancel') {
+      const conversationId = rest[1];
+      if (!conversationId) {
+        throw new Error('usage: cone group joins cancel <conversationId>');
+      }
+      await client.cancelGroupJoin(conversationId);
+      writeValue(io, context, { conversationId, cancelled: true }, () => `Cancelled the pending join for ${conversationId}.\n`);
+      return 0;
+    }
+    const pending = await client.listPendingGroupJoins();
+    writeValue(io, context, pending, (value) =>
+      value.length === 0
+        ? 'No pending group joins.\n'
+        : value.map((join) => `${join.groupName ?? join.conversationId} — invited by ${join.inviterInboxId}, expires ${join.expiresAt}`).join('\n') + '\n');
+    return 0;
+  }
+
+  throw new Error('usage: cone group <create|info|add|remove|rename|describe|promote|demote|send|leave|invite|join|joins|links>');
 }
 
 function requireGroupTarget(args: string[], valueOptions: Set<string>, command: string): string {
   const target = positionalArgs(args, valueOptions)[0];
   if (!target) {
-    throw new Error(`usage: cos group ${command} <conversationId|name> ...`);
+    throw new Error(`usage: cone group ${command} <conversationId|name> ...`);
   }
   return target;
 }
@@ -443,7 +592,7 @@ async function findGroupConversation(client: ConeClient, target: string): Promis
   throw new Error(`group not found: ${target}`);
 }
 
-// `cos requests` — the explicit Requests surface. Unknown inbound senders are
+// `cone requests` — the explicit Requests surface. Unknown inbound senders are
 // listed here, never in the main inbox or the address book; accept moves them
 // to the inbox (optionally saving a contact), block denies the peer inbox.
 // Group adds land here too (labeled by kind); accept/block target the group.
@@ -465,7 +614,7 @@ async function handleRequests(args: string[], io: CliIo, context: CliContext, cl
   if (command === 'accept' || command === 'block') {
     const target = firstPositional(args.slice(1));
     if (!target) {
-      throw new Error(`usage: cos requests ${command} <conversationId|inboxId> ${command === 'accept' ? '[--save-as <name>]' : ''}`.trim());
+      throw new Error(`usage: cone requests ${command} <conversationId|inboxId> ${command === 'accept' ? '[--save-as <name>]' : ''}`.trim());
     }
     const conversation = await findInboxConversation(client, target);
     const state = command === 'accept' ? 'allowed' : 'denied';
@@ -487,17 +636,17 @@ async function handleRequests(args: string[], io: CliIo, context: CliContext, cl
     return 0;
   }
 
-  throw new Error('usage: cos requests [list|accept <target> [--save-as <name>]|block <target>] [--denied]');
+  throw new Error('usage: cone requests [list|accept <target> [--save-as <name>]|block <target>] [--denied]');
 }
 
-// `cos timer` — the per-conversation disappearing-messages timer. Without a
+// `cone timer` — the per-conversation disappearing-messages timer. Without a
 // duration it reports the current setting; with one ('5m', '1h', '7d', 'off')
 // it sets it. The XMTP settings write tells the peer; expired messages are
 // hidden immediately and purged from local storage on sync.
 async function handleTimer(args: string[], io: CliIo, context: CliContext, client: ConeClient): Promise<number> {
   const [target, duration] = positionalArgs(args, new Set(['--env']));
   if (!target) {
-    throw new Error('usage: cos timer <conversationId|contactName|inboxId> [<duration|off>]');
+    throw new Error('usage: cone timer <conversationId|contactName|inboxId> [<duration|off>]');
   }
   const conversation = await findInboxConversation(client, target);
 
@@ -530,17 +679,25 @@ async function handleTimer(args: string[], io: CliIo, context: CliContext, clien
 
 async function handlePair(args: string[], io: CliIo, context: CliContext, getClient: () => Promise<ConeClient>): Promise<number> {
   if (args.includes('new') || args.includes('join')) {
-    throw new Error('usage: cos pair [code] [--share-name <name>] [--save-as <contactName>]');
+    throw new Error('usage: cone pair [code] [--share-name <name>] [--save-as <contactName>]');
   }
   if (args.includes('--name')) {
     throw new Error('use --share-name for the peer-visible name or --save-as for your local contact name');
   }
-  const code = firstPairCode(args);
-  if (!code) {
-    // Creating a code is local-only: no account unlock, no network.
+  let code = firstPairCode(args);
+  if (!code && args.includes('--print')) {
+    // Mint-only, for scripts: local, no account unlock, no network, no wait.
     const created = createHandshakeCode(new Date());
     writeValue(io, context, created, (value) => `Handshake code: ${value.code}\nExpires at: ${value.expiresAt}\n`);
     return 0;
+  }
+  if (!code) {
+    // Pairing needs BOTH sides in the room, so minting immediately joins:
+    // print the code for the other side, then wait for them.
+    const created = createHandshakeCode(new Date());
+    writeValue(io, context, { ...created, waiting: true }, (value) =>
+      `Handshake code: ${value.code}\nExpires at: ${value.expiresAt}\nHave the other side enter this code — waiting for them (up to 60s)...\n`);
+    code = created.code;
   }
   const client = await getClient();
   const shareName = optionalOption(args, '--share-name');
@@ -558,8 +715,8 @@ async function handlePair(args: string[], io: CliIo, context: CliContext, getCli
     ...result,
     contact,
     next: {
-      send: `cos send --to ${JSON.stringify(contact.name)} --text "hello"`,
-      listen: 'cos listen',
+      send: `cone send --to ${JSON.stringify(contact.name)} --text "hello"`,
+      listen: 'cone listen',
     },
   };
   writeValue(io, context, cliResult, (value) => {
@@ -586,7 +743,7 @@ async function handleBackup(args: string[], io: CliIo, context: CliContext, clie
     writeValue(io, context, { imported: true, in: input }, () => `Backup imported from ${input}.\n`);
     return 0;
   }
-  throw new Error('usage: cos backup <export|import>');
+  throw new Error('usage: cone backup <export|import>');
 }
 
 async function loadClient(context: CliContext, io: CliIo, deps: CliDeps): Promise<ConeClient> {
@@ -600,7 +757,7 @@ async function loadClient(context: CliContext, io: CliIo, deps: CliDeps): Promis
 async function readLoginSecret(args: string[], io: CliIo): Promise<string> {
   if (args.includes('--secret-stdin')) {
     if (io.isStdinTty()) {
-      io.stderr('Reading SECRET_KEY from stdin. Paste it, press Enter, then press Ctrl-D.\nFor interactive login, use: cos login --remember\n');
+      io.stderr('Reading SECRET_KEY from stdin. Paste it, press Enter, then press Ctrl-D.\nFor interactive login, use: cone login --remember\n');
     }
     return io.stdinText();
   }
@@ -696,7 +853,7 @@ interface CliContext {
 
 function parseCliArgs(args: string[]): CliContext {
   const rest: string[] = [];
-  let output: OutputMode = process.env.COS_OUTPUT === 'plain' ? 'plain' : 'json';
+  let output: OutputMode = process.env.CONE_OUTPUT === 'plain' ? 'plain' : 'json';
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -795,33 +952,44 @@ async function readHiddenLine(prompt: string): Promise<string> {
 
 function helpText(): string {
   return `Usage:
-  cos keygen
-  cos [--json|--plain] login [--remember]
-  cos [--json|--plain] login --secret-stdin [--remember]
-  cos [--json|--plain] whoami [--env dev|production|local]
-  cos [--json|--plain] send --to <inboxId|address|contactName> --text "..."
-  cos [--json|--plain] listen [--once] [--timeout-ms <ms>]   (allowed senders only)
-  cos [--json|--plain] inbox [list]
-  cos [--json|--plain] inbox sync
-  cos [--json|--plain] inbox read <conversationId|contactName|inboxId>
-  cos [--json|--plain] requests [list] [--denied]
-  cos [--json|--plain] requests accept <conversationId|inboxId> [--save-as <name>]
-  cos [--json|--plain] requests block <conversationId|inboxId>
-  cos [--json|--plain] timer <conversationId|contactName|inboxId>            (show)
-  cos [--json|--plain] timer <conversationId|contactName|inboxId> <5m|1h|7d|off>
-  cos chat [--plain-log] [--sync-on-open|--no-sync-on-open]
-  cos group create --member <inboxId|address|contactName> [--member ...] [--name <name>] [--description <text>] [--locked]
-  cos group info <conversationId|name>
-  cos group add <conversationId|name> --member <inboxId|address|contactName> [--member ...]
-  cos group send <conversationId|name> --text "..."
-  cos group leave <conversationId|name>
-  cos contacts list
-  cos contacts add --name <name> --identity <inboxId|address>
-  cos contacts rename <contactId> <name>
-  cos contacts delete <contactId>
-  cos pair
-  cos pair <code> [--share-name <name>] [--save-as <contactName>]
-  cos backup export --out backup.cos
-  cos backup import --in backup.cos
+  cone keygen
+  cone [--json|--plain] login [--remember]
+  cone [--json|--plain] login --secret-stdin [--remember]
+  cone [--json|--plain] whoami [--env dev|production|local]
+  cone [--json|--plain] send --to <inboxId|address|contactName> --text "..."
+  cone [--json|--plain] listen [--once] [--timeout-ms <ms>]   (allowed senders only)
+  cone [--json|--plain] inbox [list]
+  cone [--json|--plain] inbox sync
+  cone [--json|--plain] inbox read <conversationId|contactName|inboxId>
+  cone [--json|--plain] requests [list] [--denied]
+  cone [--json|--plain] requests accept <conversationId|inboxId> [--save-as <name>]
+  cone [--json|--plain] requests block <conversationId|inboxId>
+  cone [--json|--plain] timer <conversationId|contactName|inboxId>            (show)
+  cone [--json|--plain] timer <conversationId|contactName|inboxId> <5m|1h|7d|off>
+  cone chat [--plain-log] [--sync-on-open|--no-sync-on-open]
+  cone group create --member <inboxId|address|contactName> [--member ...] [--name <name>] [--description <text>] [--locked]
+  cone group info <conversationId|name>
+  cone group add <conversationId|name> --member <inboxId|address|contactName> [--member ...]
+  cone group remove <conversationId|name> --member <ref> [--member ...]     (admin)
+  cone group rename <conversationId|name> --name <name>
+  cone group describe <conversationId|name> --text "..."
+  cone group promote <conversationId|name> --member <ref> [--super]         (owner makes admins; --super transfers ownership)
+  cone group demote <conversationId|name> --member <ref>
+  cone group send <conversationId|name> --text "..."
+  cone group leave <conversationId|name>       (visible to the group; block instead to hide silently)
+  cone group invite <conversationId|name> [--code <code>] [--timeout-ms <ms>]   (mint a single-use code, wait, add the joiner)
+  cone group invite <conversationId|name> --link [--max-uses <n>] [--ttl <duration>]   (async token; joiners admitted on your next sync)
+  cone group join <code|token> [--share-name <name>] [--timeout-ms <ms>]
+  cone group joins [cancel <conversationId>]   (pending joins awaiting their welcome)
+  cone group links [revoke <linkId>]           (async invite links this account minted)
+  cone contacts list
+  cone contacts add --name <name> --identity <inboxId|address>
+  cone contacts rename <contactId> <name>
+  cone contacts delete <contactId>
+  cone pair [--share-name <name>] [--save-as <contactName>]   (mint a code, print it, wait for the other side)
+  cone pair <code> [--share-name <name>] [--save-as <contactName>]   (join a code from the other side)
+  cone pair --print                            (mint-only, for scripts: no unlock, no waiting)
+  cone backup export --out backup.cone
+  cone backup import --in backup.cone
 `;
 }

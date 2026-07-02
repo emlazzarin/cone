@@ -1,7 +1,11 @@
 import {
   formatConnectionStatus,
+  formatGroupUpdate,
   formatRetention,
   formatTranscriptTime,
+  groupHistoryNotice,
+  isGroupUpdateEnvelope,
+  isGroupUpdateMessage,
   isVisibleChatMessage,
   latestReadOutboundId,
   matchesPendingSend,
@@ -11,7 +15,7 @@ import {
   type ConeConversation,
 } from '@cone/core';
 
-import { activeContact, composerKey, conversationActivityAt, isContactsMode, requestCount, scopedConversations, selectedContact, selectedConversation, visibleConversations } from './state';
+import { activeContact, composerKey, conversationActivityAt, groupInfoMembers, isContactsMode, memberDisplayName, requestCount, scopedConversations, selectedContact, selectedConversation, visibleConversations } from './state';
 import type { ChatMode, ChatState } from './types';
 import { CSI, accent, danger, dim, ellipsize, highlight, inputField, inverse, pad, shortId, stripAnsi, success, wrapText } from './text';
 
@@ -24,7 +28,7 @@ function convTitle(conversation: Pick<ConeConversation, 'title' | 'peerInboxId'>
 
 export function renderChat(state: ChatState, width: number, height: number): string {
   if (width < 50 || height < 10) {
-    return `${CSI}2J${CSI}H${inverse(' Cone of Silence '.slice(0, Math.max(1, width)))}\nterminal too small for cos chat\n`;
+    return `${CSI}2J${CSI}H${inverse(' Cone '.slice(0, Math.max(1, width)))}\nterminal too small for cone chat\n`;
   }
 
   const safeWidth = Math.max(1, width);
@@ -53,16 +57,17 @@ export function renderChat(state: ChatState, width: number, height: number): str
 // least important cell first. Modes are expressed by the footer and input
 // line, not a dedicated label.
 function topBar(state: ChatState, width: number): string {
+  const selected = selectedConversation(state);
   const context = isContactsMode(state)
     ? selectedContact(state)?.name ?? 'contacts'
     : state.mode === 'chat-compose'
       ? state.editForm?.title ?? 'New message'
-      : activeContact(state)?.name ?? selectedConversation(state)?.title ?? 'chats';
+      : activeContact(state)?.name ?? (selected ? convTitle(selected) : 'chats');
   const unread = Object.values(state.unreadByConversation).reduce((sum, count) => sum + count, 0);
   const connection = formatConnectionStatus(connectionStatusForState(state));
   const requests = requestCount(state);
   const parts = [
-    `Cone of Silence ·${state.identity.env}`,
+    `Cone ·${state.identity.env}`,
     '1 Chats',
     '2 Contacts',
     unread > 0 ? `${connection} · ${unread} new` : connection,
@@ -153,7 +158,55 @@ function renderMainRow(state: ChatState, row: number, width: number, bodyHeight:
   if (state.mode === 'contacts-edit' || state.mode === 'chat-compose') {
     return renderEditFormRow(state, row, width);
   }
+  if (state.mode === 'group-info') {
+    return renderGroupInfoRow(state, row, width, bodyHeight);
+  }
   return renderThreadRow(state, row, width, bodyHeight);
+}
+
+// The group-info pane: shared metadata, own status, and the member list with
+// roles ('owner' for XMTP super admins). Members read from the cached mirror,
+// so the pane works offline; entering the pane kicks a quiet sync to freshen.
+function renderGroupInfoRow(state: ChatState, row: number, width: number, bodyHeight: number): string {
+  const conversation = selectedConversation(state);
+  if (!conversation || conversation.kind !== 'group') {
+    return pad(row === 0 ? '[group info]' : '', width);
+  }
+  if (row === 0) {
+    const left = conversation.active === false ? ` ${danger('no longer a member')}` : '';
+    return pad(`[group info] ${conversation.title}${left}`, width);
+  }
+  const meta: string[] = [];
+  if (conversation.groupDescription) {
+    meta.push(dim(ellipsize(conversation.groupDescription, width - 2)));
+  }
+  const timer = conversation.retention ? ` · timer ${formatRetention(conversation.retention.durationMs)}` : '';
+  meta.push(dim(`${conversation.memberCount ?? groupInfoMembers(state).length} members · consent ${conversation.consentState}${timer}`));
+  meta.push('');
+  if (row <= meta.length) {
+    return pad(meta[row - 1] ?? '', width);
+  }
+
+  const members = groupInfoMembers(state);
+  const listRow = row - meta.length - 1;
+  if (members.length === 0) {
+    return pad(listRow === 0 ? dim('no member list yet — syncing') : '', width);
+  }
+  const visibleRows = Math.max(1, bodyHeight - meta.length - 1);
+  const start = visibleStart(state.groupInfoIndex, members.length, visibleRows);
+  const member = members[start + listRow];
+  if (!member || start + listRow >= start + visibleRows) {
+    return pad('', width);
+  }
+  const selected = start + listRow === state.groupInfoIndex;
+  const role = member.level === 'superAdmin' ? ' [owner]' : member.level === 'admin' ? ' [admin]' : '';
+  const rawName = memberDisplayName(state, member.inboxId);
+  const unnamed = rawName === member.inboxId;
+  const name = unnamed ? shortId(member.inboxId) : rawName;
+  const idSuffix = unnamed ? '' : ` ${dim(shortId(member.inboxId))}`;
+  const blocked = member.consentState === 'denied' ? ` ${danger('[blocked]')}` : '';
+  const line = `${selected ? '>' : ' '} ${name}${role}${idSuffix}${blocked}`;
+  return pad(selected ? highlight(line) : line, width);
 }
 
 function renderThreadRow(state: ChatState, row: number, width: number, bodyHeight: number): string {
@@ -164,7 +217,7 @@ function renderThreadRow(state: ChatState, row: number, width: number, bodyHeigh
     // When the title is already the peer's inbox ID, don't repeat it dimmed.
     // Groups show their member count instead of a peer id.
     const peerSuffix = conversation?.kind === 'group'
-      ? ` ${dim(conversation.memberCount ? `group · ${conversation.memberCount}` : 'group')}`
+      ? ` ${dim(conversation.memberCount ? `group · ${conversation.memberCount}` : 'group')}${conversation.active === false ? ` ${danger('left')}` : ''}`
       : conversation?.peerInboxId && conversation.title !== conversation.peerInboxId
         ? ` ${dim(shortId(conversation.peerInboxId))}`
         : '';
@@ -230,8 +283,18 @@ function renderEditFormRow(state: ChatState, row: number, width: number): string
     return pad(`[${form.title}]`, width);
   }
   if (form.pending) {
-    const lines = ['Waiting for the other side to enter the same code (up to 60s)…', 'Esc to leave — pairing keeps running in the background.'];
-    return pad(dim(lines[row - 1] ?? ''), width);
+    // A pending group invite keeps its result lines (the code) on screen —
+    // that is what gets read out to the joiner while we wait.
+    const result = form.resultLines ?? [];
+    if (row <= result.length) {
+      return pad(result[row - 1] ?? '', width);
+    }
+    const waiting = form.kind === 'group-invite'
+      ? ['Waiting for someone to join with this code (up to 60s)…', 'Esc to leave — the invite keeps running in the background.']
+      : form.kind === 'group-join'
+        ? ['Waiting for the inviter to share the group (up to 60s)…', 'Esc to leave — the join keeps running in the background.']
+        : ['Waiting for the other side to enter the same code (up to 60s)…', 'Esc to leave — pairing keeps running in the background.'];
+    return pad(dim(waiting[row - result.length - 1] ?? ''), width);
   }
   if (form.resultLines && row <= form.resultLines.length) {
     return pad(form.resultLines[row - 1] ?? '', width);
@@ -308,7 +371,9 @@ function footerLine(state: ChatState, width: number): string {
       ? ' type to filter | Up/Down move | Enter keep | Esc clear '
       : state.scope === 'requests'
         ? ` j/k move | Enter preview | a accept | b block${state.pendingBlockId ? ' (again to confirm)' : ''} | ${filterHint} |${requestsHint} | ? help | q quit `
-        : ` j/k move | Enter talk | n new | r name | e timer | c/p pair | ${filterHint} | d delete${failedHere ? ' | Ctrl+X delete failed' : ''}${retrySync ? ' | s retry sync' : ''}${requestsHint} | ? help | q quit `
+        : ` j/k move | Enter talk | n new | ${selectedConversation(state)?.kind === 'group' ? 'i info' : 'r name'} | e timer | c/p pair | g join group | ${filterHint} | d delete${failedHere ? ' | Ctrl+X delete failed' : ''}${retrySync ? ' | s retry sync' : ''}${requestsHint} | ? help | q quit `
+    : state.mode === 'group-info'
+      ? ` j/k move | a add | v invite | l link | r rename | +/- role | d remove | e timer | x leave | b block | Esc back `
     : state.mode === 'chat-talk'
       ? failedHere
         ? ' Enter retry | Ctrl+X delete failed | Esc back | Ctrl+U clear '
@@ -339,8 +404,9 @@ function transcriptRows(
   const key = conversation?.conversationId ?? contactKey;
   const allMessages = conversation ? state.messages : [];
   // Control messages (read receipts, pair confirmations) never appear in the
-  // transcript; the read receipt instead places a single "Read" marker.
-  const messages = allMessages.filter(isVisibleChatMessage);
+  // transcript; the read receipt instead places a single "Read" marker. Group
+  // updates are the exception — they render as attributed system lines.
+  const messages = allMessages.filter((message) => isVisibleChatMessage(message) || isGroupUpdateMessage(message));
   const readMarkerId = state.readReceipts ? latestReadOutboundId(allMessages) : undefined;
   // Optimistic rows render identically to delivered ones; only failures are
   // marked. A pending row hides once its delivered copy is in the store.
@@ -352,7 +418,9 @@ function transcriptRows(
     : [];
 
   if (messages.length === 0 && pending.length === 0) {
+    const notice = conversation?.kind === 'group' ? groupHistoryNotice(conversation, state.identity.inboxId) : undefined;
     return [
+      ...(notice ? [dim(`· ${notice}`)] : []),
       conversation
         ? 'No local messages yet. New messages stream in automatically.'
         : 'No messages yet. Press Enter to talk, type Message, then Enter to send.',
@@ -386,10 +454,29 @@ function transcriptRows(
       rows.push(row);
     }
   };
+  // Group transcripts open with the honest MLS note: your view starts where
+  // you joined (or where you created the group).
+  if (conversation?.kind === 'group') {
+    const notice = groupHistoryNotice(conversation, state.identity.inboxId);
+    if (notice) {
+      rows.push(dim(`· ${notice}`));
+    }
+  }
+  const resolveName = (inboxId: string) => memberDisplayName(state, inboxId);
   const peerLabel = conversation ? convTitle(conversation) : 'peer';
   for (const message of messages) {
+    // Group updates render as dim system lines, not chat bubbles.
+    if (isGroupUpdateEnvelope(message.json)) {
+      for (const line of formatGroupUpdate(message.json, resolveName)) {
+        rows.push(dim(`${formatTranscriptTime(message.sentAt)} · ${ellipsize(line, Math.max(10, width - 8))}`));
+      }
+      continue;
+    }
     const outbound = message.direction === 'outbound';
-    pushEntry(message.sentAt, outbound ? 'me' : peerLabel, messageBody(message), {
+    // In groups, label inbound rows by their actual sender (contacts-first);
+    // in DMs the peer label is the conversation title as before.
+    const sender = outbound ? 'me' : conversation?.kind === 'group' ? shortSender(resolveName(message.senderInboxId)) : peerLabel;
+    pushEntry(message.sentAt, sender, messageBody(message), {
       outbound,
       read: message.messageId === readMarkerId,
     });
@@ -398,6 +485,12 @@ function transcriptRows(
     pushEntry(entry.sentAt, 'me', entry.text, { failed: entry.status === 'failed', outbound: true });
   }
   return rows;
+}
+
+// A group sender with no contact name is a raw inbox ID; shorten it so the
+// transcript prefix stays readable.
+function shortSender(name: string): string {
+  return name.length > 20 && /^[0-9a-f]+$/iu.test(name) ? shortId(name) : name;
 }
 
 function renderHelpRow(state: ChatState, row: number, width: number): string {
@@ -418,9 +511,15 @@ function renderHelpRow(state: ChatState, row: number, width: number): string {
     't toggles Requests (unknown senders). There: a accepts, b blocks (twice to',
     '  confirm). Accepting moves them to your inbox; only allowed chats send receipts.',
     'Chats: r names the selected peer (saves a contact); d deletes the local chat.',
+    'i opens group info on a group: members with roles, a add, r rename, +/-',
+    '  promote/demote, d remove (twice), x leave (twice, visible), b block (twice,',
+    '  silent). Owners must promote a new owner before leaving.',
     'e sets the disappearing-messages timer for the selected chat (off, 5m…30d).',
     '  Both sides see it; messages sent under a timer vanish after it elapses.',
     'c creates a pairing code, p joins one — from Chats or Contacts.',
+    'g joins a group by invite code or link token; in group info, v creates a',
+    '  code (single use, 10 minutes, adds the joiner directly) and l creates an',
+    '  async link token (joiners are admitted when this account syncs).',
     'Contacts: a add, r rename, d delete, c create code, p join code.',
     'Realtime stream stays on; s only appears when sync/stream needs retry.',
   ];
@@ -450,6 +549,9 @@ function modeLabel(mode: ChatMode): string {
   }
   if (mode === 'contacts-select') {
     return 'Contacts';
+  }
+  if (mode === 'group-info') {
+    return 'Group info';
   }
   return 'Editing';
 }

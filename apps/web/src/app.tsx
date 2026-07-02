@@ -6,12 +6,16 @@ import {
   errorMessage,
   formatConnectionStatus,
   formatConversationPreview,
+  formatGroupUpdate,
   formatRetention,
   formatTranscriptTime,
   generateSecretKey,
+  groupHistoryNotice,
   HttpRendezvousClient,
   isAllowedConversation,
   isDeniedConversation,
+  isGroupUpdateEnvelope,
+  isGroupUpdateMessage,
   isRequestConversation,
   isVisibleChatMessage,
   laterIso,
@@ -24,9 +28,13 @@ import {
   type ConeConnectionStatus,
   type ConeClient,
   type ConeConversation,
+  type ConeGroupMember,
   type ConeIdentity,
   type ConeMessage,
   type Contact,
+  type GroupInviteLink,
+  type GroupMemberLevel,
+  type HandshakeCode,
   type XmtpEnv,
 } from '@cone/core';
 import { browserAccountNamespace, createBrowserXmtpAdapter, IndexedDbStore } from '@cone/xmtp-browser';
@@ -85,7 +93,7 @@ const VIEWS: { key: View; label: string }[] = [
   { key: 'settings', label: 'Settings' },
 ];
 
-const DEFAULT_RENDEZVOUS_URL = import.meta.env.VITE_COS_RENDEZVOUS_URL ?? 'http://localhost:8787';
+const DEFAULT_RENDEZVOUS_URL = import.meta.env.VITE_CONE_RENDEZVOUS_URL ?? 'http://localhost:8787';
 
 export function App({ bootstrap }: AppProps = {}) {
   const [session, setSession] = useState<SessionState | null>(() => bootstrap?.session ?? null);
@@ -118,12 +126,28 @@ export function App({ bootstrap }: AppProps = {}) {
   const [pairShareName, setPairShareName] = useState('');
   const [pairExpiresAt, setPairExpiresAt] = useState('');
 
+  // Synchronous group invite code (inviter side, shown in the group info
+  // panel while waiting) and the joiner-side fields on the Pair tab.
+  const [groupInviteCode, setGroupInviteCode] = useState('');
+  const [groupInviteExpiresAt, setGroupInviteExpiresAt] = useState('');
+  const [groupInviteLink, setGroupInviteLink] = useState<GroupInviteLink | null>(null);
+  const [groupJoinCode, setGroupJoinCode] = useState('');
+  const [groupJoinShareName, setGroupJoinShareName] = useState('');
+
   const [status, setStatus] = useState('');
   const [statusError, setStatusError] = useState(false);
   // Keyboard-stepped (not yet applied) value of the disappearing-messages
   // select; Enter commits it, Esc/blur discards it. Pointer selection commits
   // directly and never uses the draft.
   const [timerDraft, setTimerDraft] = useState<string | null>(null);
+  const [groupInfoOpen, setGroupInfoOpen] = useState(false);
+  // DM header "name this contact" row — the Chats-side way to (re)create a
+  // local alias for a peer, matching the TUI's `r`.
+  const [peerNameOpen, setPeerNameOpen] = useState(false);
+  const [peerNameDraft, setPeerNameDraft] = useState('');
+  const [groupMembers, setGroupMembers] = useState<ConeGroupMember[]>([]);
+  const [memberInput, setMemberInput] = useState('');
+  const [groupNameDraft, setGroupNameDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [helpVisible, setHelpVisible] = useState(false);
   const [pendingSends, setPendingSends] = useState<PendingSend[]>([]);
@@ -216,7 +240,26 @@ export function App({ bootstrap }: AppProps = {}) {
 
   const activeConversation = conversations.find((conversation) => conversation.conversationId === selectedConversationId);
   const visibleMessages = (messagesByConv[selectedConversationId] ?? []).filter(isVisibleChatMessage);
-  const lastVisibleId = visibleMessages[visibleMessages.length - 1]?.messageId ?? '';
+  // The rendered transcript also carries group updates ("Alice added Bob") as
+  // system lines; they stay excluded from previews/unread counts.
+  const transcriptMessages = (messagesByConv[selectedConversationId] ?? []).filter(
+    (message) => isVisibleChatMessage(message) || isGroupUpdateMessage(message),
+  );
+  const lastVisibleId = transcriptMessages[transcriptMessages.length - 1]?.messageId ?? '';
+  const contactNameByInbox = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const contact of contacts) {
+      if (contact.source !== 'self') {
+        map.set(contact.inboxId, contact.name);
+      }
+    }
+    return map;
+  }, [contacts]);
+  // Contacts-first display name for group members and senders.
+  const memberLabel = (inboxId: string) =>
+    inboxId === session?.identity.inboxId ? 'you' : contactNameByInbox.get(inboxId) ?? shortId(inboxId);
+  const activeGroup = activeConversation?.kind === 'group' ? activeConversation : undefined;
+  const activeGroupInactive = activeGroup?.active === false;
   // Pending rows for the open pane; a 'sending' row hides as soon as its
   // delivered copy is in the local store.
   const panePending = pendingSends.filter(
@@ -514,6 +557,41 @@ export function App({ bootstrap }: AppProps = {}) {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [session]);
 
+  // The group info panel belongs to one conversation; switching chats closes
+  // it. Opening it fetches a fresh member list (the cached mirror is the
+  // offline fallback).
+  useEffect(() => {
+    setGroupInfoOpen(false);
+    setMemberInput('');
+    setPeerNameOpen(false);
+    setPeerNameDraft('');
+  }, [selectedConversationId]);
+
+  useEffect(() => {
+    if (!groupInfoOpen || !session || !activeGroup) {
+      return;
+    }
+    setGroupNameDraft(activeGroup.groupName ?? '');
+    setGroupMembers(activeGroup.members ?? []);
+    if (activeGroup.active === false) {
+      return;
+    }
+    let cancelled = false;
+    void session.client.listGroupMembers(activeGroup.conversationId)
+      .then((members) => {
+        if (!cancelled) {
+          setGroupMembers(members);
+        }
+      })
+      .catch(() => {
+        /* offline — the cached mirror is already shown */
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupInfoOpen, session, activeGroup?.conversationId, activeGroup?.active]);
+
   // ── Actions ────────────────────────────────────────────────────────────
   async function run(action: () => Promise<void>, pending = 'Working…') {
     setBusy(true);
@@ -591,6 +669,10 @@ export function App({ bootstrap }: AppProps = {}) {
     }
     const body = text.trim();
     const group = activeConversation?.kind === 'group' ? activeConversation : undefined;
+    if (group?.active === false) {
+      note('You are no longer a member of this group');
+      return;
+    }
     const target = activeConversation ? activeConversation.peerInboxId ?? '' : to.trim();
     if (!body || (!target && !group)) {
       return;
@@ -713,6 +795,99 @@ export function App({ bootstrap }: AppProps = {}) {
     }, 'Deleting…');
   }
 
+  // ── Group management (the info panel) ──────────────────────────────────
+  async function reloadGroupMembers(conversationId: string) {
+    if (!session) {
+      return;
+    }
+    setGroupMembers(await session.client.listGroupMembers(conversationId));
+  }
+
+  async function renameActiveGroup() {
+    if (!session || !activeGroup || !groupNameDraft.trim()) {
+      return;
+    }
+    await run(async () => {
+      await session.client.renameGroup(activeGroup.conversationId, groupNameDraft);
+      await refresh(session.client);
+      note('Group renamed — every member sees the new name');
+    }, 'Renaming…');
+  }
+
+  async function addGroupMember() {
+    if (!session || !activeGroup || !memberInput.trim()) {
+      return;
+    }
+    await run(async () => {
+      await session.client.addGroupMembers(activeGroup.conversationId, [memberInput.trim()]);
+      setMemberInput('');
+      await reloadGroupMembers(activeGroup.conversationId);
+      await refresh(session.client);
+      note('Member added');
+    }, 'Adding…');
+  }
+
+  async function removeGroupMember(member: ConeGroupMember) {
+    if (!session || !activeGroup || !confirm(`Remove ${memberLabel(member.inboxId)} from ${activeGroup.title}? Everyone in the group will see it.`)) {
+      return;
+    }
+    await run(async () => {
+      await session.client.removeGroupMembers(activeGroup.conversationId, [{ inboxId: member.inboxId }]);
+      await reloadGroupMembers(activeGroup.conversationId);
+      await refresh(session.client);
+      note(`Removed ${memberLabel(member.inboxId)}`);
+    }, 'Removing…');
+  }
+
+  async function setMemberLevel(member: ConeGroupMember, level: GroupMemberLevel) {
+    if (!session || !activeGroup) {
+      return;
+    }
+    await run(async () => {
+      await session.client.setGroupMemberLevel(activeGroup.conversationId, { inboxId: member.inboxId }, level);
+      await reloadGroupMembers(activeGroup.conversationId);
+      await refresh(session.client);
+      note(`${memberLabel(member.inboxId)} is now ${level === 'superAdmin' ? 'an owner' : level === 'admin' ? 'an admin' : 'a member'}`);
+    }, 'Updating role…');
+  }
+
+  async function leaveActiveGroup() {
+    if (!session || !activeGroup) {
+      return;
+    }
+    const self = groupMembers.find((member) => member.inboxId === session.identity.inboxId);
+    const otherOwner = groupMembers.some((member) => member.level === 'superAdmin' && member.inboxId !== session.identity.inboxId);
+    // XMTP forbids the last owner leaving; explain the transfer move instead.
+    if (self?.level === 'superAdmin' && !otherOwner) {
+      note('You are the only owner — promote another member to owner first');
+      return;
+    }
+    if (!confirm(`Leave ${activeGroup.title}? Everyone in the group will see that you left. Your local history is kept.`)) {
+      return;
+    }
+    await run(async () => {
+      await session.client.leaveGroup(activeGroup.conversationId);
+      await refresh(session.client);
+      note(`Left ${activeGroup.title}`);
+    }, 'Leaving…');
+  }
+
+  async function blockActiveGroup() {
+    if (!session || !activeGroup) {
+      return;
+    }
+    if (!confirm(`Block ${activeGroup.title}? It disappears from your chats without telling anyone — unlike leaving, nobody sees it.`)) {
+      return;
+    }
+    await run(async () => {
+      await session.client.setConversationConsent(activeGroup.conversationId, 'denied');
+      setSelectedConversationId('');
+      setGroupInfoOpen(false);
+      await refresh(session.client);
+      note(`Blocked ${activeGroup.title}`);
+    }, 'Blocking…');
+  }
+
   // Accept a Request: mark the sender allowed (moves them to the inbox) and,
   // optionally, save a contact under a chosen name in the same flow.
   async function acceptRequest(conversation: ConeConversation, saveName?: string) {
@@ -776,24 +951,122 @@ export function App({ bootstrap }: AppProps = {}) {
     }, 'Setting timer…');
   }
 
+  // Minting a code immediately joins its room: pairing needs both sides
+  // waiting, so "create, then separately join your own code" was a trap.
   async function createCode() {
     if (!session) {
       return;
     }
+    let generated: HandshakeCode | undefined;
     await run(async () => {
-      const generated = await session.client.createHandshakeCode();
+      generated = await session.client.createHandshakeCode();
       setPairCode(generated.code);
       setPairExpiresAt(generated.expiresAt);
-      note('Share this code with the other side.');
     }, 'Creating code…');
+    if (generated) {
+      await joinCode(generated.code);
+    }
   }
 
-  async function joinCode() {
-    if (!session || !pairCode.trim()) {
+  // Synchronous group invite, inviter side: mint a single-use code and wait
+  // for the join request. The joiner is added directly — the code was created
+  // seconds ago, so intent is unambiguous. No contact is auto-saved.
+  async function inviteToActiveGroup() {
+    if (!session || !activeGroup) {
+      return;
+    }
+    const group = activeGroup;
+    await run(async () => {
+      const generated = await session.client.createHandshakeCode();
+      setGroupInviteCode(generated.code);
+      setGroupInviteExpiresAt(generated.expiresAt);
+      try {
+        const result = await session.client.inviteToGroupWithCode(generated.code, group.conversationId);
+        await reloadGroupMembers(group.conversationId);
+        await refresh(session.client);
+        note(`Added ${result.joiner.proposedName ?? shortId(result.joiner.inboxId)} to ${group.title}`);
+      } finally {
+        setGroupInviteCode('');
+        setGroupInviteExpiresAt('');
+      }
+    }, 'Waiting for someone to join the code…');
+  }
+
+  // Save (or rename) a local contact for the open DM's peer — the Chats-side
+  // equivalent of the TUI's `r`, and the way back after deleting a contact.
+  async function savePeerName() {
+    const peerInboxId = activeConversation?.peerInboxId;
+    const name = peerNameDraft.trim();
+    if (!session || !peerInboxId || !name) {
       return;
     }
     await run(async () => {
-      const result = await session.client.pairWithCode(pairCode, { proposedName: pairShareName || undefined });
+      await session.client.saveContact({
+        name,
+        inboxId: peerInboxId,
+        address: activeConversation?.peerAddress,
+        source: 'manual',
+      });
+      setPeerNameOpen(false);
+      setPeerNameDraft('');
+      await refresh(session.client);
+      note(`Saved ${name}`);
+    }, 'Saving…');
+  }
+
+  // Async invite link: a capability token with a long TTL, admitted by this
+  // account's periodic sync — nothing to wait for at mint time.
+  async function createLinkForActiveGroup() {
+    if (!session || !activeGroup) {
+      return;
+    }
+    const group = activeGroup;
+    await run(async () => {
+      const link = await session.client.createGroupInviteLink(group.conversationId);
+      setGroupInviteLink(link);
+      note('Share the token; joiners are admitted when this app syncs.');
+    }, 'Creating invite link…');
+  }
+
+  async function revokeActiveGroupLink() {
+    if (!session || !groupInviteLink) {
+      return;
+    }
+    const link = groupInviteLink;
+    await run(async () => {
+      await session.client.revokeGroupInviteLink(link.linkId);
+      setGroupInviteLink(null);
+      note('Invite link revoked.');
+    }, 'Revoking…');
+  }
+
+  // Joiner side: the join request reaches the inviter over rendezvous; the
+  // membership itself arrives as an XMTP welcome, which the recorded pending
+  // join auto-allows (requesting to join is implied consent).
+  async function joinGroupCode() {
+    if (!session || !groupJoinCode.trim()) {
+      return;
+    }
+    await run(async () => {
+      const result = await session.client.joinGroupWithCode(groupJoinCode, {
+        proposedName: groupJoinShareName.trim() || undefined,
+      });
+      setGroupJoinCode('');
+      setGroupJoinShareName('');
+      // Sync right away so the welcome lands as soon as the add propagates.
+      await session.client.sync();
+      await refresh(session.client);
+      note(`Join requested — ${result.groupName ?? 'the group'} appears once the inviter's add arrives.`);
+    }, 'Waiting for the inviter…');
+  }
+
+  async function joinCode(codeOverride?: string) {
+    const code = (codeOverride ?? pairCode).trim();
+    if (!session || !code) {
+      return;
+    }
+    await run(async () => {
+      const result = await session.client.pairWithCode(code, { proposedName: pairShareName || undefined });
       const contact = pairPeerName.trim()
         ? await session.client.saveContact({
             address: result.contact.address,
@@ -968,7 +1241,7 @@ export function App({ bootstrap }: AppProps = {}) {
                   ref={secretRef}
                   value={secretInput}
                   onInput={(event) => setSecretInput(event.currentTarget.value)}
-                  placeholder="cos_sk_v1_…"
+                  placeholder="cone_sk_v1_…"
                   rows={3}
                   autocomplete="off"
                   spellcheck={false}
@@ -1200,11 +1473,28 @@ export function App({ bootstrap }: AppProps = {}) {
                         {initials(activeConversation.title)}
                       </span>
                       <span class="thread__title">{peerLabel(activeConversation)}</span>
-                      <span class="thread__peer">
-                        {activeConversation.kind === 'group'
-                          ? `group · ${activeConversation.memberCount ?? '?'} members`
-                          : shortId(activeConversation.peerInboxId ?? '')}
-                      </span>
+                      {activeConversation.kind === 'group' ? (
+                        <button
+                          type="button"
+                          class={`thread__peer thread__peer--btn${groupInfoOpen ? ' active' : ''}`}
+                          onClick={() => setGroupInfoOpen((open) => !open)}
+                          title="Group info — members, roles, and settings"
+                        >
+                          group · {activeConversation.memberCount ?? '?'} members{activeGroupInactive ? ' · left' : ''} ▾
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          class={`thread__peer thread__peer--btn${peerNameOpen ? ' active' : ''}`}
+                          onClick={() => {
+                            setPeerNameDraft(contacts.find((contact) => contact.inboxId === activeConversation.peerInboxId)?.name ?? '');
+                            setPeerNameOpen((open) => !open);
+                          }}
+                          title="Name this contact — a local alias, visible only to you"
+                        >
+                          {shortId(activeConversation.peerInboxId ?? '')} ✎
+                        </button>
+                      )}
                       <span class="thread__spacer" />
                       {isRequestConversation(activeConversation) ? (
                         <>
@@ -1271,10 +1561,190 @@ export function App({ bootstrap }: AppProps = {}) {
                   )}
                 </header>
 
+                {peerNameOpen && activeConversation && activeConversation.kind !== 'group' && activeConversation.peerInboxId && (
+                  <div class="group-info" aria-label="Name this contact">
+                    <div class="group-info__rename">
+                      <input
+                        value={peerNameDraft}
+                        onInput={(event) => setPeerNameDraft(event.currentTarget.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault();
+                            void savePeerName();
+                          } else if (event.key === 'Escape') {
+                            setPeerNameOpen(false);
+                          }
+                        }}
+                        placeholder="Contact name — a local alias, visible only to you"
+                        aria-label="Contact name"
+                      />
+                      <button type="button" class="ghost" disabled={!peerNameDraft.trim() || busy} onClick={() => void savePeerName()}>
+                        Save
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {groupInfoOpen && activeGroup && (
+                  <div class="group-info" aria-label="Group info">
+                    {activeGroup.groupDescription && <p class="group-info__desc">{activeGroup.groupDescription}</p>}
+                    {activeGroupInactive ? (
+                      <p class="group-info__note">You are no longer a member. Your local history is kept.</p>
+                    ) : (
+                      <div class="group-info__rename">
+                        <input
+                          value={groupNameDraft}
+                          onInput={(event) => setGroupNameDraft(event.currentTarget.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') {
+                              event.preventDefault();
+                              void renameActiveGroup();
+                            }
+                          }}
+                          placeholder="Group name"
+                          aria-label="Group name (shared — every member sees it)"
+                        />
+                        <button
+                          type="button"
+                          class="ghost"
+                          disabled={!groupNameDraft.trim() || groupNameDraft.trim() === (activeGroup.groupName ?? '')}
+                          onClick={() => void renameActiveGroup()}
+                        >
+                          Rename
+                        </button>
+                      </div>
+                    )}
+                    <div class="group-info__members">
+                      {groupMembers.map((member) => {
+                        const self = member.inboxId === session?.identity.inboxId;
+                        return (
+                          <div class="group-info__member" key={member.inboxId}>
+                            <span class="avatar sm" style={`--hue:${hashHue(member.inboxId)}`} aria-hidden="true">
+                              {initials(memberLabel(member.inboxId))}
+                            </span>
+                            <span class="group-info__name">
+                              {memberLabel(member.inboxId)}
+                              {member.level !== 'member' && (
+                                <span class={`role-chip${member.level === 'superAdmin' ? ' owner' : ''}`}>
+                                  {member.level === 'superAdmin' ? 'owner' : 'admin'}
+                                </span>
+                              )}
+                              {member.consentState === 'denied' && <span class="role-chip blocked">blocked</span>}
+                            </span>
+                            {!self && !activeGroupInactive && (
+                              <span class="group-info__actions">
+                                {member.level !== 'superAdmin' && (
+                                  <button
+                                    type="button"
+                                    class="ghost"
+                                    title={member.level === 'member' ? 'Make admin' : 'Make owner'}
+                                    onClick={() => void setMemberLevel(member, member.level === 'member' ? 'admin' : 'superAdmin')}
+                                  >
+                                    ↑
+                                  </button>
+                                )}
+                                {member.level !== 'member' && (
+                                  <button
+                                    type="button"
+                                    class="ghost"
+                                    title={member.level === 'superAdmin' ? 'Demote to admin' : 'Demote to member'}
+                                    onClick={() => void setMemberLevel(member, member.level === 'superAdmin' ? 'admin' : 'member')}
+                                  >
+                                    ↓
+                                  </button>
+                                )}
+                                <button type="button" class="ghost danger" title="Remove from group" onClick={() => void removeGroupMember(member)}>
+                                  ×
+                                </button>
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
+                      {groupMembers.length === 0 && <p class="muted">No member list yet — it fills in after a sync.</p>}
+                    </div>
+                    {!activeGroupInactive && (
+                      <div class="group-info__add">
+                        <input
+                          value={memberInput}
+                          onInput={(event) => setMemberInput(event.currentTarget.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') {
+                              event.preventDefault();
+                              void addGroupMember();
+                            }
+                          }}
+                          placeholder="Add member — contact, XMTP inbox ID, or 0x address"
+                          aria-label="Add member"
+                        />
+                        <button type="button" class="ghost" disabled={!memberInput.trim()} onClick={() => void addGroupMember()}>
+                          Add
+                        </button>
+                      </div>
+                    )}
+                    {!activeGroupInactive && (
+                      <div class="group-info__invite">
+                        {groupInviteCode ? (
+                          <>
+                            <span class="code">{groupInviteCode}</span>
+                            <button type="button" class="ghost" onClick={() => void copy(groupInviteCode)}>Copy</button>
+                            <span class="muted">
+                              waiting for the joiner — expires in {countdown(groupInviteExpiresAt, nowTick)}
+                            </span>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            class="ghost"
+                            disabled={busy}
+                            title="Mint a single-use code; whoever enters it within 10 minutes is added directly"
+                            onClick={() => void inviteToActiveGroup()}
+                          >
+                            Invite by code
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {!activeGroupInactive && (
+                      <div class="group-info__invite">
+                        {groupInviteLink && groupInviteLink.conversationId === activeGroup.conversationId ? (
+                          <>
+                            <span class="code">{groupInviteLink.token}</span>
+                            <button type="button" class="ghost" onClick={() => void copy(groupInviteLink.token)}>Copy</button>
+                            <button type="button" class="ghost danger" onClick={() => void revokeActiveGroupLink()}>Revoke</button>
+                            <span class="muted">joiners are admitted when this app syncs</span>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            class="ghost"
+                            disabled={busy}
+                            title="Mint an async token — anyone holding it is added when this app syncs. Single use by default."
+                            onClick={() => void createLinkForActiveGroup()}
+                          >
+                            Invite link
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {!activeGroupInactive && (
+                      <div class="group-info__foot">
+                        <button type="button" class="ghost" onClick={() => void leaveActiveGroup()} title="Everyone in the group sees that you left">
+                          Leave group
+                        </button>
+                        <button type="button" class="ghost danger" onClick={() => void blockActiveGroup()} title="Hides the group without telling anyone">
+                          Block group
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <div class="transcript" ref={transcriptRef} role="log" aria-live="polite" aria-relevant="additions text">
-                  {visibleMessages.length === 0 && panePending.length === 0 ? (
+                  {transcriptMessages.length === 0 && panePending.length === 0 ? (
                     <div class="sys">
                       <p>· <b>{sessionLabel(sessionStartedAt)}</b> — session ready</p>
+                      {activeGroup && session && <p>· {groupHistoryNotice(activeGroup, session.identity.inboxId)}</p>}
                       <p>· {activeConversation ? 'No messages yet.' : 'Pick a recipient below, then write your message.'}</p>
                       <p>· {activeConversation
                         ? 'Type below and press Enter to send.'
@@ -1283,15 +1753,36 @@ export function App({ bootstrap }: AppProps = {}) {
                     </div>
                   ) : (
                     <>
-                      {visibleMessages.map((message) => (
-                        <MessageRow
-                          key={message.messageId}
-                          message={message}
-                          sender={message.direction === 'outbound' ? 'me' : activeConversation?.title ?? shortId(message.senderInboxId)}
-                          reserveStatus={readReceipts}
-                          readMarker={message.messageId === readMarkerId}
-                        />
-                      ))}
+                      {activeGroup && session && (
+                        <div class="sys">
+                          <p>· {groupHistoryNotice(activeGroup, session.identity.inboxId)}</p>
+                        </div>
+                      )}
+                      {transcriptMessages.map((message) =>
+                        isGroupUpdateEnvelope(message.json) ? (
+                          <div class="sys sys--inline" key={message.messageId}>
+                            {formatGroupUpdate(message.json, memberLabel).map((line) => (
+                              <p key={line}>
+                                <span class="msg__time">{formatTranscriptTime(message.sentAt)}</span> · {line}
+                              </p>
+                            ))}
+                          </div>
+                        ) : (
+                          <MessageRow
+                            key={message.messageId}
+                            message={message}
+                            sender={
+                              message.direction === 'outbound'
+                                ? 'me'
+                                : activeGroup
+                                  ? memberLabel(message.senderInboxId)
+                                  : activeConversation?.title ?? shortId(message.senderInboxId)
+                            }
+                            reserveStatus={readReceipts}
+                            readMarker={message.messageId === readMarkerId}
+                          />
+                        ),
+                      )}
                       {panePending.map((entry) => (
                         <article class={`msg outbound${entry.status === 'failed' ? ' failed' : ''}`} key={entry.id}>
                           <span class="msg__content">
@@ -1381,6 +1872,7 @@ export function App({ bootstrap }: AppProps = {}) {
                       ref={messageRef}
                       class="composer__input"
                       value={text}
+                      disabled={activeGroupInactive}
                       onFocus={() => activeConversation && setComposing(false)}
                       onInput={(event) => setText(event.currentTarget.value)}
                       onKeyDown={(event) => {
@@ -1393,13 +1885,13 @@ export function App({ bootstrap }: AppProps = {}) {
                         }
                       }}
                       rows={1}
-                      placeholder={`Message ${recipientName}…`}
+                      placeholder={activeGroupInactive ? 'You are no longer a member of this group' : `Message ${recipientName}…`}
                       aria-label="Message"
                     />
                     <button
                       class="primary composer__send"
                       type="submit"
-                      disabled={!text.trim() || (!activeConversation && !to.trim())}
+                      disabled={!text.trim() || activeGroupInactive || (!activeConversation && !to.trim())}
                     >
                       Send <kbd>↵</kbd>
                     </button>
@@ -1496,10 +1988,10 @@ export function App({ bootstrap }: AppProps = {}) {
               <section class="panel">
                 <div class="panel__head">Pair</div>
                 <p class="lede">
-                  Two people or agents enter the same one-time code. Each posts an encrypted offer to the rendezvous
-                  service; once both are present you confirm over XMTP and save each other as contacts. A code works for
-                  exactly two participants and expires after ten minutes — the pairing itself is permanent and the code is
-                  never needed again. No messages pass through rendezvous.
+                  Two people or agents enter the same one-time code. Creating a code starts waiting immediately — just
+                  have the other side enter it within ten minutes (CLI: <code>cone pair &lt;code&gt;</code>). Once both
+                  sides are present you confirm over XMTP and save each other as contacts; the pairing is permanent and
+                  the code is never needed again. No messages pass through rendezvous.
                 </p>
                 <label class="field">
                   <span>handshake code</span>
@@ -1535,6 +2027,36 @@ export function App({ bootstrap }: AppProps = {}) {
                 <p class="log__line"><span>net</span><em>{session.env}</em></p>
                 <p class="log__line"><span>you</span><em>{shortId(session.identity.inboxId)}</em></p>
               </aside>
+              <section class="panel">
+                <div class="panel__head">Join a group</div>
+                <p class="lede">
+                  Someone in a group creates an invite from the group's info panel: a spoken code (ten minutes, they
+                  wait and add you directly) or a link token (they add you the next time their app syncs). Enter
+                  either here — the group appears in Chats once their add arrives. Invites are single use by default
+                  and nobody is saved as a contact.
+                </p>
+                <label class="field">
+                  <span>invite code or token</span>
+                  <input
+                    value={groupJoinCode}
+                    onInput={(event) => setGroupJoinCode(event.currentTarget.value)}
+                    placeholder="anchor-beacon-cedar… or cone_gi_v1_…"
+                  />
+                </label>
+                <label class="field">
+                  <span>offer them a name for you</span>
+                  <input
+                    value={groupJoinShareName}
+                    onInput={(event) => setGroupJoinShareName(event.currentTarget.value)}
+                    placeholder="My laptop, bot1…"
+                  />
+                </label>
+                <div class="row">
+                  <button class="primary" type="button" disabled={busy || !groupJoinCode.trim()} onClick={() => void joinGroupCode()}>
+                    Join group
+                  </button>
+                </div>
+              </section>
             </div>
           )}
 
@@ -1552,7 +2074,7 @@ export function App({ bootstrap }: AppProps = {}) {
                     <button type="button" onClick={(event) => (event.currentTarget.nextElementSibling as HTMLInputElement)?.click()}>Import backup</button>
                     <input
                       type="file"
-                      accept=".backup,.cos,application/octet-stream"
+                      accept=".backup,.cone,application/octet-stream"
                       style="display:none"
                       onChange={(event) => void importBackup(event.currentTarget.files?.[0] ?? null)}
                     />
@@ -1844,13 +2366,13 @@ function sessionLabel(startedAt: Date | null): string {
 }
 
 function seenKey(accountId: string): string {
-  return `cos:seen:${accountId}`;
+  return `cone:seen:${accountId}`;
 }
 
 function readReceiptsKey(accountId: string): string {
-  return `cos:readReceipts:${accountId}`;
+  return `cone:readReceipts:${accountId}`;
 }
 
 function showRequestsKey(accountId: string): string {
-  return `cos:showRequests:${accountId}`;
+  return `cone:showRequests:${accountId}`;
 }

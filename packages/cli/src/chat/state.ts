@@ -26,6 +26,7 @@ export function createChatState(
     editForm: null,
     filter: '',
     filterActive: false,
+    groupInfoIndex: 0,
     helpVisible: false,
     identity,
     input: '',
@@ -123,6 +124,37 @@ export function enterChatTalk(state: ChatState): void {
   state.mode = 'chat-talk';
   loadDraft(state);
   state.status = `talking to ${activeContact(state)?.name ?? selectedConversation(state)?.title ?? 'chat'}`;
+}
+
+// The group-info pane operates on the selected conversation (which must be a
+// group). Selection and members are read live so refreshes reconcile the view.
+export function enterGroupInfo(state: ChatState): void {
+  saveDraft(state);
+  state.activeContactId = undefined;
+  state.editForm = null;
+  state.helpVisible = false;
+  state.mode = 'group-info';
+  state.groupInfoIndex = 0;
+  state.pendingGroupAction = undefined;
+  state.status = `group info — ${selectedConversation(state)?.title ?? 'group'}`;
+}
+
+export function groupInfoMembers(state: ChatState): NonNullable<ConeConversation['members']> {
+  return selectedConversation(state)?.members ?? [];
+}
+
+export function selectGroupMember(state: ChatState, delta: number): void {
+  state.pendingGroupAction = undefined;
+  state.groupInfoIndex = clampIndex(state.groupInfoIndex + delta, groupInfoMembers(state).length);
+}
+
+// Contacts-first display name for a group member; the raw ID stays available
+// in the info pane itself.
+export function memberDisplayName(state: ChatState, inboxId: string): string {
+  if (inboxId === state.identity.inboxId) {
+    return 'you';
+  }
+  return state.contacts.find((contact) => contact.inboxId === inboxId && contact.source !== 'self')?.name ?? inboxId;
 }
 
 export function startChatCompose(state: ChatState, form: ContactEditForm): void {

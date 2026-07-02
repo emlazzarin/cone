@@ -47,13 +47,28 @@ export async function decryptPeerOffer(
       continue;
     }
 
+    let peer: PairingOffer;
     try {
-      const peer = await decryptJson<PairingOffer>(key, stored.encryptedOffer);
-      if (peer.inboxId !== input.identity.inboxId && peer.env === input.identity.env) {
-        return peer;
-      }
+      peer = await decryptJson<PairingOffer>(key, stored.encryptedOffer);
     } catch {
       continue;
+    }
+    // Group-invite payloads share the code-scoped key space but carry an
+    // explicit `type`; pairing offers never do. Skip them so a group invite
+    // room can never be misread as a pairing peer.
+    if ('type' in (peer as object) || typeof peer.inboxId !== 'string') {
+      continue;
+    }
+    // The other participant is this same account from another app. Waiting
+    // longer can never succeed — fail fast instead of timing out silently.
+    if (peer.inboxId === input.identity.inboxId) {
+      throw new Error(
+        'the other side of this code is this same account — pairing connects two different accounts. ' +
+        'Two apps unlocked with the same SECRET KEY already share an identity (and their conversations sync); there is nothing to pair.',
+      );
+    }
+    if (peer.env === input.identity.env) {
+      return peer;
     }
   }
 

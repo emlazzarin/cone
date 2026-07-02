@@ -9,6 +9,7 @@ import {
   isGroupUpdateEnvelope,
   type GroupUpdateEnvelope,
 } from './envelope';
+import { formatRetention } from './retention';
 import type { ConeConsentState, ConeConversation, ConeMessage, MessageDeliveryStatus, SyncResult } from './types';
 
 export type ConeConnectionStatus = 'catching-up' | 'connecting' | 'live' | 'offline' | 'stale';
@@ -112,12 +113,6 @@ export function isDeniedConversation(conversation: Pick<ConeConversation, 'conse
   return conversation.consentState === 'denied';
 }
 
-// Rows stored before groups existed lack `kind`; they are all DMs, so group
-// branches must test positively.
-export function isGroupConversation(conversation: Pick<ConeConversation, 'kind'>): boolean {
-  return conversation.kind === 'group';
-}
-
 // Attributed system lines for a group update ("Alice added Bob", "Carol
 // renamed the group to Crew"). `resolveName` maps inbox IDs to display names
 // (contacts-first); pass-through by default.
@@ -126,7 +121,7 @@ export function formatGroupUpdate(
   resolveName: (inboxId: string) => string = (inboxId) => inboxId,
 ): string[] {
   const actor = resolveName(update.initiatedByInboxId);
-  const names = (inboxIds: string[]) => inboxIds.map(resolveName).join(', ');
+  const names = (inboxIds: string[] | undefined) => (inboxIds ?? []).map(resolveName).join(', ');
   const lines: string[] = [];
   if (update.added.length > 0) {
     lines.push(`${actor} added ${names(update.added)}`);
@@ -137,6 +132,19 @@ export function formatGroupUpdate(
   if (update.left.length > 0) {
     lines.push(`${names(update.left)} left`);
   }
+  if (update.adminsAdded?.length) {
+    lines.push(`${actor} made ${names(update.adminsAdded)} an admin`);
+  }
+  if (update.adminsRemoved?.length) {
+    lines.push(`${actor} removed ${names(update.adminsRemoved)} as admin`);
+  }
+  if (update.superAdminsAdded?.length) {
+    lines.push(`${actor} made ${names(update.superAdminsAdded)} an owner`);
+  }
+  if (update.superAdminsRemoved?.length) {
+    lines.push(`${actor} removed ${names(update.superAdminsRemoved)} as owner`);
+  }
+  let disappearingHandled = false;
   for (const change of update.metadataChanges) {
     if (change.field === 'group_name') {
       lines.push(change.newValue ? `${actor} renamed the group to ${change.newValue}` : `${actor} cleared the group name`);
@@ -145,10 +153,41 @@ export function formatGroupUpdate(
     } else if (change.field === 'group_image_url_square') {
       lines.push(`${actor} updated the group image`);
     } else if (change.field === 'message_disappear_in_ns' || change.field === 'message_disappear_from_ns') {
-      lines.push(`${actor} changed the disappearing-messages timer`);
+      // One timer change arrives as two field changes (from_ns + in_ns);
+      // render them as a single line carrying the duration, not two blank ones.
+      if (disappearingHandled) {
+        continue;
+      }
+      disappearingHandled = true;
+      const duration = update.metadataChanges.find((candidate) => candidate.field === 'message_disappear_in_ns');
+      const durationNs = Number(duration?.newValue ?? '0');
+      lines.push(Number.isFinite(durationNs) && durationNs > 0
+        ? `${actor} set disappearing messages to ${formatRetention(durationNs / 1_000_000)}`
+        : `${actor} turned disappearing messages off`);
     }
   }
   return lines.length > 0 ? lines : [`${actor} updated the group`];
+}
+
+// Group updates are control messages (hidden by isVisibleChatMessage) that
+// surfaces nonetheless render as system lines in group transcripts.
+export function isGroupUpdateMessage(message: Pick<ConeMessage, 'json'>): boolean {
+  return isGroupUpdateEnvelope(message.json);
+}
+
+// The honest MLS caveat, shown once at the top of a group transcript: a new
+// member's view starts at their join (forward secrecy), and the creator's
+// starts at creation. Undefined for DMs.
+export function groupHistoryNotice(
+  conversation: Pick<ConeConversation, 'kind' | 'addedByInboxId'>,
+  selfInboxId: string,
+): string | undefined {
+  if (conversation.kind !== 'group') {
+    return undefined;
+  }
+  return conversation.addedByInboxId === selfInboxId || !conversation.addedByInboxId
+    ? 'you created this group'
+    : 'you joined — earlier messages aren\'t visible';
 }
 
 export function isReadReceipt(message: Pick<ConeMessage, 'json'>): boolean {

@@ -9,7 +9,7 @@ describe('CLI', () => {
     const io = makeIo();
 
     expect(await runCli(['keygen'], io)).toBe(0);
-    expect(io.out[0]?.startsWith('cos_sk_v1_')).toBe(true);
+    expect(io.out[0]?.startsWith('cone_sk_v1_')).toBe(true);
   });
 
   test('login reads a single prompted secret without requiring stdin EOF', async () => {
@@ -29,7 +29,7 @@ describe('CLI', () => {
     expect(await runCli(['login', '--secret-stdin'], io)).toBe(0);
 
     expect(io.err.join('')).toContain('press Ctrl-D');
-    expect(io.err.join('')).toContain('cos login --remember');
+    expect(io.err.join('')).toContain('cone login --remember');
   });
 
   test('send command resolves client from stdin secret and sends text', async () => {
@@ -68,15 +68,30 @@ describe('CLI', () => {
     expect(client.contacts[0]?.name).toBe('Alice');
   });
 
-  test('pair creates a handshake code without unlocking an account', async () => {
+  test('pair --print mints a code without unlocking an account', async () => {
     const io = makeIo(generateSecretKey());
 
-    expect(await runCli(['pair'], io, { createClient: async () => {
+    expect(await runCli(['pair', '--print'], io, { createClient: async () => {
       throw new Error('client should not be created');
     } })).toBe(0);
 
     const output = JSON.parse(io.out.join('')) as { code?: string };
     expect(output.code).toContain('-');
+  });
+
+  test('bare pair mints a code and immediately waits on it', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+
+    expect(await runCli(['pair', '--secret-stdin', '--plain'], io, { createClient: async () => client })).toBe(0);
+
+    // Both the printed code and the join used the same fresh code.
+    const output = io.out.join('');
+    const minted = output.match(/Handshake code: (\S+)/)?.[1] ?? '';
+    expect(minted).toBeTruthy();
+    expect(output).toContain('waiting for them');
+    expect(client.pairRequests).toEqual([{ code: minted, proposedName: undefined }]);
+    expect(output).toContain('Paired with Dana');
   });
 
   test('pair with a code does not send a peer-visible name implicitly', async () => {
@@ -94,7 +109,7 @@ describe('CLI', () => {
     expect(client.pairRequests[0]).toEqual({ code: 'shared-code', proposedName: undefined });
     const output = JSON.parse(io.out.join('')) as { next?: { send?: string }; contact?: { name?: string } };
     expect(output.contact?.name).toBe('Dana');
-    expect(output.next?.send).toBe('cos send --to "Dana" --text "hello"');
+    expect(output.next?.send).toBe('cone send --to "Dana" --text "hello"');
   });
 
   test('pair with a code supports explicit share and local contact names', async () => {
@@ -112,7 +127,7 @@ describe('CLI', () => {
     expect(client.pairRequests[0]).toEqual({ code: 'shared-code', proposedName: 'Charlie CLI' });
     const output = JSON.parse(io.out.join('')) as { next?: { send?: string }; contact?: { name?: string } };
     expect(output.contact?.name).toBe('Dana Laptop');
-    expect(output.next?.send).toBe('cos send --to "Dana Laptop" --text "hello"');
+    expect(output.next?.send).toBe('cone send --to "Dana Laptop" --text "hello"');
   });
 
   test('old pair subcommands point to the simplified syntax', async () => {
@@ -120,7 +135,7 @@ describe('CLI', () => {
     const client = new MockClient();
 
     expect(await runCli(['pair', 'join', 'shared-code', '--secret-stdin'], io, { createClient: async () => client })).toBe(1);
-    expect(io.err.join('')).toContain('usage: cos pair [code]');
+    expect(io.err.join('')).toContain('usage: cone pair [code]');
   });
 
   test('listen --once waits for one message before exiting', async () => {
@@ -136,6 +151,7 @@ describe('CLI', () => {
     await client.waitForHandler();
     await client.emit({
       conversationId: 'dm-cli',
+      conversationKind: 'dm',
       messageId: 'msg-cli-inbound',
       raw: {},
       senderInboxId: 'inbox-alice',
@@ -186,7 +202,7 @@ describe('CLI', () => {
     expect(io.err.join('')).toContain('requires an interactive TTY');
   });
 
-  test('inbox list hides requests and points to cos requests', async () => {
+  test('inbox list hides requests and points to cone requests', async () => {
     const io = makeIo(generateSecretKey());
     const client = new MockClient();
     client.conversations = [
@@ -261,7 +277,7 @@ describe('CLI', () => {
     const client = new MockClient();
 
     expect(await runCli(['group', 'create', '--secret-stdin', '--name', 'Crew'], io, { createClient: async () => client })).toBe(1);
-    expect(io.err.join('')).toContain('usage: cos group create');
+    expect(io.err.join('')).toContain('usage: cone group create');
   });
 
   test('group info, add, send, and leave resolve a group by name', async () => {
@@ -287,6 +303,104 @@ describe('CLI', () => {
 
     expect(await runCli(['group', 'leave', 'Crew', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
     expect(client.leftGroups).toEqual(['group-crew']);
+  });
+
+  test('group rename, describe, remove, promote, and demote route through the client', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'group-crew', kind: 'group', title: 'Crew', groupName: 'Crew', consentState: 'allowed' },
+    ];
+
+    expect(await runCli(['group', 'rename', 'Crew', '--name', 'New Crew', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.groupRenames).toEqual([{ conversationId: 'group-crew', name: 'New Crew' }]);
+
+    // The rename took effect locally — the new name resolves the group now.
+    expect(await runCli(['group', 'describe', 'New Crew', '--text', 'the crew', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.groupDescriptions).toEqual([{ conversationId: 'group-crew', description: 'the crew' }]);
+
+    expect(await runCli(['group', 'remove', 'group-crew', '--member', 'inbox-troll', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.groupMemberRemovals).toEqual([{ conversationId: 'group-crew', members: ['inbox-troll'] }]);
+
+    expect(await runCli(['group', 'promote', 'group-crew', '--member', 'inbox-bob', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.groupLevelChanges.at(-1)).toEqual({ conversationId: 'group-crew', member: 'inbox-bob', level: 'admin' });
+
+    expect(await runCli(['group', 'promote', 'group-crew', '--member', 'inbox-bob', '--super', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.groupLevelChanges.at(-1)).toEqual({ conversationId: 'group-crew', member: 'inbox-bob', level: 'superAdmin' });
+
+    expect(await runCli(['group', 'demote', 'group-crew', '--member', 'inbox-bob', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.groupLevelChanges.at(-1)).toEqual({ conversationId: 'group-crew', member: 'inbox-bob', level: 'member' });
+  });
+
+  test('group invite mints a code, waits, and reports the joiner', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'group-crew', kind: 'group', title: 'Crew', groupName: 'Crew', consentState: 'allowed' },
+    ];
+
+    expect(await runCli(['group', 'invite', 'Crew', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    const output = io.out.join('');
+    expect(output).toContain('Invite code for Crew: anchor-beacon-cedar-drift-ember');
+    expect(output).toContain('Added Joiner (inbox-joiner) to Crew.');
+    expect(output).toContain('cone contacts add --name "Joiner" --identity inbox-joiner');
+    expect(client.groupInvites).toEqual([{ code: 'anchor-beacon-cedar-drift-ember', conversationId: 'group-crew' }]);
+  });
+
+  test('group invite --link mints an async token and group links manages it', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      { conversationId: 'group-crew', kind: 'group', title: 'Crew', groupName: 'Crew', consentState: 'allowed' },
+    ];
+
+    expect(await runCli(['group', 'invite', 'Crew', '--link', '--max-uses', '3', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.inviteLinks).toEqual([{ conversationId: 'group-crew', maxUses: 3, ttlMs: undefined }]);
+    const output = io.out.join('');
+    expect(output).toContain('cone_gi_v1_test-token');
+    expect(output).toContain('cone group join cone_gi_v1_test-token');
+    expect(output).toContain('cone group links revoke link-1');
+
+    const listIo = makeIo(generateSecretKey());
+    expect(await runCli(['group', 'links', '--plain', '--secret-stdin'], listIo, { createClient: async () => client })).toBe(0);
+    expect(listIo.out.join('')).toContain('link-1 — group-crew, 0/1 uses');
+
+    const revokeIo = makeIo(generateSecretKey());
+    expect(await runCli(['group', 'links', 'revoke', 'link-1', '--secret-stdin'], revokeIo, { createClient: async () => client })).toBe(0);
+    expect(client.revokedLinks).toEqual(['link-1']);
+  });
+
+  test('group join posts a join request and points at sync', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+
+    expect(await runCli(['group', 'join', 'anchor-beacon-cedar-drift-ember', '--share-name', 'Sam', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    expect(client.groupJoins).toEqual([{ code: 'anchor-beacon-cedar-drift-ember', proposedName: 'Sam' }]);
+    expect(io.out.join('')).toContain('cone inbox sync');
+
+    const usage = makeIo(generateSecretKey());
+    expect(await runCli(['group', 'join', '--secret-stdin'], usage, { createClient: async () => client })).toBe(1);
+    expect(usage.err.join('')).toContain('usage: cone group join <code>');
+  });
+
+  test('group info reports a left group from the cached mirror', async () => {
+    const io = makeIo(generateSecretKey());
+    const client = new MockClient();
+    client.conversations = [
+      {
+        conversationId: 'group-old',
+        kind: 'group',
+        title: 'Old Crew',
+        consentState: 'allowed',
+        active: false,
+        members: [{ inboxId: 'inbox-a', level: 'superAdmin', consentState: 'allowed' }],
+      },
+    ];
+
+    expect(await runCli(['group', 'info', 'Old Crew', '--plain', '--secret-stdin'], io, { createClient: async () => client })).toBe(0);
+    const output = io.out.join('');
+    expect(output).toContain('no longer a member');
+    expect(output).toContain('inbox-a [superAdmin]');
   });
 
   test('group commands reject DM targets and unknown groups', async () => {
@@ -344,7 +458,7 @@ describe('CLI', () => {
     ];
 
     expect(await runCli(['timer', '--secret-stdin'], io, { createClient: async () => client })).toBe(1);
-    expect(io.err.join('')).toContain('usage: cos timer');
+    expect(io.err.join('')).toContain('usage: cone timer');
 
     expect(await runCli(['timer', 'Nobody', '1h', '--secret-stdin'], io, { createClient: async () => client })).toBe(1);
     expect(io.err.join('')).toContain('not found');
@@ -387,6 +501,14 @@ class MockClient implements ConeClient {
   consentCalls: Array<{ to: string; state: ConeConsentState }> = [];
   groupCreates: Array<{ name?: string; members: unknown[]; locked?: boolean }> = [];
   groupMemberAdds: Array<{ conversationId: string; members: unknown[] }> = [];
+  groupMemberRemovals: Array<{ conversationId: string; members: unknown[] }> = [];
+  groupRenames: Array<{ conversationId: string; name: string }> = [];
+  groupDescriptions: Array<{ conversationId: string; description: string }> = [];
+  groupLevelChanges: Array<{ conversationId: string; member: unknown; level: string }> = [];
+  groupInvites: Array<{ code: string; conversationId: string }> = [];
+  groupJoins: Array<{ code: string; proposedName?: string }> = [];
+  inviteLinks: Array<{ conversationId: string; maxUses?: number; ttlMs?: number }> = [];
+  revokedLinks: string[] = [];
   leftGroups: string[] = [];
   groupMembers: ConeGroupMember[] = [];
   retentionCalls: Array<{ conversationId: string; durationMs: number | null }> = [];
@@ -478,12 +600,31 @@ class MockClient implements ConeClient {
     return Promise.resolve();
   }
 
-  removeGroupMembers(): Promise<void> {
+  removeGroupMembers(conversationId: string, members: unknown[]): Promise<void> {
+    this.groupMemberRemovals.push({ conversationId, members });
     return Promise.resolve();
   }
 
   leaveGroup(conversationId: string): Promise<void> {
     this.leftGroups.push(conversationId);
+    return Promise.resolve();
+  }
+
+  renameGroup(conversationId: string, name: string): Promise<void> {
+    this.groupRenames.push({ conversationId, name });
+    this.conversations = this.conversations.map((conversation) =>
+      conversation.conversationId === conversationId ? { ...conversation, groupName: name, title: name } : conversation,
+    );
+    return Promise.resolve();
+  }
+
+  setGroupDescription(conversationId: string, description: string): Promise<void> {
+    this.groupDescriptions.push({ conversationId, description });
+    return Promise.resolve();
+  }
+
+  setGroupMemberLevel(conversationId: string, member: unknown, level: string): Promise<void> {
+    this.groupLevelChanges.push({ conversationId, member, level });
     return Promise.resolve();
   }
 
@@ -578,6 +719,67 @@ class MockClient implements ConeClient {
 
   createHandshakeCode() {
     return Promise.resolve({ code: 'anchor-beacon-cedar-drift-ember', expiresAt: new Date().toISOString() });
+  }
+
+  inviteToGroupWithCode(code: string, conversationId: string) {
+    this.groupInvites.push({ code, conversationId });
+    return Promise.resolve({ conversationId, joiner: { inboxId: 'inbox-joiner', proposedName: 'Joiner' } });
+  }
+
+  joinGroupWithCode(code: string, options?: { proposedName?: string }) {
+    this.groupJoins.push({ code, proposedName: options?.proposedName });
+    return Promise.resolve({
+      conversationId: 'group-joined',
+      groupName: 'Crew',
+      memberCount: 2,
+      inviter: { inboxId: 'inbox-dana' },
+    });
+  }
+
+  listPendingGroupJoins() {
+    return Promise.resolve([]);
+  }
+
+  cancelGroupJoin(_conversationId: string) {
+    return Promise.resolve();
+  }
+
+  createGroupInviteLink(conversationId: string, options?: { ttlMs?: number; maxUses?: number }) {
+    this.inviteLinks.push({ conversationId, maxUses: options?.maxUses, ttlMs: options?.ttlMs });
+    return Promise.resolve({
+      linkId: 'link-1',
+      conversationId,
+      token: 'cone_gi_v1_test-token',
+      nonce: 'nonce-1',
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      maxUses: options?.maxUses ?? 1,
+      uses: 0,
+      servicedParticipantIds: [],
+    });
+  }
+
+  listGroupInviteLinks() {
+    return Promise.resolve([{
+      linkId: 'link-1',
+      conversationId: 'group-crew',
+      token: 'cone_gi_v1_test-token',
+      nonce: 'nonce-1',
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      maxUses: 1,
+      uses: 0,
+      servicedParticipantIds: [],
+    }]);
+  }
+
+  revokeGroupInviteLink(linkId: string) {
+    this.revokedLinks.push(linkId);
+    return Promise.resolve();
+  }
+
+  serviceGroupInviteLinks() {
+    return Promise.resolve([]);
   }
 
   pairWithCode(code: string, options?: { proposedName?: string }) {

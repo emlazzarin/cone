@@ -114,7 +114,12 @@ export class BunSQLiteStore implements ConeStore {
       .query(
         `insert into messages (message_id, conversation_id, sender_inbox_id, sent_at, kind, data)
          values (?, ?, ?, ?, ?, ?)
-         on conflict(message_id) do update set data = excluded.data`,
+         on conflict(message_id) do update set
+           conversation_id = excluded.conversation_id,
+           sender_inbox_id = excluded.sender_inbox_id,
+           sent_at = excluded.sent_at,
+           kind = excluded.kind,
+           data = excluded.data`,
       )
       .run(
         message.messageId,
@@ -158,6 +163,10 @@ export class BunSQLiteStore implements ConeStore {
         metadata.lastStreamStartedAt = row.value;
       } else if (row.key === 'deniedInboxIds') {
         metadata.deniedInboxIds = parseStringArray(row.value);
+      } else if (row.key === 'pendingGroupJoins') {
+        metadata.pendingGroupJoins = parseJsonArray(row.value);
+      } else if (row.key === 'groupInviteLinks') {
+        metadata.groupInviteLinks = parseJsonArray(row.value);
       }
     }
     return Promise.resolve(metadata);
@@ -257,32 +266,6 @@ export class BunSQLiteStore implements ConeStore {
         value text not null
       );
     `);
-    this.relaxPeerInboxConstraint();
-  }
-
-  // Databases created before groups have `peer_inbox_id text not null`; group
-  // rows have no peer, so the column must accept NULL. SQLite cannot drop a
-  // NOT NULL constraint in place — rebuild the table once if needed.
-  private relaxPeerInboxConstraint(): void {
-    const columns = this.db.query(`pragma table_info(conversations)`).all() as Array<{ name: string; notnull: number }>;
-    const peerColumn = columns.find((column) => column.name === 'peer_inbox_id');
-    if (!peerColumn || peerColumn.notnull === 0) {
-      return;
-    }
-    this.db.exec(`
-      begin;
-      alter table conversations rename to conversations_legacy;
-      create table conversations (
-        conversation_id text primary key,
-        peer_inbox_id text,
-        title text not null,
-        updated_at text,
-        data text not null
-      );
-      insert into conversations select conversation_id, peer_inbox_id, title, updated_at, data from conversations_legacy;
-      drop table conversations_legacy;
-      commit;
-    `);
   }
 
   private readContact(whereClause: string, value: string): Contact | null {
@@ -303,6 +286,15 @@ function parseStringArray(value: string): string[] {
   try {
     const parsed = JSON.parse(value) as unknown;
     return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseJsonArray<T>(value: string): T[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
   } catch {
     return [];
   }

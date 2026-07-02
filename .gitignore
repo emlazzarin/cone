@@ -3,6 +3,7 @@
 .sisyphus/
 .claude/
 .cursor/
+.firecrawl/
 
 # local secrets
 
