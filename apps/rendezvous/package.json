@@ -8,7 +8,9 @@
   },
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
-    "dev": "wrangler dev"
+    "build:server": "bun build src/server.ts --target=bun --outfile dist/server.js",
+    "dev": "wrangler dev",
+    "serve": "bun run src/server.ts"
   },
   "devDependencies": {
     "wrangler": "^4.97.0"
