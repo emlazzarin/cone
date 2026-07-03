@@ -1,6 +1,6 @@
 # Cone Product Spec
 
-Cone is a Bun-first TypeScript product with a static PWA (ConePWA) and a CLI/library whose terminal chat UI is ConeTUI. Users see the product name "Cone" everywhere; ConePWA and ConeTUI name the surfaces in docs and code. Both surfaces unlock the same XMTP account from a long `SECRET KEY`, can message any XMTP-reachable identity, save local address-book entries, and pair with an ephemeral handshake code.
+Cone is a Bun-first TypeScript product with three surfaces: a static installable PWA (ConePWA), a terminal chat UI (ConeTUI, `cone chat`), and a CLI/library for agents and developers (ConeCLI) — ConeTUI and ConeCLI ship in the one `cone` binary. Users see the product name "Cone" everywhere; ConePWA, ConeTUI, and ConeCLI name the surfaces in docs and code. All three unlock the same XMTP account from a long `SECRET KEY`, can message any XMTP-reachable identity, save local address-book entries, and pair with an ephemeral handshake code. Where this spec says "both surfaces" it means the two rendering surfaces, ConePWA and ConeTUI.
 
 Pre-release policy: *local state* carries no upgrade paths — schema changes regenerate it. The *protocol* is different: everything in "Protocol Compatibility" below is frozen now, because those are the surfaces that, once two users have connected, can never change without stranding them.
 
