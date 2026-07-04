@@ -180,6 +180,8 @@ export class BunSQLiteStore implements ConeStore {
         metadata.pollCursors = parseJsonRecord(row.value);
       } else if (row.key === 'idempotencySends') {
         metadata.idempotencySends = parseJsonArray(row.value);
+      } else if (row.key === 'hiddenConversations') {
+        metadata.hiddenConversations = parseJsonRecord(row.value);
       }
     }
     return Promise.resolve(metadata);

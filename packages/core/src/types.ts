@@ -142,6 +142,11 @@ export interface ConeStoreMetadata {
   // scope = the resolved recipient; a record without messageId is a claim
   // whose send is in flight (or died mid-flight).
   idempotencySends?: Array<{ key: string; scope: string; messageId?: string; conversationId?: string; sentAt?: string }>;
+  // Locally deleted conversations (conversationId → deletedAt). Deleting a
+  // chat is a local act — the XMTP conversation still exists and sync keeps
+  // mirroring it — so a tombstone keeps it out of views until a message newer
+  // than the tombstone arrives, which legitimately resurrects the chat.
+  hiddenConversations?: Record<string, string>;
 }
 
 export interface StoredMessage {
@@ -515,17 +520,17 @@ export interface ConeClient {
   saveContact(input: SaveContactInput): Promise<Contact>;
   deleteContact(contactId: string): Promise<void>;
   createHandshakeCode(): Promise<HandshakeCode>;
-  pairWithCode(code: string, options?: { proposedName?: string; timeoutMs?: number }): Promise<PairingResult>;
+  pairWithCode(code: string, options?: { proposedName?: string; timeoutMs?: number; signal?: AbortSignal }): Promise<PairingResult>;
   // Synchronous group invite code, inviter side: post the group descriptor to
   // the code's rendezvous room, wait for a join request, and add the joiner.
   // Auto-add is correct here — the code was created seconds ago, so intent is
   // unambiguous. The joiner is never auto-saved as a contact.
-  inviteToGroupWithCode(code: string, conversationId: string, options?: { timeoutMs?: number }): Promise<GroupInviteResult>;
+  inviteToGroupWithCode(code: string, conversationId: string, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<GroupInviteResult>;
   // Joiner side: post a join request, wait for the group descriptor, and
   // record the join as pending. Membership arrives with the XMTP welcome; a
   // matching pending join auto-allows the group (joining is implied consent).
   // Accepts a synchronous handshake code or an async invite link token.
-  joinGroupWithCode(codeOrToken: string, options?: { proposedName?: string; timeoutMs?: number }): Promise<GroupJoinResult>;
+  joinGroupWithCode(codeOrToken: string, options?: { proposedName?: string; timeoutMs?: number; signal?: AbortSignal }): Promise<GroupJoinResult>;
   listPendingGroupJoins(): Promise<PendingGroupJoin[]>;
   cancelGroupJoin(conversationId: string): Promise<void>;
   // Async invite links: capability tokens with a long TTL. The token is

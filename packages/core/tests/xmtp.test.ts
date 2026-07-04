@@ -329,20 +329,20 @@ describe('SdkXmtpAdapter envelope sending', () => {
 });
 
 describe('SdkXmtpAdapter DM listing', () => {
-  // XMTP can hold several MLS DMs per peer pair; the SDK stitches them, and
-  // every DM listing must ask for the canonical one only — otherwise each
-  // duplicate becomes its own thread in the read model.
-  test('sync and list exclude duplicate DMs explicitly', async () => {
+  // XMTP can hold several MLS DMs per peer pair. Conversation listings must
+  // ask for the canonical DM only (each duplicate would become its own
+  // thread), but sync's *message* fetch must include duplicates — a peer
+  // whose SDK picked the other DM as canonical publishes there, and not
+  // every SDK stitches duplicates into canonical reads (browser does not).
+  test('conversations list canonical-only; sync messages include duplicates', async () => {
     const captured = emptyCaptured();
     const adapter = makeAdapter(captured);
 
     await adapter.sync({ consentStates: ['allowed', 'unknown'] });
     await adapter.listConversations();
 
-    expect(captured.dmListOptions).toHaveLength(2);
-    for (const options of captured.dmListOptions) {
-      expect(options?.includeDuplicateDms).toBe(false);
-    }
+    expect(captured.dmListOptions).toHaveLength(3);
+    expect(captured.dmListOptions.map((options) => options?.includeDuplicateDms)).toEqual([false, true, false]);
   });
 });
 

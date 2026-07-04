@@ -63,9 +63,9 @@ describe('rendezvous v2 room semantics', () => {
     const offers = mustStore(applyExchange(stale, body('fresh', 'pair'), NOW));
     expect(offers.map((offer) => offer.participantId)).toEqual(['fresh']);
 
-    // A pair offer asking for a week is capped to the 10-minute ceiling.
+    // A pair offer asking for a week is capped to the 30-minute ceiling.
     const greedy = mustStore(applyExchange([], body('greedy', 'pair', new Date(NOW + 7 * 24 * 60 * 60_000).toISOString()), NOW));
-    expect(Date.parse(greedy[0]!.expiresAt)).toBe(NOW + 10 * 60_000);
+    expect(Date.parse(greedy[0]!.expiresAt)).toBe(NOW + 30 * 60_000);
   });
 });
 

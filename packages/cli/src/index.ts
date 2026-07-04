@@ -760,7 +760,8 @@ async function handleGroup(args: string[], io: CliIo, context: CliContext, clien
       : await client.createHandshakeCode();
     writeValue(io, context, { ...code, conversationId: conversation.conversationId, waiting: true }, (value) =>
       `Invite code for ${conversation.title}: ${value.code}\nExpires at: ${value.expiresAt}\nWaiting for someone to join with this code...\n`);
-    const timeoutMs = Number(optionalOption(rest, '--timeout-ms') ?? '60000');
+    // Default to the code's full window, matching the printed "Waiting…".
+    const timeoutMs = Number(optionalOption(rest, '--timeout-ms') ?? String(GROUP_INVITE_TTL_MS));
     const result = await client.inviteToGroupWithCode(code.code, conversation.conversationId, { timeoutMs });
     writeValue(io, context, result, (value) => {
       const name = value.joiner.proposedName ? `${value.joiner.proposedName} (${value.joiner.inboxId})` : value.joiner.inboxId;
@@ -781,7 +782,7 @@ async function handleGroup(args: string[], io: CliIo, context: CliContext, clien
     if (!code) {
       throw new Error('usage: cone group join <code> [--share-name <name>] [--timeout-ms <ms>]');
     }
-    const timeoutMs = Number(optionalOption(rest, '--timeout-ms') ?? '60000');
+    const timeoutMs = Number(optionalOption(rest, '--timeout-ms') ?? String(GROUP_INVITE_TTL_MS));
     const result = await client.joinGroupWithCode(code, {
       proposedName: optionalOption(rest, '--share-name'),
       timeoutMs,

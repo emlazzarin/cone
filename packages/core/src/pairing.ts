@@ -2,7 +2,10 @@ import { ConeError } from './errors';
 import { codeScopedKey, decryptJson, encryptJson, normalizeHandshakeCode, randomHandshakeCode, randomId, sha256Hex } from './crypto';
 import type { ConeIdentity, HandshakeCode, PairingOffer, RendezvousStoredOffer } from './types';
 
-export const PAIRING_TTL_MS = 10 * 60 * 1000;
+// Thirty minutes: long enough for the slow side of a human↔agent handshake
+// (installing Cone from scratch mid-pair is the common case), short enough
+// that a leaked code goes stale within the hour.
+export const PAIRING_TTL_MS = 30 * 60 * 1000;
 
 export const PAIRING_OFFER_TYPE = 'cone.pairing.offer.v1';
 

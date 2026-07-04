@@ -269,6 +269,8 @@ class ConeClientImpl implements ConeClient {
     });
     // Sending implies consent, same as DMs; the mirror is already stamped.
     await this.setGroupConsentSafe(conversationId, 'allowed');
+    // Sending into a locally deleted chat brings it back.
+    await this.unhideConversation(conversationId, sent.sentAt);
     return sent;
   }
 
@@ -459,6 +461,7 @@ class ConeClientImpl implements ConeClient {
         await this.persistNetworkMessage(message);
         if (isNew) {
           messagesSynced += 1;
+          await this.unhideConversation(message.conversationId, message.sentAt);
         }
       }
       await this.collapseDuplicateDms(result.conversations);
@@ -519,17 +522,22 @@ class ConeClientImpl implements ConeClient {
   }
 
   async listConversations(): Promise<ConeConversation[]> {
-    const [conversations, contacts, identity] = await Promise.all([
+    const [conversations, contacts, identity, metadata] = await Promise.all([
       this.options.store.listConversations(),
       this.options.store.listContacts(),
       this.identity(),
+      this.options.store.getMetadata(),
     ]);
     const contactsByInbox = new Map(contacts.map((contact) => [contact.inboxId, contact]));
+    const hidden = metadata.hiddenConversations ?? {};
 
     return conversations
       // Self-DMs are hidden: Cone has no notes-to-self surface yet, and XMTP
       // models messaging your own inbox awkwardly (duplicate threads).
       .filter((conversation) => !(conversation.kind === 'dm' && conversation.peerInboxId === identity.inboxId))
+      // Locally deleted chats stay gone until new activity clears the
+      // tombstone (see deleteConversation/unhideConversation).
+      .filter((conversation) => !(conversation.conversationId in hidden))
       .map((conversation) => {
       if (conversation.kind === 'group') {
         return { ...conversation, title: conversation.groupName ?? conversation.title };
@@ -637,8 +645,31 @@ class ConeClientImpl implements ConeClient {
     }));
   }
 
-  deleteConversation(conversationId: string): Promise<void> {
-    return this.options.store.deleteConversation(conversationId);
+  async deleteConversation(conversationId: string): Promise<void> {
+    // Deleting is local: the XMTP conversation still exists and sync keeps
+    // mirroring it, so a bare row delete resurrects within one poll. The
+    // tombstone keeps it out of views until a message newer than the deletion
+    // arrives — which legitimately brings the chat back.
+    const metadata = await this.options.store.getMetadata();
+    await this.options.store.putMetadata({
+      hiddenConversations: { ...metadata.hiddenConversations, [conversationId]: this.nowIso() },
+    });
+    await this.options.store.deleteConversation(conversationId);
+  }
+
+  // Clear a deletion tombstone when the conversation shows new life: a synced
+  // message newer than the tombstone, or a local send into it.
+  private async unhideConversation(conversationId: string, activityAt?: string): Promise<void> {
+    const metadata = await this.options.store.getMetadata();
+    const hiddenAt = metadata.hiddenConversations?.[conversationId];
+    if (!hiddenAt) {
+      return;
+    }
+    if (activityAt && Date.parse(activityAt) <= Date.parse(hiddenAt)) {
+      return;
+    }
+    const { [conversationId]: _cleared, ...rest } = metadata.hiddenConversations!;
+    await this.options.store.putMetadata({ hiddenConversations: rest });
   }
 
   listContacts(): Promise<Contact[]> {
@@ -716,6 +747,11 @@ class ConeClientImpl implements ConeClient {
       throw new Error(`conversation has no peer: ${conversationId}`);
     }
     await this.setConsent({ inboxId: conversation.peerInboxId }, state);
+    // Also stamp the conversation-level record (consent is dual-keyed in
+    // XMTP); without it, other installations of this account — and the next
+    // sync's mirror — can still read this DM as "unknown". Best-effort, same
+    // as the inbox-level network write.
+    await this.setGroupConsentSafe(conversationId, state);
   }
 
   private async setConsentSafe(inboxId: string, state: ConeConsentState): Promise<void> {
@@ -849,7 +885,7 @@ class ConeClientImpl implements ConeClient {
     return createCode(this.now());
   }
 
-  async pairWithCode(code: string, options: { proposedName?: string; timeoutMs?: number } = {}): Promise<PairingResult> {
+  async pairWithCode(code: string, options: { proposedName?: string; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<PairingResult> {
     if (!this.options.rendezvous) {
       throw new Error('rendezvous client is required for code pairing');
     }
@@ -858,7 +894,9 @@ class ConeClientImpl implements ConeClient {
     // normalized code, so "anchor beacon" and "Anchor-Beacon" pair up.
     const normalizedCode = normalizeHandshakeCode(code);
     const identity = await this.identity();
-    const deadline = this.now().getTime() + (options.timeoutMs ?? 60_000);
+    // Default to the full code window — "waits until they enter it or the
+    // window closes" is the documented promise on every surface.
+    const deadline = this.now().getTime() + (options.timeoutMs ?? PAIRING_TTL_MS);
     const localOffer = await createEncryptedPairingOffer({
       code: normalizedCode,
       identity,
@@ -867,7 +905,7 @@ class ConeClientImpl implements ConeClient {
     });
     let peer: PairingOffer | null = null;
 
-    while (this.now().getTime() < deadline) {
+    while (this.now().getTime() < deadline && !options.signal?.aborted) {
       const offers = await this.options.rendezvous.exchangeOffer({
         roomId: secretRoomId(normalizedCode),
         role: 'pair',
@@ -888,7 +926,7 @@ class ConeClientImpl implements ConeClient {
     }
 
     if (!peer) {
-      throw new ConeError('TIMEOUT', 'pairing timed out');
+      throw new ConeError('TIMEOUT', options.signal?.aborted ? 'pairing canceled' : 'pairing timed out');
     }
 
     const contact = await this.saveContact({
@@ -922,7 +960,7 @@ class ConeClientImpl implements ConeClient {
   // joiner directly. Auto-add is correct here: the code was created seconds
   // ago and handed over person-to-person, so intent is unambiguous. The joiner
   // is never auto-saved as a contact; their proposedName is a UI suggestion.
-  async inviteToGroupWithCode(code: string, conversationId: string, options: { timeoutMs?: number } = {}): Promise<GroupInviteResult> {
+  async inviteToGroupWithCode(code: string, conversationId: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<GroupInviteResult> {
     if (!this.options.rendezvous) {
       throw new Error('rendezvous client is required for group invite codes');
     }
@@ -932,7 +970,7 @@ class ConeClientImpl implements ConeClient {
     }
     const normalizedCode = normalizeHandshakeCode(code);
     const identity = await this.identity();
-    const deadline = this.now().getTime() + (options.timeoutMs ?? 60_000);
+    const deadline = this.now().getTime() + (options.timeoutMs ?? GROUP_INVITE_TTL_MS);
     const local = await createEncryptedGroupDescriptor({
       code: normalizedCode,
       identity,
@@ -941,7 +979,7 @@ class ConeClientImpl implements ConeClient {
     });
 
     let request: GroupJoinRequest | null = null;
-    while (this.now().getTime() < deadline) {
+    while (this.now().getTime() < deadline && !options.signal?.aborted) {
       const offers = await this.options.rendezvous.exchangeOffer({
         roomId: secretRoomId(normalizedCode),
         role: 'descriptor',
@@ -961,7 +999,7 @@ class ConeClientImpl implements ConeClient {
     }
 
     if (!request) {
-      throw new ConeError('TIMEOUT', 'group invite timed out');
+      throw new ConeError('TIMEOUT', options.signal?.aborted ? 'group invite canceled' : 'group invite timed out');
     }
 
     await this.addGroupMembers(conversationId, [{ inboxId: request.inboxId }]);
@@ -977,7 +1015,7 @@ class ConeClientImpl implements ConeClient {
   // join is implied consent) instead of landing in Requests. Accepts a spoken
   // handshake code (case-insensitive) or a pasted invite-link token; a token's
   // join offer outlives the session so the minter's next sync can admit it.
-  async joinGroupWithCode(code: string, options: { proposedName?: string; timeoutMs?: number } = {}): Promise<GroupJoinResult> {
+  async joinGroupWithCode(code: string, options: { proposedName?: string; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<GroupJoinResult> {
     if (!this.options.rendezvous) {
       throw new Error('rendezvous client is required for group invite codes');
     }
@@ -988,7 +1026,7 @@ class ConeClientImpl implements ConeClient {
     const isToken = isGroupInviteToken(code);
     const normalizedCode = isToken ? code.trim() : normalizeHandshakeCode(code);
     const identity = await this.identity();
-    const deadline = this.now().getTime() + (options.timeoutMs ?? 60_000);
+    const deadline = this.now().getTime() + (options.timeoutMs ?? GROUP_INVITE_TTL_MS);
     const local = await createEncryptedJoinRequest({
       code: normalizedCode,
       identity,
@@ -997,7 +1035,7 @@ class ConeClientImpl implements ConeClient {
     });
 
     let descriptor: GroupInviteDescriptor | null = null;
-    while (this.now().getTime() < deadline) {
+    while (this.now().getTime() < deadline && !options.signal?.aborted) {
       const offers = await this.options.rendezvous.exchangeOffer({
         roomId: secretRoomId(normalizedCode),
         role: 'join',
@@ -1017,7 +1055,7 @@ class ConeClientImpl implements ConeClient {
     }
 
     if (!descriptor) {
-      throw new ConeError('TIMEOUT', 'group join timed out');
+      throw new ConeError('TIMEOUT', options.signal?.aborted ? 'group join canceled' : 'group join timed out');
     }
 
     const pending = await this.pendingGroupJoins();
@@ -1288,6 +1326,8 @@ class ConeClientImpl implements ConeClient {
       kind,
       encryptedPayload: await encryptJson(this.options.account.coneStorageKey, 'cone.message.v1', payload),
     });
+    // Sending into a locally deleted chat brings it back.
+    await this.unhideConversation(conversationId, sent.sentAt);
   }
 
   private async persistNetworkMessage(message: IncomingMessage): Promise<void> {

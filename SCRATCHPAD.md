@@ -5,7 +5,116 @@ lives in TODO.md; history lives in git. This file holds only what's in flight,
 what's deliberately deferred (with the reasoning that deferred it), and the
 hard-won gotchas that will bite again if forgotten.
 
-## Active — agent readiness batch (agreed with Eddy 2026-07-02)
+## Active — staging live-testing toward production (2026-07-03)
+
+Hosting is live on staging (infra lives in the private `emlazzarin/cone-infra`
+repo: OpenTofu DNS, Caddy, systemd, deploy scripts). `*.staging.cone.chat` is
+basic-auth gated except `rv.` (capability-based) ; `agents.staging.cone.chat`
+serves the assembled skill + source tarball. Prod droplet is provisioned and
+serving the landing page only — rendezvous/web/agents not yet deployed there,
+`DEFAULT_RENDEZVOUS_URL` not yet flipped.
+
+Fixed from Eddy's first two agent-pairing sessions (Hermes agent):
+- **60-second wait vs 10-minute code**: `pairWithCode`/group invite/join
+  defaulted `timeoutMs` to 60s while codes lived 10 min — the PWA side "timed
+  out", the agent later completed against the stored offer, and the PWA's
+  save-contact path never ran (this also masqueraded as "no proposed name" and
+  "no contact created"). All waits now default to the full code window, codes
+  live **30 minutes** (`PAIRING_TTL_MS`, server ceiling matches), and the
+  waits take an `AbortSignal` (PWA "Stop waiting" button).
+- **Deleted chats resurrected by sync**: local row delete + mirror-first sync
+  re-created them. Now `hiddenConversations` tombstones in store metadata
+  (SQLite whitelist branch added!); a message newer than the tombstone, or a
+  local send, un-hides. Views filter tombstoned ids.
+- **Agent sends published but invisible to the PWA peer**: pairing's dueling
+  confirmations guarantee duplicate MLS DMs; sync fetched messages from
+  *canonical* DMs only. Node reads stitch duplicates in, browser reads do
+  not → agent messages (published into its duplicate) never reached the PWA
+  read model. sync now lists DMs twice: canonical-only for conversations,
+  `includeDuplicateDms: true` for messages; the existing fold reunites them.
+  Verified live (CLI×CLI, dev network + staging rendezvous).
+- Skill rewritten prescriptively (agent setup runbook: durable key =
+  `--remember`, never echo the key — the Hermes agent pasted its secret key
+  into chat! —, env persisted where the event loop runs, pairing verified via
+  inbox, gateway wiring is an obligation with a 30s-poll default, completion
+  checklist). PWA: login Enter submits (textarea never implicit-submits),
+  `y` copies the pair code, explicit "＋ Add contact" button + `a` key.
+
+Third live-test round (2026-07-03, Eddy on mobile + re-used key on a new
+device):
+- **Accepted requests reappearing / stale requests on a fresh device**: XMTP
+  consent is dual-keyed (per-inbox and per-conversation). Accepting a DM wrote
+  only the inbox-level record; the sync mirror read the DM's
+  conversation-level record ("unknown") and flipped rows back to Requests —
+  and a new installation of an old key saw every historic DM as a Request.
+  Fix: `toDmConversation` falls back to inbox-level consent when the
+  conversation record is unknown, and `setConversationConsent` now writes the
+  conversation-level record too.
+- Requests-list Accept no longer navigates into the thread (batch-clearing
+  stale requests was accept→thread→back per item).
+- Mobile PWA: unwrappable 64-char hex ids pushed layout past the viewport
+  (renders "zoomed in"; iOS then re-zooms on every input focus).
+  `overflow-wrap: anywhere` on id/code-bearing classes, `overflow-x: clip`
+  backstop on body, viewport pinned (`maximum-scale=1, user-scalable=no`).
+- Skill: setup runbook is one pass — no pausing to "verify" before the event
+  loop exists (the Hermes agent stopped mid-setup to check in).
+- **Mobile root cause found by headless audit** (puppeteer + CDP device
+  metrics against `preview.html`, all views at 320/390px): `.app` had no
+  `grid-template-columns`, so the implicit `auto` column sized to the widest
+  child's min-content — one unshrinkable row widened *every* row ~9px past
+  the viewport. Fix: `grid-template-columns: minmax(0, 1fr)` (plus tabs +
+  thread-header `flex-wrap`). The earlier `maximum-scale=1` lock had made
+  this worse by removing pinch-out. The 16px mobile input bump was removed —
+  the locked viewport already prevents iOS focus-zoom, and 16px controls next
+  to 13px body read oversized. DM transcripts collapse membership noise
+  ("X added you" per duplicate DM) into one "you and <peer> began a
+  conversation" line at transcript font size; groups keep attributed lines.
+  Audit criterion for future style changes: every preview view must show
+  zero elements past the viewport at 320 and 390px.
+- Mobile polish round 2 (same day): transcript bottom-anchors like Signal
+  (`.transcript > :first-child { margin-top: auto }` — scrolls normally when
+  long, empty-state centering unaffected); app height follows
+  `visualViewport` via a `--viewport-height` CSS var + scroll pin (iOS
+  keyboards never shrink dvh — Safari pans nav off-screen otherwise), so
+  topbar/tabs/back stay visible while typing; login Unlock button moved to
+  the right (thumb side, same side as Send).
+- Round 3: the viewport pin is **signed-in only** — on the (scrollable) login
+  screen the forced `scrollTo(0,0)` fought the user and killed iOS's
+  long-press paste callout (couldn't paste the secret key). Touch devices
+  (`hover: none and pointer: coarse`) hide all kbd chips + login keyhints;
+  the opt-in ? overlay keeps them. Direction decided: **one adaptive PWA**,
+  not a mobile fork — mobile issues so far were bugs/adaptations, not
+  architecture; revisit only if touch needs its own interaction model.
+- Rounds 4–5 (keyboard; the shape that finally holds): scrollTo-on-*scroll*
+  pinning fights Safari's reveal-the-input scroll (composer stuck under
+  keyboard, flashing per keypress) — and the round-4 "follow the pan with
+  translateY(vv.offsetTop)" baked stale pan offsets into the layout
+  (truncated transcript, black gap, no composer). Stable shape: signed-in
+  screen page-unscrollable (`.screen--app { height:100dvh; overflow:hidden
+  }`), app height = `visualViewport.height`, **one** `scrollTo(0,0)` per vv
+  *resize* (never per scroll event, no transforms), transcript re-pins to
+  bottom on resize. Login untouched (paste callout).
+- Hermes round-2 feedback: polling/idempotency/consent shape praised. Two
+  items: (1) **async pairing** for automated bootstrap — blocking window is
+  awkward; skill now documents the background-process pattern (`cone pair …
+  &` + `wait` before first send); a true non-blocking pair (post offer, exit,
+  complete on later sync — pending-group-join machinery is precedent) is
+  deferred until a second agent framework hits the same wall. (2) sqlcipher
+  stderr warnings: native SQLCipher mlock noise on Linux, not switchable via
+  SDK (its logger already defaults Off); skill now says "parse stdout only;
+  stderr is logs" which is the durable contract anyway.
+
+Open / unexplained:
+- Agent reported a DM row with `peerInboxId` = `<conversationId>:<inboxId>`
+  concatenation. Not reproduced CLI×CLI; likely SDK-nightly shape leak. Need
+  the agent's state dump if it recurs post-fix; the duplicate-ingestion fold
+  may make it moot.
+- `"` in delivered text: Cone's encode path never unicode-escapes —
+  attributed to the agent pre-escaping in its shell command; skill now warns.
+- Next readiness test's success criterion: "agent replies unprompted", not
+  "agent pairs" — the mechanics reviews never simulated docs-as-prompt.
+
+## Previous batch — agent readiness (agreed with Eddy 2026-07-02)
 
 Code-side items **done 2026-07-02**: §2 poll read model (`pollMessages`
 durable cursors, `cone messages`/`cone wait`, exit 3 = nothing new), §3

@@ -102,13 +102,17 @@ const VIEWS: { key: View; label: string }[] = [
 // Build-time override first (baked by Vite), then the product default shared
 // with the CLI so the two surfaces can never drift apart.
 const DEFAULT_RENDEZVOUS_URL = import.meta.env.VITE_CONE_RENDEZVOUS_URL ?? CORE_DEFAULT_RENDEZVOUS_URL;
+// Same pattern for the default XMTP network: staging builds bake `dev` so the
+// PWA lands on the network its rendezvous peers use; the login select still
+// allows switching (identities are env-scoped).
+const DEFAULT_XMTP_ENV: XmtpEnv = import.meta.env.VITE_CONE_XMTP_ENV === 'dev' ? 'dev' : 'production';
 
 export function App({ bootstrap }: AppProps = {}) {
   const [session, setSession] = useState<SessionState | null>(() => bootstrap?.session ?? null);
   const [secretInput, setSecretInput] = useState('');
-  // Production is the durable XMTP network and the default; the env select
-  // remains for dev/local testing (identities are env-scoped).
-  const [env, setEnv] = useState<XmtpEnv>('production');
+  // Production is the durable XMTP network and the usual default; the env
+  // select remains for dev/local testing (identities are env-scoped).
+  const [env, setEnv] = useState<XmtpEnv>(DEFAULT_XMTP_ENV);
   const [rendezvousUrl, setRendezvousUrl] = useState(bootstrap?.rendezvousUrl ?? DEFAULT_RENDEZVOUS_URL);
 
   const [view, setView] = useState<View>(bootstrap?.view ?? 'chats');
@@ -154,6 +158,7 @@ export function App({ bootstrap }: AppProps = {}) {
   // DM header "name this contact" row — the Chats-side way to (re)create a
   // local alias for a peer, matching the TUI's `r`.
   const [peerNameOpen, setPeerNameOpen] = useState(false);
+  const pairAbortRef = useRef<AbortController | null>(null);
   const [peerNameDraft, setPeerNameDraft] = useState('');
   const [groupMembers, setGroupMembers] = useState<ConeGroupMember[]>([]);
   const [memberInput, setMemberInput] = useState('');
@@ -288,6 +293,17 @@ export function App({ bootstrap }: AppProps = {}) {
     timerOptions.push(timerValue);
   }
 
+  // `a` from the chat list: open the peer-name editor for the selected DM —
+  // the fastest path from "who is this inbox id" to a saved contact.
+  function openPeerNameEditor() {
+    const conversation = conversations.find((entry) => entry.conversationId === selectedConversationId);
+    if (!conversation || conversation.kind === 'group' || !conversation.peerInboxId) {
+      return;
+    }
+    setPeerNameDraft(contacts.find((contact) => contact.inboxId === conversation.peerInboxId)?.name ?? '');
+    setPeerNameOpen(true);
+  }
+
   // ── Latest state + actions for the global key handler ──────────────────
   // The handler is registered once per session; everything it touches goes
   // through this ref so it never reads a stale closure.
@@ -300,6 +316,8 @@ export function App({ bootstrap }: AppProps = {}) {
     beginCompose,
     createCode,
     joinCode,
+    copyPairCode: () => copy(pairCode),
+    openPeerNameEditor,
   });
   keyRef.current = {
     view,
@@ -310,6 +328,8 @@ export function App({ bootstrap }: AppProps = {}) {
     beginCompose,
     createCode,
     joinCode,
+    copyPairCode: () => copy(pairCode),
+    openPeerNameEditor,
   };
 
   // ── Session lifecycle: subscribe once, poll on a timer ─────────────────
@@ -448,6 +468,42 @@ export function App({ bootstrap }: AppProps = {}) {
     }
   }, [session, selectedConversationId, messagesByConv, conversations, readReceipts]);
 
+  // Track the *visual* viewport so the app fits in the strip above a mobile
+  // keyboard (iOS keyboards do not resize dvh — Safari pans instead).
+  // Signed-in only: the login screen scrolls for real and must be left alone
+  // (force-pinning it also killed iOS's long-press paste callout).
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    if (!viewport || !session) {
+      return;
+    }
+    // Resize-only, deliberately: keyboard show/hide fires resize. Reacting to
+    // vv *scroll* events created feedback loops with Safari's own
+    // reveal-the-input scrolling, and an offsetTop transform baked stale pan
+    // offsets into the layout (app shifted down, composer lost under the
+    // keyboard, black gap on screen). One correction per resize is stable.
+    const update = () => {
+      document.documentElement.style.setProperty('--viewport-height', `${Math.round(viewport.height)}px`);
+      // Undo whatever pan Safari applied to reveal the (pre-shrink) composer;
+      // once the app fits above the keyboard there is nothing to reveal.
+      if (window.scrollY !== 0) {
+        window.scrollTo(0, 0);
+      }
+      // The keyboard shrank the transcript; keep it pinned to the newest
+      // message rather than wherever the resize left it.
+      const transcript = transcriptRef.current;
+      if (transcript) {
+        transcript.scrollTop = transcript.scrollHeight;
+      }
+    };
+    update();
+    viewport.addEventListener('resize', update);
+    return () => {
+      viewport.removeEventListener('resize', update);
+      document.documentElement.style.removeProperty('--viewport-height');
+    };
+  }, [session]);
+
   // Keep the transcript pinned to the newest message (including optimistic rows).
   useEffect(() => {
     const element = transcriptRef.current;
@@ -540,6 +596,9 @@ export function App({ bootstrap }: AppProps = {}) {
           // selected chat (arrows change it, change applies immediately).
           event.preventDefault();
           timerRef.current?.focus();
+        } else if (event.key === 'a' && ctx.selected) {
+          event.preventDefault();
+          ctx.openPeerNameEditor();
         } else if (event.key === 'Enter' && document.activeElement === document.body) {
           event.preventDefault();
           if (ctx.selected) {
@@ -558,6 +617,10 @@ export function App({ bootstrap }: AppProps = {}) {
         } else if (event.key === 'p' && ctx.pairCode.trim()) {
           event.preventDefault();
           void ctx.joinCode();
+        } else if (event.key === 'y' && ctx.pairCode.trim()) {
+          // y = yank, vim-style — the code exists precisely to be copied.
+          event.preventDefault();
+          void ctx.copyPairCode();
         }
       }
     }
@@ -899,10 +962,14 @@ export function App({ bootstrap }: AppProps = {}) {
 
   // Accept a Request: mark the sender allowed (moves them to the inbox) and,
   // optionally, save a contact under a chosen name in the same flow.
-  async function acceptRequest(conversation: ConeConversation, saveName?: string) {
+  async function acceptRequest(conversation: ConeConversation, saveName?: string, options: { open?: boolean } = {}) {
     if (!session) {
       return;
     }
+    // Accepting from inside an open thread continues there; accepting from
+    // the Requests list stays in the list — clearing several stale requests
+    // must not bounce through a chat thread per accept.
+    const open = options.open ?? true;
     await run(async () => {
       // Conversation-scoped: DMs allow the peer's inbox, groups allow the group.
       await session.client.setConversationConsent(conversation.conversationId, 'allowed');
@@ -915,13 +982,15 @@ export function App({ bootstrap }: AppProps = {}) {
         });
       }
       await refresh(session.client);
-      setChatScope('chats');
-      openConversation(conversation, false);
-      // Naming is the natural next step after accepting an unknown sender —
-      // open the header's name row so it's one keystroke away, not a hunt.
-      if (!saveName?.trim() && conversation.kind !== 'group') {
-        setPeerNameDraft('');
-        setPeerNameOpen(true);
+      if (open) {
+        setChatScope('chats');
+        openConversation(conversation, false);
+        // Naming is the natural next step after accepting an unknown sender —
+        // open the header's name row so it's one keystroke away, not a hunt.
+        if (!saveName?.trim() && conversation.kind !== 'group') {
+          setPeerNameDraft('');
+          setPeerNameOpen(true);
+        }
       }
       note(`Accepted ${peerLabel(conversation)}`);
     }, 'Accepting…');
@@ -1080,24 +1149,42 @@ export function App({ bootstrap }: AppProps = {}) {
     if (!session || !code) {
       return;
     }
-    await run(async () => {
-      const result = await session.client.pairWithCode(code, { proposedName: pairShareName || undefined });
-      const contact = pairPeerName.trim()
-        ? await session.client.saveContact({
-            address: result.contact.address,
-            inboxId: result.contact.inboxId,
-            name: pairPeerName.trim(),
-            source: 'paired',
-          })
-        : result.contact;
-      await refresh(session.client);
-      setPairCode('');
-      setPairExpiresAt('');
-      setPairPeerName('');
-      setPairShareName('');
-      openContactConversation(contact);
-      note(`Paired with ${contact.name}.`);
-    }, 'Waiting for the other side…');
+    // The wait spans the code's whole window (it can be many minutes when the
+    // other side is an agent installing Cone mid-pair), so it must be
+    // cancelable — and a cancel is a user action, not an error.
+    const abort = new AbortController();
+    pairAbortRef.current = abort;
+    try {
+      await run(async () => {
+        let result;
+        try {
+          result = await session.client.pairWithCode(code, { proposedName: pairShareName || undefined, signal: abort.signal });
+        } catch (error) {
+          if (abort.signal.aborted) {
+            note('Pairing canceled.');
+            return;
+          }
+          throw error;
+        }
+        const contact = pairPeerName.trim()
+          ? await session.client.saveContact({
+              address: result.contact.address,
+              inboxId: result.contact.inboxId,
+              name: pairPeerName.trim(),
+              source: 'paired',
+            })
+          : result.contact;
+        await refresh(session.client);
+        setPairCode('');
+        setPairExpiresAt('');
+        setPairPeerName('');
+        setPairShareName('');
+        openContactConversation(contact);
+        note(`Paired with ${contact.name}.`);
+      }, 'Waiting for the other side…');
+    } finally {
+      pairAbortRef.current = null;
+    }
   }
 
   async function exportBackup() {
@@ -1257,6 +1344,16 @@ export function App({ bootstrap }: AppProps = {}) {
                   ref={secretRef}
                   value={secretInput}
                   onInput={(event) => setSecretInput(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    // A textarea never implicit-submits, but the UI promises
+                    // "↵ unlock" — keys are single-line, so Enter means go.
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
+                      if (secretInput.trim() && !busy) {
+                        void unlock(secretInput);
+                      }
+                    }
+                  }}
                   placeholder="cone_sk_v1_…"
                   rows={3}
                   autocomplete="off"
@@ -1279,9 +1376,6 @@ export function App({ bootstrap }: AppProps = {}) {
                 </label>
               </div>
               <div class="row">
-                <button class="primary" type="submit" disabled={busy || !secretInput.trim()}>
-                  Unlock <kbd>↵</kbd>
-                </button>
                 <button
                   type="button"
                   class="ghost"
@@ -1293,6 +1387,10 @@ export function App({ bootstrap }: AppProps = {}) {
                   }}
                 >
                   Generate key
+                </button>
+                {/* Primary action sits right, under the thumb — same side as send. */}
+                <button class="primary login__unlock" type="submit" disabled={busy || !secretInput.trim()}>
+                  Unlock <kbd>↵</kbd>
                 </button>
               </div>
               <p class={`status${statusError ? ' is-error' : ''}`} role="status">
@@ -1311,7 +1409,7 @@ export function App({ bootstrap }: AppProps = {}) {
   const detail = Boolean(selectedConversationId) || composing;
 
   return (
-    <main class="screen">
+    <main class="screen screen--app">
       <div class="app">
         <header class="topbar">
           <span class="topbar__brand">cone <span class="muted">·{session.env}</span></span>
@@ -1441,7 +1539,7 @@ export function App({ bootstrap }: AppProps = {}) {
                             </span>
                           </button>
                           <span class="conv__req-actions">
-                            <button type="button" class="primary" onClick={() => void acceptRequest(conversation)}>Accept</button>
+                            <button type="button" class="primary" onClick={() => void acceptRequest(conversation, undefined, { open: false })}>Accept</button>
                             <button type="button" class="ghost danger" onClick={() => void blockRequest(conversation)}>Block</button>
                           </span>
                         </div>
@@ -1517,7 +1615,11 @@ export function App({ bootstrap }: AppProps = {}) {
                           }}
                           title="Name this contact — a local alias, visible only to you"
                         >
-                          {shortId(activeConversation.peerInboxId ?? '')} ✎
+                          {/* An unsaved peer gets an explicit call to action — a bare
+                              truncated inbox id reads as inert text, not a button. */}
+                          {contacts.some((contact) => contact.inboxId === activeConversation.peerInboxId)
+                            ? <>{shortId(activeConversation.peerInboxId ?? '')} ✎</>
+                            : <>{shortId(activeConversation.peerInboxId ?? '')} · ＋ save contact</>}
                         </button>
                       )}
                       <span class="thread__spacer" />
@@ -1529,6 +1631,18 @@ export function App({ bootstrap }: AppProps = {}) {
                         </>
                       ) : (
                         <>
+                          {activeConversation.kind !== 'group' && activeConversation.peerInboxId &&
+                            !contacts.some((contact) => contact.inboxId === activeConversation.peerInboxId) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setPeerNameDraft('');
+                                setPeerNameOpen(true);
+                              }}
+                            >
+                              ＋ Add contact <kbd>a</kbd>
+                            </button>
+                          )}
                           <label class="thread__timer" title="Disappearing messages — applies to both sides">
                             <span aria-hidden="true">⌛</span>
                             <select
@@ -1785,13 +1899,25 @@ export function App({ bootstrap }: AppProps = {}) {
                       )}
                       {transcriptMessages.map((message) =>
                         isGroupUpdateEnvelope(message.json) ? (
-                          <div class="sys sys--inline" key={message.messageId}>
-                            {formatGroupUpdate(message.json, memberLabel).map((line) => (
-                              <p key={line}>
-                                <span class="msg__time">{formatTranscriptTime(message.sentAt)}</span> · {line}
+                          // In a DM the raw membership lines are noise ("X added
+                          // you" / "you added X" — one per duplicate MLS DM the
+                          // pairing minted). Collapse them to a single intro on
+                          // the first update; groups keep attributed lines.
+                          activeGroup ? (
+                            <div class="sys sys--inline" key={message.messageId}>
+                              {formatGroupUpdate(message.json, memberLabel).map((line) => (
+                                <p key={line}>
+                                  <span class="msg__time">{formatTranscriptTime(message.sentAt)}</span> · {line}
+                                </p>
+                              ))}
+                            </div>
+                          ) : message.messageId === transcriptMessages.find((entry) => isGroupUpdateEnvelope(entry.json))?.messageId ? (
+                            <div class="sys sys--inline" key={message.messageId}>
+                              <p>
+                                <span class="msg__time">{formatTranscriptTime(message.sentAt)}</span> · you and {activeConversation?.title ?? 'your peer'} began a conversation
                               </p>
-                            ))}
-                          </div>
+                            </div>
+                          ) : null
                         ) : (
                           <MessageRow
                             key={message.messageId}
@@ -2014,7 +2140,7 @@ export function App({ bootstrap }: AppProps = {}) {
                 <div class="panel__head">Pair</div>
                 <p class="lede">
                   Two people or agents enter the same one-time code. Creating a code starts waiting immediately — just
-                  have the other side enter it within ten minutes (CLI: <code>cone pair &lt;code&gt;</code>). Once both
+                  have the other side enter it within thirty minutes (CLI: <code>cone pair &lt;code&gt;</code>). Once both
                   sides are present you confirm over XMTP and save each other as contacts; the pairing is permanent and
                   the code is never needed again. No messages pass through rendezvous.
                 </p>
@@ -2029,6 +2155,9 @@ export function App({ bootstrap }: AppProps = {}) {
                 <div class="row">
                   <button type="button" disabled={busy} onClick={() => void createCode()}>Create code <kbd>c</kbd></button>
                   <button class="primary" type="button" disabled={busy || !pairCode.trim()} onClick={() => void joinCode()}>Join code <kbd>p</kbd></button>
+                  {busy && pairAbortRef.current && (
+                    <button type="button" class="ghost" onClick={() => pairAbortRef.current?.abort()}>Stop waiting</button>
+                  )}
                 </div>
                 <label class="field">
                   <span>save peer as (your local name for them)</span>
@@ -2044,7 +2173,7 @@ export function App({ bootstrap }: AppProps = {}) {
                 <div class="code-card">
                   <span class={`code${pairCode ? '' : ' placeholder'}`}>{pairCode || 'no code yet'}</span>
                   <div class="row">
-                    <button type="button" disabled={!pairCode} onClick={() => void copy(pairCode)}>Copy</button>
+                    <button type="button" disabled={!pairCode} onClick={() => void copy(pairCode)}>Copy <kbd>y</kbd></button>
                     {pairExpiresAt && <span class="muted">code expires in {countdown(pairExpiresAt, nowTick)}</span>}
                   </div>
                 </div>
@@ -2055,7 +2184,7 @@ export function App({ bootstrap }: AppProps = {}) {
               <section class="panel">
                 <div class="panel__head">Join a group</div>
                 <p class="lede">
-                  Someone in a group creates an invite from the group's info panel: a spoken code (ten minutes, they
+                  Someone in a group creates an invite from the group's info panel: a spoken code (thirty minutes, they
                   wait and add you directly) or a link token (they add you the next time their app syncs). Enter
                   either here — the group appears in Chats once their add arrives. Invites are single use by default
                   and nobody is saved as a contact.
@@ -2257,7 +2386,7 @@ export function App({ bootstrap }: AppProps = {}) {
               </div>
               <div class="help-row">
                 <b>Pair</b>
-                <span>From the Pair tab: <kbd>c</kbd> creates a one-time code, <kbd>p</kbd> joins one. A code lasts ten minutes and works for exactly two participants — the pairing itself is permanent.</span>
+                <span>From the Pair tab: <kbd>c</kbd> creates a one-time code, <kbd>p</kbd> joins one. A code lasts thirty minutes and works for exactly two participants — the pairing itself is permanent.</span>
               </div>
               <div class="help-row">
                 <b>Privacy</b>

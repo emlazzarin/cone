@@ -45,7 +45,22 @@ For an agent or script, pipe it:
 printf '%s' "$CONE_SECRET_KEY" | cone login --secret-stdin --remember
 ```
 
+`--remember` **is** the durable storage: the key is persisted in Cone's config file (`cone config` prints the path). Do not invent a storage location or ask the user for one. If your framework has its own secrets store, keep a backup copy there (file mode 600).
+
+**Never echo the secret key** into chat messages, replies, or logs — anyone who reads it owns the account. Identify yourself by `inboxId` and address instead (`cone whoami`).
+
 The `SECRET_KEY` determines the XMTP account/inbox. Contact names are local aliases.
+
+## Agent setup runbook
+
+When your operator asks you to "set up Cone" (or hands you a pairing code), execute **all** of the following in one pass — do not stop between steps to ask permission or to "verify before continuing". The only meaningful verification is the last step, and it requires the event loop to already be running. Setup is complete only when every box is checked:
+
+1. **Installed** — `cone doctor` exits 0 (it checks the secret key, state DB, rendezvous, and XMTP reachability).
+2. **Key persisted** — logged in with `--remember`; key never echoed anywhere.
+3. **Environment persisted** — `XMTP_ENV` and `CONE_RENDEZVOUS_URL` (when your deployment sets them) are exported in the environment your event loop runs under — a cron job or gateway process does not inherit your current shell.
+4. **Paired and verified** — `cone pair <code> --share-name "<your alias>"`, then `cone inbox sync && cone inbox` must show the conversation and saved contact. If it does not, the handshake is incomplete: debug before declaring success.
+5. **Wired into your event loop** — inbound Cone messages must reach your response loop with no operator involvement. Implement this yourself (see "Agent platform integration" below); receiving messages without being able to answer them is not set up.
+6. **Reported** — tell your operator your `inboxId`, the alias you shared, and how the event loop is wired (so they know how fast to expect replies).
 
 ## Identity
 
@@ -94,6 +109,11 @@ Send to an inbox ID, EVM address, or saved contact name:
 cone send --to <identity> --text "hello"
 ```
 
+The text is delivered byte-for-byte as passed. Do not pre-escape quotes or
+unicode (`"`, `\"` etc.) — the peer sees the escape sequences literally.
+Use your exec API's argument array (not a concatenated shell string) when the
+text contains quotes, or send structured content with `--data`.
+
 Send structured JSON instead of text (rides the Cone envelope; other Cone clients surface it as a parsed `json` field, non-Cone XMTP clients see a readable fallback):
 
 ```sh
@@ -131,13 +151,57 @@ The exact shape, shared by `messages`/`wait` (`{"messages": [...], "cursor": "<o
 
 `text` XOR `json` is set; `json` is the sender's payload itself (the envelope is stripped), with `replyTo` alongside when the sender correlated it; `groupName` appears on group messages; `expiresAt` appears under a disappearing-messages timer.
 
+## Agent platform integration (gateway adapters)
+
+Cone is designed to slot into an agent framework's event loop ("gateway",
+"message bus", or equivalent). **Installing Cone is not enough** — until the
+framework consumes Cone's inbound stream, the agent receives mail but never
+wakes to answer it. When setup is requested, build this wiring yourself, in
+your own framework's idiom (Hermes: a gateway platform adapter; OpenClaw: the
+equivalent plugin/scheduler; anything else: a cron entry or supervised
+subprocess). **The default that always works:** poll every 30 seconds with
+`cone messages --cursor-name <framework>-cone`, forward each JSON line into
+your event loop, and route replies with `cone send --to <conversationId>`.
+Then prove it: have your operator message you, and reply without being
+prompted.
+
+An adapter needs four things:
+
+**Inbound, streaming (long-lived processes).** Spawn `cone listen` as a
+persistent subprocess at gateway startup; each stdout line is one JSON message
+from an allowed sender. Restart it if it exits.
+
+**Inbound, polling (turn-based/cron agents).** Call `cone messages
+--cursor-name <adapter-name>` on the framework's tick; exit 0 = new messages
+printed, 3 = nothing new, 1 = error. Cursors are durable and replay-safe. Use
+`cone wait` instead when the framework supports blocking with a timeout. One
+cursor name per consumer — two pollers sharing a name will race.
+
+**Outbound.** Route replies with `cone send --to <conversationId> --text ...`
+(or `--data` + `--reply-to <messageId>` for structured traffic). The inbound
+message's `conversationId` is the stable routing key; map it to the
+framework's thread/channel id.
+
+**Isolation.** One agent per `CONE_SECRET_KEY`, and give each agent process
+its own `CONE_HOME`. `listen` in one process plus `send`/`messages` in
+another on the same `CONE_HOME` is supported (WAL); distinct agents sharing a
+`CONE_HOME` is not. Set `XMTP_ENV` and `CONE_RENDEZVOUS_URL` in the adapter's
+environment, not per command.
+
+Do **not** auto-accept `cone requests` from adapter code — surfacing new
+senders for operator approval is the consent boundary doing its job. If the
+agent mints group invite links, run `cone inbox sync` periodically so waiting
+joiners are admitted.
+
 ## Health
 
 ```sh
 cone doctor
 ```
 
-Runs the checks an agent needs when anything fails — secret key, state DB, rendezvous reachability, XMTP reachability — as `{ name, ok, detail }` entries; exit 0 only when everything passes. In JSON mode (the default), **all errors** from any command are one structured object on stderr: `{"error":{"code":"NO_SECRET","message":"..."}}` with stable codes: `USAGE`, `NO_SECRET`, `BAD_SECRET`, `NOT_MESSAGEABLE`, `RENDEZVOUS_UNREACHABLE`, `RENDEZVOUS_REJECTED`, `SELF_PAIRING`, `TIMEOUT`, `SYNC_FAILED`, `IDEMPOTENCY_CONFLICT`, `IDEMPOTENCY_IN_FLIGHT`, `NOT_A_MEMBER`, `NOT_FOUND`, `NETWORK_UNREACHABLE`, `ERROR`.
+Runs the checks an agent needs when anything fails — secret key, state DB, rendezvous reachability, XMTP reachability — as `{ name, ok, detail }` entries; exit 0 only when everything passes.
+
+**Parse stdout only.** Every JSON contract rides stdout; stderr carries logs and native-library noise (on Linux, XMTP's SQLCipher layer may print harmless `mlock` warnings — ignore them or raise the memlock ulimit; they never indicate a Cone failure). In JSON mode (the default), **all errors** from any command are one structured object on stderr: `{"error":{"code":"NO_SECRET","message":"..."}}` with stable codes: `USAGE`, `NO_SECRET`, `BAD_SECRET`, `NOT_MESSAGEABLE`, `RENDEZVOUS_UNREACHABLE`, `RENDEZVOUS_REJECTED`, `SELF_PAIRING`, `TIMEOUT`, `SYNC_FAILED`, `IDEMPOTENCY_CONFLICT`, `IDEMPOTENCY_IN_FLIGHT`, `NOT_A_MEMBER`, `NOT_FOUND`, `NETWORK_UNREACHABLE`, `ERROR`.
 
 Running `cone listen` in one process and `cone send`/`cone messages` in another against the same `CONE_HOME` is supported (the state DB uses WAL). For heavily parallel fleets, give each agent its own `CONE_HOME` — one key per agent anyway, since every process is an XMTP installation and inboxes cap at 10.
 
@@ -207,4 +271,15 @@ Mint a code without joining (for scripts that hand the code to two other actors)
 cone pair --print
 ```
 
-Both sides must be waiting on the same code during the ten-minute window. `--share-name` is the optional peer-visible name you propose. `--save-as` is the local contact name for the peer. The rendezvous service never relays application messages.
+Both sides must be waiting on the same code during the thirty-minute window; `pair` blocks for the whole window by default. `--share-name` is the peer-visible name you propose; `--save-as` is the local contact name for the peer. The rendezvous service never relays application messages.
+
+**Agents: always pass `--share-name`** with a short alias for yourself (e.g. `--share-name "Hermes"`). The other side's client saves you under that name — without it, the human sees only your 64-character inbox id.
+
+`pair` blocks until the other side joins, but your bootstrap does not have to: run it as a background process and continue with the rest of setup (event-loop wiring, environment persistence), then reap it before your first send:
+
+```sh
+cone pair "$CODE" --share-name "Hermes" --save-as "Operator" > pair-result.json &
+PAIR_PID=$!
+# ... continue setup ...
+wait "$PAIR_PID"   # exit 0 = paired; pair-result.json has the contact
+```

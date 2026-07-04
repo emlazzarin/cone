@@ -296,19 +296,27 @@ class SdkXmtpAdapter implements XmtpAdapter {
   async sync(filter?: ConsentFilter): Promise<XmtpSyncResult> {
     const consentStates = this.consentFilter(filter);
     await this.client.conversations.syncAll(consentStates);
-    // XMTP can hold several MLS DMs for one peer pair (both sides initiated);
-    // the SDK stitches them, and listing must ask for the canonical one only —
-    // otherwise every duplicate becomes its own thread in the read model.
+    // XMTP can hold several MLS DMs for one peer pair (both sides initiated —
+    // pairing's dueling confirmations guarantee it). The *conversation list*
+    // asks for the canonical DM only, or every duplicate becomes its own
+    // thread in the read model.
     const dms = await this.client.conversations.listDms({ ...(consentStates ? { consentStates } : {}), includeDuplicateDms: false });
     const groups = await this.client.conversations.listGroups(consentStates ? { consentStates } : undefined);
     const conversations = await Promise.all([
       ...dms.map((dm) => this.toDmConversation(dm)),
       ...groups.map((group) => this.toGroupConversation(group)),
     ]);
+    // *Messages*, though, must come from every DM including duplicates: a
+    // peer whose sends land in a duplicate DM (their SDK picked the other DM
+    // as canonical) would otherwise vanish — reading the canonical DM
+    // stitches duplicates in on some SDKs (node) but not all (browser).
+    // Ingesting from all DMs lets collapseDuplicateDms reunite the history;
+    // message ids dedup, so stitching SDKs are unaffected.
+    const allDms = await this.client.conversations.listDms({ ...(consentStates ? { consentStates } : {}), includeDuplicateDms: true });
     const messagesOf = async (conversation: SdkConversation, kind: ConversationKind) =>
       (await conversation.messages()).filter(isDelivered).map((message) => toIncomingMessage(message, kind));
     const messages = (await Promise.all([
-      ...dms.map((dm) => messagesOf(dm, 'dm')),
+      ...allDms.map((dm) => messagesOf(dm, 'dm')),
       ...groups.map((group) => messagesOf(group, 'group')),
     ])).flat();
     return { conversations, messages };
@@ -490,9 +498,28 @@ class SdkXmtpAdapter implements XmtpAdapter {
       peerInboxId,
       title: peerInboxId,
       updatedAt: dm.createdAt?.toISOString(),
-      consentState: this.fromSdkConsent(await dm.consentState()),
+      consentState: await this.dmConsent(dm, peerInboxId),
       retention: fromSdkRetention(await dm.messageDisappearingSettings()),
     };
+  }
+
+  // XMTP keeps two consent records: per-conversation and per-inbox. Accepting
+  // a DM sender writes the inbox-level record (so a blocked peer cannot return
+  // via a fresh conversation), but the conversation-level record can stay
+  // "unknown" — notably on installations that never wrote it (a re-used key on
+  // a new device sees every historic DM as a Request otherwise, and a sync
+  // right after an accept would flip the row back to unknown). The inbox-level
+  // decision is the durable one, so it breaks the tie.
+  private async dmConsent(dm: SdkDm, peerInboxId: string): Promise<ConeConsentState> {
+    const conversationLevel = this.fromSdkConsent(await dm.consentState());
+    if (conversationLevel !== 'unknown') {
+      return conversationLevel;
+    }
+    try {
+      return await this.getConsent(peerInboxId);
+    } catch {
+      return 'unknown';
+    }
   }
 
   private async toGroupConversation(group: SdkGroup): Promise<ConeConversation> {

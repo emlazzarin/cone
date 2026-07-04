@@ -131,7 +131,7 @@ The key is a 32-byte root secret with version and checksum metadata. Cone determ
 
 Handshake-code pairing is for cases where two sides want to opt in without exchanging identifiers first.
 
-The rendezvous service stores encrypted offers for a short time. It does not relay application messages. Offers are encrypted with a key derived from the handshake code itself — the only secret both sides share before they know each other. After both sides decrypt each other locally, they confirm over XMTP and save each other as contacts. Handshake codes expire after ten minutes, but the pairing they establish is permanent.
+The rendezvous service stores encrypted offers for a short time. It does not relay application messages. Offers are encrypted with a key derived from the handshake code itself — the only secret both sides share before they know each other. After both sides decrypt each other locally, they confirm over XMTP and save each other as contacts. Handshake codes expire after thirty minutes, but the pairing they establish is permanent.
 
 ### Address Book
 

@@ -54,6 +54,9 @@
 body {
   margin: 0;
   min-width: 320px;
+  /* Backstop: nothing may widen the page past the viewport — on mobile that
+     renders as "zoomed in" and re-zooms on every input focus. */
+  overflow-x: clip;
   min-height: 100dvh;
 }
 
@@ -291,11 +294,30 @@ kbd {
   padding: 16px;
 }
 
+/* Signed-in screen never page-scrolls: the transcript/panels scroll
+   internally. With the page unscrollable, an iOS keyboard can only *pan* the
+   visual viewport (offsetTop), which .app compensates for below — so the
+   topbar stays visible and the composer sits above the keyboard. */
+.screen--app {
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .app {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
+  /* Explicit minmax(0) column: an implicit `auto` column takes the widest
+     child's min-content width, so one unshrinkable row (topbar chips, a long
+     id) silently widens EVERY row past the viewport — the mobile bug. */
+  grid-template-columns: minmax(0, 1fr);
   width: min(1180px, 100%);
-  height: calc(100dvh - 32px);
+  /* Height follows the *visual* viewport (set from JS): iOS keyboards do not
+     shrink dvh — Safari pans the page, scrolling the topbar/tabs off-screen.
+     Tracking visualViewport keeps navigation visible while typing. (No
+     offsetTop transform: following Safari's pan baked stale offsets into the
+     layout — shrink + one scroll reset per resize is the stable shape.) */
+  height: calc(var(--viewport-height, 100dvh) - 32px);
   margin: 0 auto;
   border: 1px solid var(--line-2);
   border-radius: var(--radius);
@@ -365,6 +387,8 @@ kbd {
 /* Tabs */
 .tabs {
   display: flex;
+  /* Narrow phones: five tabs must never widen the page. */
+  flex-wrap: wrap;
   gap: 2px;
   border-bottom: 1px solid var(--line);
   background: var(--bg-deep);
@@ -719,6 +743,9 @@ mark {
 
 .thread__head {
   display: flex;
+  /* Action buttons drop to a second row on narrow phones instead of widening
+     the page. */
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   border-bottom: 1px solid var(--line);
@@ -904,6 +931,13 @@ mark {
   scroll-behavior: smooth;
 }
 
+/* Short conversations hug the composer (messaging-app convention) instead of
+   leaving a gulf under the last message; long ones scroll normally. The
+   empty-state .sys keeps centering — its own auto margins split the space. */
+.transcript > :first-child {
+  margin-top: auto;
+}
+
 .msg {
   display: flex;
   align-items: flex-end;
@@ -1024,6 +1058,8 @@ mark {
 .sys--inline {
   margin: 0;
   padding: 2px 0;
+  /* In-flow system lines read as part of the transcript — same size as it. */
+  font-size: 13px;
 }
 
 .sys--inline p {
@@ -1169,7 +1205,23 @@ mark {
   color: var(--text-dim);
   font-size: 12.5px;
   line-height: 1.6;
-  max-width: 64ch;
+  /* Wrap at the panel edge — panels widened past 640px and a hard ch cap
+     left ledes rag-wrapping far short of it. Panels bound line length now. */
+  max-width: none;
+}
+
+/* 64-char inbox ids and codes have no break opportunities; anywhere they can
+   render, they must be allowed to wrap or they push the layout past the
+   viewport (the mobile "zoomed in" bug). */
+.lede,
+.msg__body,
+.kv__val,
+.log__line,
+.code,
+.code-card .code,
+.thread__peer,
+code {
+  overflow-wrap: anywhere;
 }
 
 .row {
@@ -1432,6 +1484,10 @@ mark {
 
 /* ── Login ────────────────────────────────────────────────────────────── */
 
+.login__unlock {
+  margin-left: auto;
+}
+
 .screen--login {
   display: grid;
   place-items: center;
@@ -1599,12 +1655,27 @@ mark {
   }
 }
 
-@media (max-width: 520px) {
-  input,
-  select,
-  textarea {
-    font-size: 16px; /* avoid iOS zoom-on-focus */
+/* Touch devices: keyboard accelerators don't exist there, so the kbd chips
+   are noise on every button and hint row. The opt-in ? overlay keeps them
+   (phones do pair hardware keyboards), as does anything inside it. */
+@media (hover: none) and (pointer: coarse) {
+  kbd {
+    display: none;
   }
+
+  .help-card kbd {
+    display: inline-block;
+  }
+
+  .keyhints {
+    display: none;
+  }
+}
+
+@media (max-width: 520px) {
+  /* No 16px input bump: it existed only to stop iOS zoom-on-focus, and the
+     locked viewport (maximum-scale=1) already prevents that. 16px controls
+     next to 13px body text read as comically oversized. */
 
   .tabs button {
     padding: 6px 9px;

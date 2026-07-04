@@ -19,7 +19,7 @@ export const MAX_JOIN_OFFERS = 32;
 // TTL ceilings by role: two-party exchanges are ephemeral, descriptors may
 // out-live them by design (async links), joins wait for the minter's sync.
 export const TTL_CEILING_MS: Record<RendezvousRole, number> = {
-  pair: 10 * 60 * 1000,
+  pair: 30 * 60 * 1000,
   descriptor: 30 * 24 * 60 * 60 * 1000,
   join: 24 * 60 * 60 * 1000,
 };
