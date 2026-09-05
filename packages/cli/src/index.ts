@@ -29,13 +29,19 @@ import {
 } from '@cone/core';
 import { createNodeXmtpAdapter } from '@cone/xmtp-node';
 
-import { loadSecretKey, readConfig, writeConfig } from './config';
+import { initializeConfig, loadSecretKey, readConfig, writeConfig } from './config';
 import { envVarLocation } from './env-origin';
 import { defaultConfigPath, defaultRendezvousUrl, defaultStatePath, resolveConfigPath, resolveRendezvousUrl, resolveStatePath, type ConfigSource } from './paths';
 import { BunSQLiteStore } from './store';
 import { runChat } from './chat';
+import { AgentSession } from './agent';
+import { serveAgent } from './serve';
+import { integrateHermes } from './integrate';
+import { serveMcp } from './mcp';
+import packageInfo from '../../../package.json';
 
 export { BunSQLiteStore } from './store';
+export { AgentSession } from './agent';
 export { HttpRendezvousClient } from '@cone/core';
 
 export interface CliIo {
@@ -57,8 +63,10 @@ export async function createCliClient(
   const account = deriveAccount(secret, { env: options.env ?? readEnv() });
   const statePath = defaultStatePath();
   const store = new BunSQLiteStore(statePath);
-  const xmtp = options.xmtp ?? await createNodeXmtpAdapter({ account, dbPath: `${statePath}.xmtp.db3` });
-  return createConeClient({
+  let xmtp = options.xmtp;
+  try {
+    xmtp ??= await createNodeXmtpAdapter({ account, dbPath: `${statePath}.xmtp.db3` });
+    return await createConeClient({
     account,
     rendezvous: new HttpRendezvousClient(defaultRendezvousUrl()),
     store,
@@ -66,15 +74,20 @@ export async function createCliClient(
     // "Allow contacts to add you to groups" — config-backed, default on for
     // human use. Agent processes pass false: their boundary is explicit accept.
     autoAllowGroupsFromContacts: options.autoAllowGroupsFromContacts ?? readConfig().groupAutoAllow ?? true,
-  });
+    });
+  } catch (error) {
+    await xmtp?.close?.();
+    store.close();
+    throw error;
+  }
 }
 
 export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliDeps = {}): Promise<number> {
   let context: CliContext = { args, output: 'json', outputSource: 'default' };
   let command: string | undefined;
   let activeClient: ConeClient | undefined;
-  const getClient = async () => {
-    activeClient = await loadClient(context, io, deps);
+  const getClient = async (options: { autoAllowGroupsFromContacts?: boolean } = {}) => {
+    activeClient = await loadClient(context, io, deps, options);
     return activeClient;
   };
 
@@ -82,6 +95,87 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
     context = parseCliArgs(args);
     command = context.args[0];
     switch (command) {
+      case '--version':
+      case 'version': {
+        io.stdout(`cone ${packageInfo.version}\n`);
+        return 0;
+      }
+      case 'integrate': {
+        if (context.args[1] !== 'hermes') throw usageError('usage: cone integrate hermes [--name <agent-name>]');
+        initializeConfig(readEnv());
+        const result = await integrateHermes({
+          binary: optionalOption(context.args, '--binary'), hermes: optionalOption(context.args, '--hermes'),
+          home: optionalOption(context.args, '--hermes-home'), name: optionalOption(context.args, '--name'),
+          restart: !context.args.includes('--no-restart'),
+        });
+        writeValue(io, context, result, () => 'Hermes integration installed. Verify an incoming message and automatic reply.\n');
+        return 0;
+      }
+      case 'init': {
+        const env = optionalOption(context.args, '--env') ?? readEnv();
+        if (!['local', 'dev', 'production'].includes(env)) throw usageError('invalid XMTP environment');
+        const initialized = initializeConfig(env as XmtpEnv);
+        const client = await getClient({ autoAllowGroupsFromContacts: false });
+        writeValue(io, context, { ...await client.identity(), created: initialized.created }, value =>
+          `Cone ready on ${value.env}.\nInbox: ${value.inboxId}\n`);
+        return 0;
+      }
+      case 'connect': {
+        const to = context.args[1];
+        if (!to) throw usageError('usage: cone connect <identity> [--name <name>]');
+        const client = await getClient({ autoAllowGroupsFromContacts: false });
+        const peer = await client.resolveIdentity(to);
+        if (!await client.canMessage({ inboxId: peer.inboxId })) throw new Error('peer is not reachable on XMTP');
+        const contact = await client.saveContact({ name: optionalOption(context.args, '--name') ?? peer.inboxId, inboxId: peer.inboxId, address: peer.address });
+        writeValue(io, context, contact, value => `Connected to ${value.name}.\n`);
+        return 0;
+      }
+      case 'serve': {
+        initializeConfig(readEnv());
+        const client = await getClient({ autoAllowGroupsFromContacts: false });
+        await serveAgent(new AgentSession(client, error => io.stderr(`${errorMessage(error)}\n`)));
+        return 0;
+      }
+      case 'mcp': {
+        initializeConfig(readEnv());
+        const client = await getClient({ autoAllowGroupsFromContacts: false });
+        await serveMcp(new AgentSession(client, error => io.stderr(`${errorMessage(error)}\n`)));
+        return 0;
+      }
+      case 'messages':
+      case 'wait':
+      case 'receive': {
+        const timeoutMs = parseTimeoutMs(context.args, command === 'wait' ? 30000 : 0);
+        const client = await getClient({ autoAllowGroupsFromContacts: context.args.includes('--auto-accept-groups-from-contacts') });
+        const session = new AgentSession(client, () => {});
+        try {
+          await session.start();
+          const result = await session.receive({ consumer: optionalOption(context.args, '--consumer') ?? optionalOption(context.args, '--cursor-name'),
+            limit: Number(optionalOption(context.args, '--limit') ?? 50), waitMs: timeoutMs });
+          const output = { ...result, messages: await enrichMessages(client, result.messages), timedOut: timeoutMs > 0 && result.messages.length === 0 };
+          writeValue(io, context, output, value => value.messages.length
+            ? `${value.messages.map(message => formatMessageLine(message, message.senderInboxId)).join('\n')}\n`
+            : 'No pending messages.\n');
+          return result.messages.length ? 0 : EXIT_NOTHING_NEW;
+        } finally { await session.close(); }
+      }
+      case 'ack': {
+        const ids = collectOptions(context.args, '--message');
+        if (!ids.length) throw usageError('usage: cone ack --message <messageId> [--message <messageId>] [--consumer <name>]');
+        const client = await getClient({ autoAllowGroupsFromContacts: false });
+        await client.acknowledgeMessages(ids, { consumer: optionalOption(context.args, '--consumer') });
+        writeValue(io, context, { acknowledged: ids }, () => `Acknowledged ${ids.length} message(s).\n`);
+        return 0;
+      }
+      case 'reply': {
+        const client = await getClient({ autoAllowGroupsFromContacts: false });
+        await syncOrThrow(client);
+        const sent = await client.sendToConversation(requiredOption(context.args, '--conversation'), requiredOption(context.args, '--text'), {
+          idempotencyKey: requiredOption(context.args, '--idempotency-key'),
+        });
+        writeValue(io, context, sent, value => `Sent ${value.messageId}.\n`);
+        return 0;
+      }
       case 'keygen': {
         io.stdout(`${generateSecretKey()}\n`);
         return 0;
@@ -138,75 +232,6 @@ export async function runCli(args: string[], io: CliIo = defaultIo(), deps: CliD
           : await client.sendText(to, text ?? '', sendOptions);
         writeValue(io, context, sent, (value) =>
           `${value.deduplicated ? 'Already sent (idempotency key matched)' : 'Sent'} ${value.messageId}${value.conversationId ? ` in ${value.conversationId}` : ''}.\n`);
-        return 0;
-      }
-      // The poll-shaped read model for turn-based agents: sync, then print
-      // everything new since the named durable cursor. Exit 3 = nothing new,
-      // so shell loops need no JSON parsing to know whether to wake the agent.
-      case 'messages': {
-        const client = await getClient();
-        await syncOrThrow(client);
-        const result = await client.pollMessages({
-          cursorName: optionalOption(context.args, '--cursor-name'),
-          advance: !context.args.includes('--peek'),
-        });
-        const enriched = { ...result, messages: await enrichMessages(client, result.messages) };
-        writeValue(io, context, enriched, (value) =>
-          value.messages.length === 0
-            ? 'No new messages.\n'
-            : `${value.messages.map((message) => formatMessageLine(message, message.senderName ?? message.senderInboxId)).join('\n')}\n`);
-        return result.messages.length > 0 ? 0 : EXIT_NOTHING_NEW;
-      }
-      // Drain anything missed while asleep, then block until at least one new
-      // allowed message arrives (or the timeout). The single primitive that
-      // makes heartbeat loops and cron jobs trivial.
-      case 'wait': {
-        const client = await getClient();
-        const cursorName = optionalOption(context.args, '--cursor-name');
-        const timeoutMs = parseTimeoutMs(context.args, 0);
-        await syncOrThrow(client);
-        const printMail = async (result: { messages: ConeMessage[]; cursor: string }) => {
-          const enriched = { ...result, messages: await enrichMessages(client, result.messages) };
-          writeValue(io, context, enriched, (value) =>
-            `${value.messages.map((message) => formatMessageLine(message, message.senderName ?? message.senderInboxId)).join('\n')}\n`);
-        };
-        const drained = await client.pollMessages({ cursorName });
-        if (drained.messages.length > 0) {
-          await printMail(drained);
-          return 0;
-        }
-        let resolveFirst: (() => void) | undefined;
-        const first = new Promise<void>((resolve) => {
-          resolveFirst = resolve;
-        });
-        const unsubscribe = await client.streamMessages((message) => {
-          // Control envelopes never wake an agent loop.
-          if (isControlEnvelope(message.json)) {
-            return;
-          }
-          resolveFirst?.();
-        });
-        // Close the subscribe gap: anything that arrived between the drain
-        // above and the stream landing is caught by one more sync + poll.
-        await client.sync();
-        const gap = await client.pollMessages({ cursorName });
-        if (gap.messages.length > 0) {
-          await unsubscribe();
-          await printMail(gap);
-          return 0;
-        }
-        const arrived = await waitForFirstMessage(first, timeoutMs).then(() => true).catch(() => false);
-        await unsubscribe();
-        if (!arrived) {
-          writeValue(io, context, { messages: [], timedOut: true }, () => 'No new messages (timed out).\n');
-          return EXIT_NOTHING_NEW;
-        }
-        const fresh = await client.pollMessages({ cursorName });
-        if (fresh.messages.length === 0) {
-          writeValue(io, context, { messages: [], timedOut: false }, () => 'No new messages.\n');
-          return EXIT_NOTHING_NEW;
-        }
-        await printMail(fresh);
         return 0;
       }
       // JSON health check an agent runs first when anything fails.
@@ -1157,7 +1182,7 @@ function readEnv(): XmtpEnv {
   // Production is the durable XMTP network and the default; dev/local are
   // explicit opt-ins for testing (identities are env-scoped, so they never
   // collide with the production account).
-  const env = process.env.XMTP_ENV ?? 'production';
+  const env = process.env.XMTP_ENV ?? readConfig().env ?? 'production';
   if (env === 'local' || env === 'dev' || env === 'production') {
     return env;
   }
@@ -1267,21 +1292,26 @@ async function handleDoctor(context: CliContext, io: CliIo): Promise<number> {
 
   // The probe lives on the transport client itself, so doctor can never
   // drift from the endpoint/protocol the real client speaks.
-  const rendezvousCheck = await new HttpRendezvousClient(rendezvousUrl).probe();
-  checks.push({ name: 'rendezvous', ...rendezvousCheck });
+  if (context.args.includes('--rendezvous')) {
+    const rendezvousCheck = await new HttpRendezvousClient(rendezvousUrl).probe();
+    checks.push({ name: 'rendezvous', ...rendezvousCheck });
+  }
 
   if (secret) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const client = await Promise.race([
-        createCliClient(secret, { env }),
-        new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error(`XMTP ${env} did not respond within 20s`)), 20_000)),
+      const identity = await Promise.race([
+        (async () => {
+          const client = await createCliClient(secret, { env });
+          try { return await client.identity(); }
+          finally { await client.close(); }
+        })(),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`XMTP ${env} did not respond within 20s`)), 20_000); }),
       ]);
-      const identity = await client.identity();
-      await client.close();
       checks.push({ name: 'xmtp', ok: true, detail: `${env} · inbox ${identity.inboxId}` });
     } catch (error) {
       checks.push({ name: 'xmtp', ok: false, detail: firstLine(error) });
-    }
+    } finally { clearTimeout(timer); }
   } else {
     checks.push({ name: 'xmtp', ok: false, detail: 'skipped — no secret key' });
   }
@@ -1303,7 +1333,7 @@ function handleConfig(io: CliIo, context: CliContext): number {
   const config = readConfig(configPath.value);
 
   const resolved = {
-    xmtpEnv: sourced(readEnv(), 'XMTP_ENV'),
+    xmtpEnv: process.env.XMTP_ENV ? sourced(readEnv(), 'XMTP_ENV') : fromConfig(config.env, 'production', '"env"'),
     configPath,
     statePath,
     rendezvousUrl,
@@ -1343,7 +1373,7 @@ function handleConfig(io: CliIo, context: CliContext): number {
     `State database:   ${value.statePath.value} — ${where(value.statePath, 'CONE_HOME')}`,
     `Rendezvous URL:   ${value.rendezvousUrl.value} — ${where(value.rendezvousUrl, 'CONE_RENDEZVOUS_URL')}`,
     `Secret key:       ${value.secretKey.source === 'none'
-      ? 'not set — set CONE_SECRET_KEY or run `cone login --remember`'
+      ? 'not set — run `cone init`'
       : value.secretKey.source === 'environment'
         ? `set by CONE_SECRET_KEY ${describeLocation(value.secretKey.location)}`
         : `remembered as "secretKey" in ${value.configPath.value}; CONE_SECRET_KEY would override`}`,
@@ -1389,6 +1419,16 @@ function fromConfig<T>(configured: T | undefined, fallback: T, key: string): { v
 
 function helpText(): string {
   return `Usage:
+  cone init [--env production|dev|local]      (create and persist identity; safe to repeat)
+  cone connect <inboxId|address> [--name <name>]
+  cone integrate hermes [--name <agent-name>] [--no-restart]
+  cone serve                                (persistent JSON-RPC over stdin/stdout)
+  cone mcp                                  (standard MCP tools over stdin/stdout)
+  cone receive [--consumer <name>] [--limit <n>] [--timeout-ms <ms>]
+       (pending mail from accepted peers; reading never acknowledges; exit 3 = empty)
+  cone reply --conversation <id> --text "..." --idempotency-key <key>
+  cone ack --message <messageId> [--message <messageId>] [--consumer <name>]
+       (acknowledge only messages whose work and replies completed)
   cone keygen
   cone [--json|--plain] login [--remember]
   cone [--json|--plain] login --secret-stdin [--remember]
@@ -1398,11 +1438,9 @@ function helpText(): string {
        [--reply-to <messageId>] [--idempotency-key <key>]
        (--data rides the Cone envelope as app JSON; --reply-to correlates request/response and requires --data;
         a repeated --idempotency-key returns the original send instead of publishing again)
-  cone [--json|--plain] messages [--cursor-name <name>] [--peek]
-       (sync, then print new allowed inbound messages since the durable cursor; exit 3 = nothing new)
-  cone [--json|--plain] wait [--timeout-ms <ms>] [--cursor-name <name>]
-       (drain missed messages, else block until one arrives; exit 3 on timeout)
-  cone [--json|--plain] doctor      (health checks: secret, state DB, rendezvous, XMTP; exit 0 = all ok)
+  cone messages                             (alias for receive; requires explicit ack)
+  cone wait [--timeout-ms <ms>]              (receive with a 30-second default wait)
+  cone [--json|--plain] doctor [--rendezvous]  (secret, state DB, XMTP; optional pairing service check)
   cone [--json|--plain] listen [--once] [--timeout-ms <ms>] [--auto-accept-groups-from-contacts]
        (allowed senders only; group adds stay explicit-accept unless the flag is given;
         JSON lines carry conversationKind plus senderName/groupName when known)

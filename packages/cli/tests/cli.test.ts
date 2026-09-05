@@ -248,7 +248,7 @@ describe('CLI', () => {
     expect(JSON.parse(replyText.err.join('')).error.code).toBe('USAGE');
   });
 
-  test('messages syncs, prints new mail with a cursor, and exit-codes nothing-new', async () => {
+  test('messages reads pending mail without acknowledgement and exit-codes nothing-new', async () => {
     const io = makeIo(generateSecretKey());
     const client = new MockClient();
     client.pollResult = {
@@ -261,15 +261,16 @@ describe('CLI', () => {
 
     expect(await runCli(['messages', '--secret-stdin', '--cursor-name', 'agent-main'], io, { createClient: async () => client })).toBe(0);
     expect(client.synced).toBe(true);
-    expect(client.pollRequests).toEqual([{ cursorName: 'agent-main', advance: true }]);
+    expect(client.receiveRequests).toEqual([{ consumer: 'agent-main', limit: 50, waitMs: 0 }]);
+    expect(client.acknowledged).toEqual([]);
     const output = JSON.parse(io.out.join('')) as { cursor: string; messages: Array<{ messageId: string }> };
-    expect(output.cursor).toBe('cursor-2');
+    expect(output.cursor).toBeUndefined();
     expect(output.messages[0]?.messageId).toBe('poll-1');
 
     const empty = makeIo(generateSecretKey());
     const quietClient = new MockClient();
     expect(await runCli(['messages', '--secret-stdin', '--peek'], empty, { createClient: async () => quietClient })).toBe(3);
-    expect(quietClient.pollRequests).toEqual([{ cursorName: undefined, advance: false }]);
+    expect(quietClient.acknowledged).toEqual([]);
   });
 
   test('a failed sync is an error, never \'nothing new\'', async () => {
@@ -339,7 +340,7 @@ describe('CLI', () => {
       const byName = Object.fromEntries(report.checks.map((check) => [check.name, check.ok]));
       expect(byName.secret).toBe(false);
       expect(byName['state-db']).toBe(true);
-      expect(byName.rendezvous).toBe(false);
+      expect(byName.rendezvous).toBeUndefined();
       expect(byName.xmtp).toBe(false);
     } finally {
       for (const [key, value] of [
@@ -356,11 +357,11 @@ describe('CLI', () => {
     }
   });
 
-  test('listen defaults to explicit-accept for group adds; the flag opts in', async () => {
+  test.each(['listen', 'messages', 'wait'])('%s defaults to explicit-accept for group adds; the flag opts in', async (command) => {
     const strictIo = makeIo(generateSecretKey());
     const strictClient = new MockClient();
     let strictOptions: { autoAllowGroupsFromContacts?: boolean } | undefined;
-    const strictExit = runCli(['listen', '--secret-stdin', '--once', '--timeout-ms', '50'], strictIo, {
+    const strictExit = runCli([command, '--secret-stdin', '--once', '--timeout-ms', '50'], strictIo, {
       createClient: async (_secret, options) => {
         strictOptions = options;
         return strictClient;
@@ -372,7 +373,7 @@ describe('CLI', () => {
     const optInIo = makeIo(generateSecretKey());
     const optInClient = new MockClient();
     let optInOptions: { autoAllowGroupsFromContacts?: boolean } | undefined;
-    await runCli(['listen', '--secret-stdin', '--once', '--timeout-ms', '50', '--auto-accept-groups-from-contacts'], optInIo, {
+    await runCli([command, '--secret-stdin', '--once', '--timeout-ms', '50', '--auto-accept-groups-from-contacts'], optInIo, {
       createClient: async (_secret, options) => {
         optInOptions = options;
         return optInClient;
@@ -747,6 +748,12 @@ function makeIo(
 }
 
 class MockClient implements ConeClient {
+  receiveRequests: unknown[] = [];
+  acknowledged: string[] = [];
+  async receiveMessages(options?: unknown) { this.receiveRequests.push(options); return { messages: this.pollResult.messages, more: false }; }
+  async acknowledgeMessages(ids: string[]) { this.acknowledged.push(...ids); }
+  async retryPendingSends() { return []; }
+
   conversations: ConeConversation[] = [];
   contacts: Contact[] = [];
   messages: ConeMessage[] = [];

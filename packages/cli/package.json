@@ -1,6 +1,6 @@
 {
   "name": "@cone/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "bun": ">=1.3.0"
@@ -13,6 +13,8 @@
   },
   "dependencies": {
     "@cone/core": "workspace:*",
-    "@cone/xmtp-node": "workspace:*"
+    "@cone/xmtp-node": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.3.6"
   }
 }

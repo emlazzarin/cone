@@ -22,6 +22,26 @@ import {
 } from '../src/index';
 
 describe('ConeClient', () => {
+  test('parallel blocks retain both peers and an explicit reconnect clears only its own denial', async () => {
+    const store = new MemoryStore();
+    const client = await makeClient(new FakeAdapter(), store);
+    await Promise.all(['inbox-a', 'inbox-b'].map(inboxId => client.setConsent({ inboxId }, 'denied')));
+    expect((await store.getMetadata()).deniedInboxIds).toEqual(['inbox-a', 'inbox-b']);
+    await client.saveContact({ name: 'A', inboxId: 'inbox-a' });
+    expect((await store.getMetadata()).deniedInboxIds).toEqual(['inbox-b']);
+  });
+
+  test('background outbox retries cannot unblock a peer the operator blocked', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+    let attempts = 0;
+    adapter.sendText = async () => { attempts++; throw new Error('offline'); };
+    await expect(client.sendText({ inboxId: 'inbox-peer' }, 'pending', { idempotencyKey: 'pending' })).rejects.toThrow('offline');
+    await client.setConsent({ inboxId: 'inbox-peer' }, 'denied');
+    await expect(client.retryPendingSends()).rejects.toThrow('1 pending send');
+    expect(attempts).toBe(1);
+  });
+
   test('saves contacts, deduplicates by inbox ID, and sends by contact name', async () => {
     const adapter = new FakeAdapter();
     const client = await makeClient(adapter);
@@ -69,7 +89,7 @@ describe('ConeClient', () => {
 
     await client.streamMessages((message) => {
       events.push(message);
-    });
+    }, { consentStates: ['allowed', 'unknown'] });
     await adapter.emit({
       conversationId: 'dm-inbound',
       conversationKind: 'dm',
@@ -99,13 +119,18 @@ describe('ConeClient', () => {
     expect((await restoredClient.listConversations()).find((entry) => entry.conversationId === 'dm-inbound')?.consentState).toBe('unknown');
   });
 
-  test('streams allowed-only by default (the agent trust boundary)', async () => {
+  test('new accepted DMs stream immediately while strangers stay outside the agent handler', async () => {
     const adapter = new FakeAdapter();
     const client = await makeClient(adapter);
-    await client.streamMessages(() => {});
-    expect(adapter.streamFilter).toEqual({ consentStates: ['allowed'] });
-
-    await client.streamMessages(() => {}, { consentStates: ['allowed', 'unknown'] });
+    await client.saveContact({ name: 'Peer', inboxId: 'inbox-peer' });
+    const received: string[] = [];
+    await client.streamMessages(message => { received.push(message.messageId); });
+    const message = { conversationId: 'dm-new', conversationKind: 'dm' as const, messageId: 'accepted', senderInboxId: 'inbox-peer', text: 'hello', sentAt: '2026-01-01T00:00:00.000Z', raw: {} };
+    await adapter.emit(message);
+    await adapter.emit({ ...message, conversationId: 'dm-stranger', messageId: 'request', senderInboxId: 'inbox-stranger' });
+    await client.setConsent({ inboxId: 'inbox-peer' }, 'denied');
+    await adapter.emit({ ...message, conversationId: 'dm-bypass', messageId: 'blocked' });
+    expect(received).toEqual(['accepted']);
     expect(adapter.streamFilter).toEqual({ consentStates: ['allowed', 'unknown'] });
   });
 
@@ -674,6 +699,16 @@ describe('ConeClient', () => {
     // The duplicate's history now lives under the canonical thread.
     expect((await client.listMessages('dm-canonical')).map((message) => message.messageId)).toContain('msg-old');
     expect(await client.listMessages('dm-duplicate')).toHaveLength(0);
+    const incoming = (await client.receiveMessages()).messages[0]!;
+    expect(incoming.conversationId).toBe('dm-duplicate');
+    expect((await client.receiveMessages({ excludeConversationIds: ['dm-duplicate'] })).messages).toEqual([]);
+    adapter.getConversationInfo = async id => ({ ...adapter.conversations[0]!, conversationId: id });
+    await client.sendToConversation(incoming.conversationId, 'first reply', { idempotencyKey: 'reply-old' });
+    await client.sync();
+    const replay = (await client.receiveMessages()).messages[0]!;
+    expect(replay.conversationId).toBe('dm-duplicate');
+    expect((await client.sendToConversation(replay.conversationId, 'regenerated reply', { idempotencyKey: 'reply-old' })).deduplicated).toBe(true);
+    expect(adapter.sentToConversation).toEqual([{ conversationId: 'dm-duplicate', text: 'first reply' }]);
   });
 
   test('self contacts are removed and self-DMs are hidden', async () => {
@@ -707,6 +742,70 @@ describe('ConeClient', () => {
 
     expect((await client.listContacts()).some((contact) => contact.source === 'self')).toBe(false);
     expect((await client.listConversations()).map((row) => row.conversationId)).toEqual(['dm-peer']);
+  });
+
+  test('receiving never acknowledges mail and an exact acknowledgement cannot consume a later arrival', async () => {
+    const adapter = new FakeAdapter();
+    const store = new MemoryStore();
+    adapter.conversations = [{ conversationId: 'dm-friend', kind: 'dm', peerInboxId: 'inbox-friend', title: 'Friend', consentState: 'allowed' }];
+    const message = (id: string): IncomingMessage => ({
+      conversationId: 'dm-friend', conversationKind: 'dm', messageId: id, senderInboxId: 'inbox-friend',
+      sentAt: '2026-01-01T10:00:00.000Z', text: id, raw: {},
+    });
+    adapter.networkMessages = [message('one'), message('two')];
+    const client = await makeClient(adapter, store);
+    await client.sync();
+    const first = await client.receiveMessages({ consumer: 'hermes', limit: 1 });
+    expect(first.messages.map(m => m.messageId)).toEqual(['one']);
+    expect(first.more).toBe(true);
+    expect((await client.receiveMessages({ consumer: 'hermes', limit: 1 })).messages.map(m => m.messageId)).toEqual(['one']);
+    adapter.networkMessages.push(message('three'));
+    await client.sync();
+    await client.acknowledgeMessages(['one'], { consumer: 'hermes' });
+    const restored = new MemoryStore();
+    await restored.importSnapshot(await store.exportSnapshot());
+    const restarted = await makeClient(adapter, restored);
+    expect((await restarted.receiveMessages({ consumer: 'hermes' })).messages.map(m => m.messageId)).toEqual(['two', 'three']);
+    expect((await restarted.receiveMessages({ consumer: 'another-agent' })).messages).toHaveLength(3);
+  });
+
+  test('accepting an older request makes its unacknowledged messages available', async () => {
+    const adapter = new FakeAdapter();
+    const store = new MemoryStore();
+    adapter.conversations = [{ conversationId: 'dm-stranger', kind: 'dm', peerInboxId: 'inbox-stranger', title: 'Stranger', consentState: 'unknown' }];
+    adapter.networkMessages = [{ conversationId: 'dm-stranger', conversationKind: 'dm', messageId: 'old-request', senderInboxId: 'inbox-stranger', sentAt: '2026-01-01T10:00:00.000Z', text: 'hi', raw: {} }];
+    const client = await makeClient(adapter, store);
+    await client.sync();
+    expect((await client.receiveMessages()).messages).toEqual([]);
+    await client.setConversationConsent('dm-stranger', 'allowed');
+    expect((await client.receiveMessages()).messages.map(m => m.messageId)).toEqual(['old-request']);
+  });
+
+  test('a crash after publishing retries the original encrypted payload with the same native key', async () => {
+    class InterruptedStore extends MemoryStore {
+      interrupted = false;
+      override async settleSend(key: string, sent: SentMessage) {
+        if (!this.interrupted) { this.interrupted = true; throw new Error('simulated crash after publish'); }
+        return super.settleSend(key, sent);
+      }
+    }
+    const store = new InterruptedStore();
+    const adapter = new FakeAdapter();
+    const attempts: Array<{ text: string; key?: string }> = [];
+    adapter.sendText = async (_identity, text, options: { idempotencyKey?: string } = {}) => {
+      attempts.push({ text, key: options.idempotencyKey });
+      return { messageId: 'native-deduplicated-id', conversationId: 'dm-peer', sentAt: '2026-01-01T10:00:00.000Z' };
+    };
+    const client = await makeClient(adapter, store);
+    await expect(client.sendText({ inboxId: 'inbox-peer' }, 'original reply', { idempotencyKey: 'reply-1' })).rejects.toThrow('simulated crash');
+    const pending = await store.listPendingSends();
+    expect(pending).toHaveLength(1);
+    expect(JSON.stringify(pending)).not.toContain('original reply');
+    const restarted = await makeClient(adapter, store);
+    const result = await restarted.sendText({ inboxId: 'inbox-peer' }, 'regenerated reply', { idempotencyKey: 'reply-1' });
+    expect(result.messageId).toBe('native-deduplicated-id');
+    expect(attempts).toEqual([{ text: 'original reply', key: 'reply-1' }, { text: 'original reply', key: 'reply-1' }]);
+    expect(await store.listPendingSends()).toEqual([]);
   });
 
   test('pollMessages returns new allowed inbound messages once, with a durable cursor', async () => {
@@ -861,6 +960,7 @@ async function makeClient(
 }
 
 class FakeAdapter implements XmtpAdapter {
+  getConversationInfo = async (_id: string): Promise<ConeConversation | null> => null;
   conversations: ConeConversation[] = [];
   networkMessages: IncomingMessage[] = [];
   sent: Array<{ inboxId: string; text: string }> = [];

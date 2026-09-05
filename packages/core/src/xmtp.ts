@@ -27,6 +27,7 @@ import type {
   MessageRetention,
   ResolvedIdentity,
   SentMessage,
+  SendOptions,
   Unsubscribe,
   XmtpAdapter,
   XmtpEnv,
@@ -63,10 +64,10 @@ export interface SdkConversation {
   id: string;
   topic?: string;
   createdAt?: Date;
-  sendText(text: string): Promise<string>;
+  sendText(text: string, options?: { idempotencyKey?: string }): Promise<string>;
   // Sends pre-encoded content (the Cone envelope content type). Identical
   // signature in both bindings: send(encodedContent, opts?).
-  send(encodedContent: ConeEncodedContent): Promise<string>;
+  send(encodedContent: ConeEncodedContent, options?: { idempotencyKey?: string }): Promise<string>;
   messages(options?: Record<string, unknown>): Promise<unknown[]>;
   consentState(): MaybePromise<unknown>;
   messageDisappearingSettings(): MaybePromise<SdkDisappearingSettings | null | undefined>;
@@ -119,6 +120,8 @@ export interface SdkClient {
     streamAllMessages(handlers: {
       onValue: (message: unknown) => void;
       onError: (error: unknown) => void;
+      onFail?: () => void;
+      onEnd?: () => void;
       consentStates?: unknown[];
       conversationType?: unknown;
     }): Promise<{ return(): unknown }>;
@@ -236,13 +239,13 @@ class SdkXmtpAdapter implements XmtpAdapter {
     return result.get(address) === true;
   }
 
-  async sendText(identity: ResolvedIdentity, text: string): Promise<SentMessage> {
+  async sendText(identity: ResolvedIdentity, text: string, options: SendOptions = {}): Promise<SentMessage> {
     const dm = await this.findOrCreateDm(identity);
     // conversation.sendText publishes synchronously and rejects if the message
     // cannot reach the network, so a resolved send is published. (We avoid the
     // optimistic send + publishMessages split because a failed-then-retried
     // optimistic message can later flush and duplicate.)
-    const messageId = await dm.sendText(text);
+    const messageId = await dm.sendText(text, { idempotencyKey: options.idempotencyKey });
     return {
       messageId,
       conversationId: String(dm.id ?? dm.topic ?? `dm:${identity.inboxId}`),
@@ -251,11 +254,21 @@ class SdkXmtpAdapter implements XmtpAdapter {
     };
   }
 
+  async prepareDm(identity: ResolvedIdentity): Promise<ConeConversation> {
+    return this.toDmConversation(await this.findOrCreateDm(identity));
+  }
+
+  async getConversationInfo(conversationId: string): Promise<ConeConversation | null> {
+    const conversation = await this.client.conversations.getConversationById(conversationId);
+    if (!conversation) return null;
+    return 'peerInboxId' in conversation ? this.toDmConversation(conversation) : this.toGroupConversation(conversation as SdkGroup);
+  }
+
   // Cone envelopes ride the Cone envelope content type. Same synchronous
   // publish semantics as sendText.
-  async sendEnvelope(identity: ResolvedIdentity, envelope: ConeEnvelope): Promise<SentMessage> {
+  async sendEnvelope(identity: ResolvedIdentity, envelope: ConeEnvelope, options: SendOptions = {}): Promise<SentMessage> {
     const dm = await this.findOrCreateDm(identity);
-    const messageId = await dm.send(encodeConeEnvelope(envelope));
+    const messageId = await dm.send(encodeConeEnvelope(envelope), { idempotencyKey: options.idempotencyKey });
     return {
       messageId,
       conversationId: String(dm.id ?? dm.topic ?? `dm:${identity.inboxId}`),
@@ -268,28 +281,38 @@ class SdkXmtpAdapter implements XmtpAdapter {
   // kind. The unsubscribe closes both.
   async streamMessages(handler: MessageHandler, filter?: ConsentFilter): Promise<Unsubscribe> {
     const consentStates = this.consentFilter(filter);
+    let closed = false;
+    const report = (error: unknown) => {
+      if (!closed) (filter?.onError ?? console.error)(error);
+    };
     const open = (conversationType: unknown, kind: ConversationKind) =>
       this.client.conversations.streamAllMessages({
         onValue: (message: unknown) => {
           if (isDelivered(message)) {
-            void handler(toIncomingMessage(message, kind));
+            try { void Promise.resolve(handler(toIncomingMessage(message, kind))).catch(report); }
+            catch (error) { report(error); }
           }
         },
-        onError: (error: unknown) => {
-          console.error(error);
-        },
+        onError: report,
+        onFail: () => report(new Error('XMTP message stream failed')),
+        onEnd: () => report(new Error('XMTP message stream ended')),
         conversationType,
         ...(consentStates ? { consentStates } : {}),
       });
 
-    const [dmStream, groupStream] = await Promise.all([
+    const streams = await Promise.allSettled([
       open(this.options.dmConversationType, 'dm'),
       open(this.options.groupConversationType, 'group'),
     ]);
 
-    return () => {
-      void dmStream.return();
-      void groupStream.return();
+    if (streams.some(result => result.status === 'rejected')) {
+      closed = true;
+      await Promise.all(streams.filter(result => result.status === 'fulfilled').map(result => result.value.return()));
+      throw streams.find(result => result.status === 'rejected')!.reason;
+    }
+    return async () => {
+      closed = true;
+      await Promise.all(streams.map(result => result.status === 'fulfilled' ? result.value.return() : undefined));
     };
   }
 
@@ -314,7 +337,8 @@ class SdkXmtpAdapter implements XmtpAdapter {
     // message ids dedup, so stitching SDKs are unaffected.
     const allDms = await this.client.conversations.listDms({ ...(consentStates ? { consentStates } : {}), includeDuplicateDms: true });
     const messagesOf = async (conversation: SdkConversation, kind: ConversationKind) =>
-      (await conversation.messages()).filter(isDelivered).map((message) => toIncomingMessage(message, kind));
+      (await conversation.messages(filter?.insertedAfterNs === undefined ? undefined : { insertedAfterNs: filter.insertedAfterNs }))
+        .filter(isDelivered).map((message) => toIncomingMessage(message, kind));
     const messages = (await Promise.all([
       ...allDms.map((dm) => messagesOf(dm, 'dm')),
       ...groups.map((group) => messagesOf(group, 'group')),
@@ -410,12 +434,14 @@ class SdkXmtpAdapter implements XmtpAdapter {
     await (await this.getGroup(conversationId)).removeSuperAdmin(inboxId);
   }
 
-  async sendToConversation(conversationId: string, text: string): Promise<SentMessage> {
+  async sendToConversation(conversationId: string, content: string | ConeEnvelope, options: SendOptions = {}): Promise<SentMessage> {
     const conversation = await this.client.conversations.getConversationById(conversationId);
     if (!conversation) {
       throw new Error(`conversation not found: ${conversationId}`);
     }
-    const messageId = await conversation.sendText(text);
+    const messageId = typeof content === 'string'
+      ? await conversation.sendText(content, { idempotencyKey: options.idempotencyKey })
+      : await conversation.send(encodeConeEnvelope(content), { idempotencyKey: options.idempotencyKey });
     return {
       messageId,
       conversationId,

@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import type {
@@ -9,6 +9,9 @@ import type {
   ConeStoreSnapshot,
   Contact,
   StoredMessage,
+  OutboxEntry,
+  PendingMessageOptions,
+  SentMessage,
 } from '@cone/core';
 
 export class BunSQLiteStore implements ConeStore {
@@ -17,6 +20,7 @@ export class BunSQLiteStore implements ConeStore {
   constructor(private readonly filePath: string) {
     mkdirSync(dirname(filePath), { recursive: true });
     this.db = new Database(filePath, { create: true });
+    chmodSync(filePath, 0o600);
     // Agents run `cone listen` and `cone send` concurrently against one
     // CONE_HOME. WAL lets a reader and a writer coexist, and the busy timeout
     // makes brief write overlaps queue instead of throwing SQLITE_BUSY.
@@ -162,12 +166,56 @@ export class BunSQLiteStore implements ConeStore {
     return Promise.resolve(result.changes > 0);
   }
 
+  listPendingMessages(options: PendingMessageOptions): Promise<StoredMessage[]> {
+    // JSON arrays keep the parameter count fixed even for a large address book.
+    const rows = this.db.query(`
+      select m.rowid as seq, m.data from messages m
+      where m.conversation_id in (select value from json_each(?))
+        and m.sender_inbox_id not in (select value from json_each(?))
+        and coalesce(json_extract(m.data, '$.networkConversationId'), m.conversation_id) not in (select value from json_each(?))
+        and m.rowid > ?
+        and not exists (select 1 from acknowledgements a where a.consumer = ? and a.message_id = m.message_id)
+      order by m.rowid limit ?
+    `).all(JSON.stringify(options.conversationIds), JSON.stringify(options.excludeSenderInboxIds), JSON.stringify(options.excludeConversationIds ?? []),
+      options.afterSeq ?? 0, options.consumer, options.limit) as Array<DataRow & { seq: number }>;
+    return Promise.resolve(rows.map(row => ({ ...parseDataRow<StoredMessage>(row), seq: row.seq })));
+  }
+
+  acknowledgeMessages(consumer: string, messageIds: string[]): Promise<void> {
+    const insert = this.db.query('insert or ignore into acknowledgements (consumer, message_id) values (?, ?)');
+    this.db.transaction(() => { for (const id of messageIds) insert.run(consumer, id); })();
+    return Promise.resolve();
+  }
+
+  prepareSend(entry: OutboxEntry): Promise<OutboxEntry> {
+    return Promise.resolve(this.db.transaction(() => {
+      this.db.query('insert or ignore into outbox (key, data) values (?, ?)').run(entry.key, JSON.stringify(entry));
+      return parseDataRow<OutboxEntry>(this.db.query('select data from outbox where key = ?').get(entry.key) as DataRow);
+    })());
+  }
+
+  settleSend(key: string, sent: SentMessage): Promise<void> {
+    const row = this.db.query('select data from outbox where key = ?').get(key) as DataRow | null;
+    if (!row) throw new Error('outbox entry not found');
+    const entry = parseDataRow<OutboxEntry>(row);
+    this.db.query('update outbox set data = ? where key = ?')
+      .run(JSON.stringify({ ...entry, encryptedPayload: undefined, sent }), key);
+    return Promise.resolve();
+  }
+
+  listPendingSends(): Promise<OutboxEntry[]> {
+    return Promise.resolve((this.db.query("select data from outbox where json_extract(data, '$.sent') is null").all() as DataRow[])
+      .map(parseDataRow<OutboxEntry>));
+  }
+
   getMetadata(): Promise<ConeStoreMetadata> {
     const rows = this.db.query(`select key, value from metadata`).all() as Array<{ key: string; value: string }>;
     const metadata: ConeStoreMetadata = {};
     for (const row of rows) {
       if (row.key === 'lastSyncedAt') {
         metadata.lastSyncedAt = row.value;
+      } else if (row.key === 'lastXmtpSyncStartedAt') {
+        metadata.lastXmtpSyncStartedAt = row.value;
       } else if (row.key === 'lastStreamStartedAt') {
         metadata.lastStreamStartedAt = row.value;
       } else if (row.key === 'deniedInboxIds') {
@@ -185,6 +233,17 @@ export class BunSQLiteStore implements ConeStore {
       }
     }
     return Promise.resolve(metadata);
+  }
+
+  updateDeniedInboxId(inboxId: string, denied: boolean): Promise<void> {
+    this.db.transaction(() => {
+      const row = this.db.query("select value from metadata where key = 'deniedInboxIds'").get() as { value: string } | null;
+      const ids = new Set(row ? parseStringArray(row.value) : []);
+      if (denied) ids.add(inboxId); else ids.delete(inboxId);
+      this.db.query("insert into metadata (key, value) values ('deniedInboxIds', ?) on conflict(key) do update set value = excluded.value")
+        .run(JSON.stringify([...ids].sort()));
+    })();
+    return Promise.resolve();
   }
 
   async putMetadata(metadata: ConeStoreMetadata): Promise<void> {
@@ -216,6 +275,8 @@ export class BunSQLiteStore implements ConeStore {
       metadata,
       messages,
       processedMessageIds: processedRows.map((row) => row.message_id),
+      acknowledgements: this.db.query('select consumer, message_id as messageId from acknowledgements').all() as Array<{ consumer: string; messageId: string }>,
+      outbox: (this.db.query('select data from outbox').all() as DataRow[]).map(parseDataRow<OutboxEntry>),
     };
   }
 
@@ -235,6 +296,8 @@ export class BunSQLiteStore implements ConeStore {
     for (const messageId of snapshot.processedMessageIds ?? []) {
       await this.markMessageProcessed(messageId);
     }
+    for (const ack of snapshot.acknowledgements ?? []) await this.acknowledgeMessages(ack.consumer, [ack.messageId]);
+    for (const entry of snapshot.outbox ?? []) await this.prepareSend(entry);
   }
 
   close(): void {
@@ -263,7 +326,8 @@ export class BunSQLiteStore implements ConeStore {
       );
 
       create table if not exists messages (
-        message_id text primary key,
+        seq integer primary key autoincrement,
+        message_id text not null unique,
         conversation_id text not null,
         sender_inbox_id text not null,
         sent_at text not null,
@@ -280,7 +344,31 @@ export class BunSQLiteStore implements ConeStore {
         key text primary key,
         value text not null
       );
+
+      create table if not exists acknowledgements (
+        consumer text not null,
+        message_id text not null,
+        primary key (consumer, message_id)
+      );
+      create table if not exists outbox (key text primary key, data text not null);
     `);
+    const columns = this.db.query('pragma table_info(messages)').all() as Array<{ name: string }>;
+    if (!columns.some(column => column.name === 'seq')) {
+      // Preserve existing cursor positions while preventing SQLite from reusing
+      // the highest rowid after retention or deletion removes its message.
+      this.db.transaction(() => this.db.exec(`
+        alter table messages rename to messages_before_sequence;
+        create table messages (
+          seq integer primary key autoincrement, message_id text not null unique,
+          conversation_id text not null, sender_inbox_id text not null,
+          sent_at text not null, kind text not null, data text not null
+        );
+        insert into messages select rowid, * from messages_before_sequence;
+        drop table messages_before_sequence;
+      `))();
+    }
+    this.db.exec('create index if not exists messages_by_conversation on messages (conversation_id, seq);');
+    this.db.exec("create index if not exists outbox_pending on outbox (key) where json_extract(data, '$.sent') is null;");
   }
 
   private readContact(whereClause: string, value: string): Contact | null {

@@ -47,12 +47,13 @@ export function envelopeType(value: unknown): string | undefined {
   return undefined;
 }
 
-export function isAppJsonEnvelope(value: unknown): value is { type: typeof APP_JSON_TYPE; value: unknown } {
+export function isAppJsonEnvelope(value: unknown): value is { type: typeof APP_JSON_TYPE; value: unknown; replyTo?: string } {
   return (
     envelopeType(value) === APP_JSON_TYPE &&
     typeof value === 'object' &&
     value !== null &&
-    'value' in value
+    'value' in value &&
+    (!('replyTo' in value) || value.replyTo === undefined || typeof value.replyTo === 'string')
   );
 }
 

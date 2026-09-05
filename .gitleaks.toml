@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Literal example placeholders and the web preview's mock invite"
+regexTarget = "secret"
+regexes = [
+  '''^(cos|cone)_sk_v1_REPLACE_ME$''',
+  '''^cone_gi_v1_M0ckT0kenM0ckT0ken$''',
+]

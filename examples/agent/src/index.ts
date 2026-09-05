@@ -1,60 +1,37 @@
-import { isAddressedTo } from '@cone/core';
+import { isAddressedTo, type XmtpEnv } from '@cone/core';
+import { AgentSession, createCliClient } from '@cone/cli';
+import { initializeConfig, loadSecretKey } from '../../../packages/cli/src/config';
 
-import { loadSecretKey } from '../../../packages/cli/src/config';
-import { createCliClient } from '../../../packages/cli/src/index';
-
-// The reference Cone agent: a group-capable concierge. The patterns here are
-// the ones that matter for any agent on the network:
-//
-// - **Consent is the trust boundary.** The stream defaults to allowed senders
-//   only, and `autoAllowGroupsFromContacts: false` means even a contact's
-//   group add waits for an explicit `cone requests accept`. No stranger's
-//   text ever reaches this process.
-// - **Respond only when addressed in groups.** There is no native mention
-//   type; Cone's convention is plain "@alias" text (`isAddressedTo`). An
-//   agent that replies to everything in a shared room feeds reply loops with
-//   other agents; one that replies only when addressed cannot.
-// - **Sync on a timer.** The periodic sync drains anything missed while
-//   streaming reconnected, reconciles consent decisions made elsewhere — and
-//   services any group invite links this agent minted (`cone group invite
-//   <group> --link` run against the same CONE_HOME), admitting joiners.
-//   Groups never *require* an online agent; running one just makes its own
-//   links instant.
-const ALIAS = process.env.CONE_AGENT_NAME ?? 'concierge';
-const SYNC_INTERVAL_MS = 60_000;
-
+const alias = process.env.CONE_AGENT_NAME ?? 'concierge';
+const env = process.env.XMTP_ENV;
+if (env && !['production', 'dev', 'local'].includes(env)) throw new Error('Invalid XMTP_ENV');
+initializeConfig(env as XmtpEnv | undefined);
 const client = await createCliClient(loadSecretKey(), { autoAllowGroupsFromContacts: false });
-const identity = await client.identity();
-
-console.log('Cone agent online');
-console.log(`Inbox:   ${identity.inboxId}`);
-console.log(`Address: ${identity.address ?? '(none)'}`);
-console.log(`Alias:   @${ALIAS} (groups reply only when addressed)`);
-
-await client.sync();
-setInterval(() => {
-  client.sync().catch(() => undefined);
-}, SYNC_INTERVAL_MS);
-
-await client.streamMessages(async (message) => {
-  if (!message.text) {
-    return;
-  }
-  const from = message.senderInboxId.slice(0, 8);
-
-  if (message.conversationKind === 'group') {
-    console.log(`[group ${message.conversationId.slice(0, 8)}] ${from}…: ${message.text}`);
-    if (!isAddressedTo(message.text, [ALIAS])) {
-      return;
+const session = new AgentSession(client);
+const shutdown = new AbortController();
+const stop = () => shutdown.abort();
+process.once('SIGINT', stop);
+process.once('SIGTERM', stop);
+try {
+  await session.start();
+  console.log(JSON.stringify({ ...await client.identity(), alias }));
+  while (!shutdown.signal.aborted) {
+    const batch = await session.receive({ consumer: 'concierge', waitMs: 30000, signal: shutdown.signal });
+    for (const message of batch.messages) {
+      if (message.text && (message.conversationKind === 'group'
+        ? isAddressedTo(message.text, [alias]) : message.text.trim().toLowerCase() === 'ping')) {
+        await client.sendToConversation(message.conversationId, 'pong', { idempotencyKey: `concierge:${message.messageId}` });
+      }
+      // This example intentionally ignores other content. Failed sends throw
+      // before acknowledgement, leaving the request for the next run.
+      await session.acknowledge([message.messageId], 'concierge');
     }
-    await client.sendToConversation(message.conversationId, `@${from}… you rang — I'm here.`);
-    return;
   }
-
-  console.log(`[dm] ${from}…: ${message.text}`);
-  if (message.text.trim().toLowerCase() === 'ping') {
-    await client.sendText({ inboxId: message.senderInboxId }, 'pong');
-  }
-});
-
-await new Promise(() => undefined);
+} catch (error) {
+  if (!shutdown.signal.aborted) throw error;
+} finally {
+  await session.close();
+  await client.close();
+  process.off('SIGINT', stop);
+  process.off('SIGTERM', stop);
+}
