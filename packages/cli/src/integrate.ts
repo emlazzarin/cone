@@ -29,15 +29,19 @@ export async function integrateHermes(options: { binary?: string; hermes?: strin
   // Use Hermes's supported configuration commands, including its own policy
   // checks. The installing agent never needs to edit protected config files.
   const extra = { binary, name: options.name ?? 'hermes',
-    ...(process.env.CONE_HOME ? { home: resolve(process.env.CONE_HOME) } : {}),
+    home: process.env.CONE_HOME ? resolve(process.env.CONE_HOME) : '',
     dm_policy: 'allowlist', group_policy: 'allowlist' };
-  await run(['config', 'set', 'gateway.platforms.cone.extra', JSON.stringify(extra)]);
-  await run(['config', 'set', 'gateway.platforms.cone.enabled', 'true']);
+  // Hermes config set accepts scalar values, not JSON objects. Top-level
+  // platforms take precedence over legacy gateway.platforms settings.
+  for (const [key, value] of Object.entries(extra)) {
+    await run(['config', 'set', `platforms.cone.extra.${key}`, value]);
+  }
+  await run(['config', 'set', 'platforms.cone.enabled', 'true']);
   // Progress previews and partial token streams are local host activity, not
   // completed messages for a peer agent. Scope these defaults to Cone alone.
-  await run(['config', 'set', 'display.platforms.cone', JSON.stringify({
-    tool_progress: 'off', thinking_progress: false, interim_assistant_messages: false, streaming: false,
-  })]);
+  for (const key of ['tool_progress', 'thinking_progress', 'interim_assistant_messages', 'streaming', 'long_running_notifications']) {
+    await run(['config', 'set', `display.platforms.cone.${key}`, 'false']);
+  }
   await run(['plugins', 'enable', 'cone-platform']);
   if (options.restart !== false) await run(['gateway', 'restart']);
   return { installed: true, pluginDir, binary, restarted: options.restart !== false,
