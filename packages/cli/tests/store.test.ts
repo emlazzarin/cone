@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { existsSync, rmSync } from 'node:fs';
 
 import { deriveAccount, encryptJson, secretKeyFromHexSeed, type ConeConversation, type Contact, type StoredMessage } from '@cone/core';
@@ -16,6 +17,41 @@ afterEach(() => {
 });
 
 describe('BunSQLiteStore', () => {
+  test('upgrades the old message table without reusing a deleted ingestion sequence', async () => {
+    const path = tempPath();
+    const old = new Database(path);
+    old.exec('create table messages (message_id text primary key, conversation_id text not null, sender_inbox_id text not null, sent_at text not null, kind text not null, data text not null)');
+    old.query('insert into messages values (?, ?, ?, ?, ?, ?)').run('old', 'dm', 'peer', '2026-01-01', 'text', '{}');
+    old.close();
+    const store = new BunSQLiteStore(path);
+    expect((await store.listMessages())[0]?.seq).toBe(1);
+    await store.deleteMessage('old');
+    const account = deriveAccount(secretKeyFromHexSeed('08'.repeat(32)), { env: 'dev' });
+    await store.putMessage({ messageId: 'new', conversationId: 'dm', senderInboxId: 'peer', sentAt: '2026-01-02', kind: 'text', encryptedPayload: await encryptJson(account.coneStorageKey, 'test', 'hello') });
+    expect((await store.listMessages())[0]?.seq).toBe(2);
+    store.close();
+  });
+
+  test('two connections share exact acknowledgements and atomically keep the first pending send', async () => {
+    const path = tempPath();
+    const a = new BunSQLiteStore(path);
+    const b = new BunSQLiteStore(path);
+    const account = deriveAccount(secretKeyFromHexSeed('09'.repeat(32)), { env: 'dev' });
+    const encryptedPayload = await encryptJson(account.coneStorageKey, 'test', 'reply');
+    for (const messageId of ['one', 'two']) await a.putMessage({ messageId, conversationId: 'dm', senderInboxId: 'peer', sentAt: '2026-01-01', kind: 'text', encryptedPayload });
+    await b.acknowledgeMessages('hermes', ['one']);
+    const query = { consumer: 'hermes', conversationIds: ['dm'], excludeSenderInboxIds: [], limit: 10 };
+    expect((await a.listPendingMessages(query)).map(m => m.messageId)).toEqual(['two']);
+    const first = { key: 'reply-one', scope: 'peer', kind: 'text' as const, encryptedPayload };
+    const records = await Promise.all([a.prepareSend(first), b.prepareSend({ ...first, scope: 'different-peer' })]);
+    expect(records).toEqual([first, first]);
+    a.close(); b.close();
+    const reopened = new BunSQLiteStore(path);
+    expect((await reopened.listPendingMessages(query)).map(m => m.messageId)).toEqual(['two']);
+    expect(await reopened.listPendingSends()).toEqual([first]);
+    reopened.close();
+  });
+
   test('persists contacts, messages, processed IDs, and snapshots', async () => {
     const path = tempPath();
     const account = deriveAccount(secretKeyFromHexSeed('06'.repeat(32)), { env: 'dev' });

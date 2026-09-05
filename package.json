@@ -1,6 +1,6 @@
 {
   "name": "cone",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -12,6 +12,7 @@
     "examples/*"
   ],
   "scripts": {
+    "build:cli": "bun run scripts/build-cli.ts",
     "setup": "bun run scripts/setup.ts",
     "build": "bun run --cwd apps/web build && bun run --cwd apps/rendezvous build",
     "dev:web": "bun run --cwd apps/web dev",

@@ -1,4 +1,4 @@
-import { Client, ConsentEntityType, ConsentState, ConversationType, GroupPermissionsOptions, IdentifierKind, PermissionLevel, type ClientOptions, type Identifier, type XmtpEnv as SdkXmtpEnv } from '@xmtp/node-sdk';
+import { Client, ConsentEntityType, ConsentState, ConversationType, GroupPermissionsOptions, IdentifierKind, LogLevel, PermissionLevel, type ClientOptions, type Identifier, type XmtpEnv as SdkXmtpEnv } from '@xmtp/node-sdk';
 import type { ContentCodec } from '@xmtp/content-type-primitives';
 import { createConeEnvelopeCodec, hexToBytes, type DerivedAccount, type XmtpAdapter } from '@cone/core';
 import { createSdkXmtpAdapter, type SdkClient, type SdkDm, type SdkGroup } from '@cone/core/xmtp';
@@ -10,6 +10,7 @@ export interface NodeXmtpAdapterOptions {
 }
 
 export async function createNodeXmtpAdapter(options: NodeXmtpAdapterOptions): Promise<XmtpAdapter> {
+  process.env.XMTP_STREAM_WATCHDOG_ENABLED ??= 'true';
   const wallet = privateKeyToAccount(options.account.walletPrivateKey);
   const address = wallet.address.toLowerCase();
   const signer = {
@@ -22,6 +23,10 @@ export async function createNodeXmtpAdapter(options: NodeXmtpAdapterOptions): Pr
     dbEncryptionKey: hexToBytes(options.account.xmtpDbEncryptionKey),
     dbPath: options.dbPath,
     env: options.account.env as SdkXmtpEnv,
+    waitForRegistrationVisible: { timeoutMs: 30000 },
+    // stdout is the CLI / adapter protocol. Network errors are reported by
+    // the adapter on stderr; native diagnostics must not corrupt JSON frames.
+    stdoutLoggingLevel: LogLevel.Off,
     // Inbound Cone envelopes (read receipts, pair confirms, app JSON) decode
     // via this codec; without it their content would arrive undefined.
     codecs: [createConeEnvelopeCodec() as unknown as ContentCodec],

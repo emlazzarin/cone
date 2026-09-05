@@ -1,13 +1,13 @@
 {
   "name": "@cone/xmtp-browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
   },
   "dependencies": {
     "@cone/core": "workspace:*",
-    "@xmtp/browser-sdk": "7.0.0",
+    "@xmtp/browser-sdk": "7.1.0",
     "@xmtp/content-type-primitives": "3.0.0",
     "viem": "^2.40.0"
   }

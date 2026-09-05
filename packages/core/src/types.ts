@@ -127,6 +127,7 @@ export interface ConeConversation {
 export interface ConeStoreMetadata {
   lastStreamStartedAt?: string;
   lastSyncedAt?: string;
+  lastXmtpSyncStartedAt?: string;
   // Inboxes this account has denied, maintained by Cone-side consent writes.
   // XMTP gates group delivery at the conversation level only, so this is what
   // lets the read model drop a denied sender's messages inside allowed groups.
@@ -135,12 +136,10 @@ export interface ConeStoreMetadata {
   pendingGroupJoins?: PendingGroupJoin[];
   // Async invite links minted by this account, serviced during sync.
   groupInviteLinks?: GroupInviteLink[];
-  // Durable poll cursors, keyed by caller-supplied name (opaque values —
-  // see ConeClient.pollMessages). A crashed agent never loses its place.
+  // Legacy poll cursors. Agent delivery uses explicit acknowledgements.
   pollCursors?: Record<string, string>;
-  // Idempotency-key ledger for sends, newest last, capped (IDEMPOTENCY_CAP).
-  // scope = the resolved recipient; a record without messageId is a claim
-  // whose send is in flight (or died mid-flight).
+  // Legacy send results from before native XMTP idempotency. A record without
+  // messageId is ambiguous and cannot be retried automatically.
   idempotencySends?: Array<{ key: string; scope: string; messageId?: string; conversationId?: string; sentAt?: string }>;
   // Locally deleted conversations (conversationId → deletedAt). Deleting a
   // chat is a local act — the XMTP conversation still exists and sync keeps
@@ -151,6 +150,8 @@ export interface ConeStoreMetadata {
 
 export interface StoredMessage {
   messageId: string;
+  // Preserve the exact MLS route when the UI combines duplicate DM histories.
+  networkConversationId?: string;
   // Store-stamped ingestion order (SQLite rowid / memory counter), assigned on
   // first insert and preserved across updates. Poll cursors ride this — never
   // sender-supplied sentAt, which can arrive out of order.
@@ -161,6 +162,30 @@ export interface StoredMessage {
   sentAt: string;
   kind: 'text' | 'json' | 'control';
   encryptedPayload: EncryptedJson;
+}
+
+export interface OutboxEntry {
+  key: string;
+  // A canonical inbox id, or conversation:<id> for an exact conversation.
+  scope: string;
+  conversationId?: string;
+  kind: 'text' | 'json';
+  encryptedPayload?: EncryptedJson;
+  sent?: SentMessage;
+}
+
+export interface MessageAcknowledgement {
+  consumer: string;
+  messageId: string;
+}
+
+export interface PendingMessageOptions {
+  consumer: string;
+  conversationIds: string[];
+  excludeSenderInboxIds: string[];
+  excludeConversationIds?: string[];
+  afterSeq?: number;
+  limit: number;
 }
 
 export interface ConeMessage {
@@ -236,6 +261,8 @@ export interface MessageListOptions {
 // the strict default that backs the agent trust boundary.
 export interface ConsentFilter {
   consentStates?: ConeConsentState[];
+  onError?: (error: unknown) => void;
+  insertedAfterNs?: bigint;
 }
 
 export interface XmtpSyncResult {
@@ -375,12 +402,14 @@ export interface XmtpAdapter {
   identity(): Promise<ConeIdentity>;
   resolveIdentity(ref: IdentityRef): Promise<ResolvedIdentity | null>;
   canMessage(identity: ResolvedIdentity): Promise<boolean>;
-  sendText(identity: ResolvedIdentity, text: string): Promise<SentMessage>;
+  prepareDm?(identity: ResolvedIdentity): Promise<ConeConversation>;
+  getConversationInfo?(conversationId: string): Promise<ConeConversation | null>;
+  sendText(identity: ResolvedIdentity, text: string, options?: SendOptions): Promise<SentMessage>;
   // Send a Cone envelope (control message or app JSON) to a DM peer. Rides the
   // Cone envelope content type, never text — see content-type.ts.
-  sendEnvelope(identity: ResolvedIdentity, envelope: ConeEnvelope): Promise<SentMessage>;
+  sendEnvelope(identity: ResolvedIdentity, envelope: ConeEnvelope, options?: SendOptions): Promise<SentMessage>;
   // Send into an existing conversation by id — works for DMs and groups.
-  sendToConversation(conversationId: string, text: string): Promise<SentMessage>;
+  sendToConversation(conversationId: string, content: string | ConeEnvelope, options?: SendOptions): Promise<SentMessage>;
   sync(filter?: ConsentFilter): Promise<XmtpSyncResult>;
   streamMessages(handler: MessageHandler, filter?: ConsentFilter): Promise<Unsubscribe>;
   listConversations(filter?: ConsentFilter): Promise<ConeConversation[]>;
@@ -423,6 +452,8 @@ export interface ConeStoreSnapshot {
   metadata: ConeStoreMetadata;
   messages: StoredMessage[];
   processedMessageIds: string[];
+  acknowledgements?: MessageAcknowledgement[];
+  outbox?: OutboxEntry[];
 }
 
 export interface ConeStore {
@@ -442,6 +473,13 @@ export interface ConeStore {
   listMessages(conversationId?: string): Promise<StoredMessage[]>;
   deleteMessage(messageId: string): Promise<void>;
   markMessageProcessed(messageId: string): Promise<boolean>;
+  listPendingMessages(options: PendingMessageOptions): Promise<StoredMessage[]>;
+  acknowledgeMessages(consumer: string, messageIds: string[]): Promise<void>;
+  // Atomic insert-if-absent. The first payload owns the key, including after
+  // an interrupted publish; retries always use that stored payload.
+  prepareSend(entry: OutboxEntry): Promise<OutboxEntry>;
+  settleSend(key: string, sent: SentMessage): Promise<void>;
+  listPendingSends(): Promise<OutboxEntry[]>;
 
   getMetadata(): Promise<ConeStoreMetadata>;
   putMetadata(metadata: ConeStoreMetadata): Promise<void>;
@@ -465,10 +503,11 @@ export interface ConeClient {
   sendText(to: IdentityRef, text: string, options?: SendOptions): Promise<SentMessage>;
   // replyTo correlation rides the app-JSON envelope, so it is json-only.
   sendJson(to: IdentityRef, value: unknown, options?: SendOptions): Promise<SentMessage>;
-  // Send into an existing conversation by id. DMs route through the identity
-  // path (same reachability/consent semantics as sendText); groups publish to
-  // the group and imply group consent.
-  sendToConversation(conversationId: string, text: string): Promise<SentMessage>;
+  // Send into the exact XMTP conversation; sending implies consent.
+  sendToConversation(conversationId: string, text: string, options?: SendOptions): Promise<SentMessage>;
+  receiveMessages(options?: { consumer?: string; limit?: number; excludeConversationIds?: string[] }): Promise<{ messages: ConeMessage[]; more: boolean }>;
+  acknowledgeMessages(messageIds: string[], options?: { consumer?: string }): Promise<void>;
+  retryPendingSends(): Promise<SentMessage[]>;
   // The poll-shaped read model for turn-based agents (wake → check → sleep):
   // returns inbound, visible messages from allowed conversations that arrived
   // since the named cursor's last position. Callers sync() first. With

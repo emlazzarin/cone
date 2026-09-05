@@ -8,6 +8,9 @@ import {
   type ConeConversation,
   type Contact,
   type StoredMessage,
+  type OutboxEntry,
+  type PendingMessageOptions,
+  type SentMessage,
 } from '@cone/core';
 
 const STORE_NAME = 'encrypted-state';
@@ -16,6 +19,35 @@ const SNAPSHOT_KEY = 'snapshot';
 export class IndexedDbStore implements ConeStore {
   private readonly memory = new MemoryStore();
   private loaded = false;
+
+  async listPendingMessages(options: PendingMessageOptions): Promise<StoredMessage[]> {
+    await this.load();
+    return this.memory.listPendingMessages(options);
+  }
+
+  async acknowledgeMessages(consumer: string, messageIds: string[]): Promise<void> {
+    await this.load();
+    await this.memory.acknowledgeMessages(consumer, messageIds);
+    await this.save();
+  }
+
+  async prepareSend(entry: OutboxEntry): Promise<OutboxEntry> {
+    await this.load();
+    const stored = await this.memory.prepareSend(entry);
+    await this.save();
+    return stored;
+  }
+
+  async settleSend(key: string, sent: SentMessage): Promise<void> {
+    await this.load();
+    await this.memory.settleSend(key, sent);
+    await this.save();
+  }
+
+  async listPendingSends(): Promise<OutboxEntry[]> {
+    await this.load();
+    return this.memory.listPendingSends();
+  }
 
   constructor(
     private readonly dbName: string,

@@ -63,6 +63,7 @@ import type {
   SendOptions,
   SentMessage,
   StoredMessage,
+  OutboxEntry,
   SyncResult,
   Unsubscribe,
 } from './types';
@@ -131,29 +132,22 @@ class ConeClientImpl implements ConeClient {
       throw new Error('message text is required');
     }
     const resolved = await this.resolveIdentity(to);
-    const recalled = await this.claimIdempotentSend(options.idempotencyKey, resolved.inboxId);
-    if (recalled) {
-      return recalled;
-    }
-    try {
+    return this.performSend(resolved.inboxId, 'text', text, options, async (payload, conversationId) => {
       if (!(await this.options.xmtp.canMessage(resolved))) {
         throw new ConeError('NOT_MESSAGEABLE', 'identity is not XMTP-reachable');
       }
 
-      const sent = await this.options.xmtp.sendText(resolved, text);
-      await this.persistOutbound(sent, resolved, 'text', text);
+      const body = payload as string;
+      const sent = conversationId
+        ? await this.options.xmtp.sendToConversation(conversationId, body, options)
+        : await this.options.xmtp.sendText(resolved, body, options);
+      await this.persistOutbound(sent, resolved, 'text', body);
       // Sending implies consent: the recipient leaves "unknown" so a reply never
       // lands in Requests. persistOutbound already stamped the local mirror
       // allowed; this propagates it to the network (best-effort).
       await this.setConsentSafe(resolved.inboxId, 'allowed');
-      await this.settleIdempotentSend(options.idempotencyKey, sent);
       return sent;
-    } catch (error) {
-      // A definite failure releases the claim so the caller may retry; only a
-      // crash (nothing runs) leaves it pending — the honest at-most-once case.
-      await this.releaseIdempotentSend(options.idempotencyKey);
-      throw error;
-    }
+    });
   }
 
   // App JSON rides the Cone envelope content type (with a human-readable
@@ -162,37 +156,32 @@ class ConeClientImpl implements ConeClient {
   // request/response over async messaging) is an additive envelope field.
   async sendJson(to: IdentityRef, value: unknown, options: SendOptions = {}): Promise<SentMessage> {
     const resolved = await this.resolveIdentity(to);
-    const recalled = await this.claimIdempotentSend(options.idempotencyKey, resolved.inboxId);
-    if (recalled) {
-      return recalled;
-    }
-    try {
+    const envelope = { type: APP_JSON_TYPE, value, ...(options.replyTo ? { replyTo: options.replyTo } : {}) };
+    return this.performSend(resolved.inboxId, 'json', envelope, options, async (payload, conversationId) => {
       if (!(await this.options.xmtp.canMessage(resolved))) {
         throw new ConeError('NOT_MESSAGEABLE', 'identity is not XMTP-reachable');
       }
 
-      const envelope = { type: APP_JSON_TYPE, value, ...(options.replyTo ? { replyTo: options.replyTo } : {}) };
-      const sent = await this.options.xmtp.sendEnvelope(resolved, envelope);
-      await this.persistOutbound(sent, resolved, 'json', envelope);
+      const body = payload as typeof envelope;
+      const sent = conversationId
+        ? await this.options.xmtp.sendToConversation(conversationId, body, options)
+        : await this.options.xmtp.sendEnvelope(resolved, body, options);
+      await this.persistOutbound(sent, resolved, 'json', body);
       await this.setConsentSafe(resolved.inboxId, 'allowed');
-      await this.settleIdempotentSend(options.idempotencyKey, sent);
       return sent;
-    } catch (error) {
-      await this.releaseIdempotentSend(options.idempotencyKey);
-      throw error;
-    }
+    });
   }
 
-  // At-most-once idempotency: the key is CLAIMED (recorded scoped to the
-  // resolved recipient) before publishing and settled with the messageId
-  // after. A retry that finds a settled record gets the original back; one
-  // that finds an unsettled claim gets IDEMPOTENCY_IN_FLIGHT — the previous
-  // attempt may or may not have published, and guessing would double-send.
-  // The ledger is capped: it protects crash-retry loops, not forever-uniqueness.
-  private async claimIdempotentSend(key: string | undefined, scope: string): Promise<SentMessage | null> {
+  // The first payload owns a key. Store it before any network effect; native
+  // XMTP idempotency covers a crash after publication but before settlement.
+  private async performSend(scope: string, kind: 'text' | 'json', payload: unknown, options: SendOptions,
+    publish: (payload: unknown, conversationId?: string) => Promise<SentMessage>): Promise<SentMessage> {
+    const key = options.idempotencyKey;
     if (!key) {
-      return null;
+      return publish(payload);
     }
+    // Pre-6.1 sends did not carry a native key. Preserve their original
+    // results and fail closed for an ambiguous legacy send during upgrades.
     const records = (await this.options.store.getMetadata()).idempotencySends ?? [];
     const match = records.find((record) => record.key === key);
     if (match) {
@@ -204,46 +193,52 @@ class ConeClientImpl implements ConeClient {
       }
       return { messageId: match.messageId, conversationId: match.conversationId, sentAt: match.sentAt, deduplicated: true };
     }
-    await this.options.store.putMetadata({ idempotencySends: [...records, { key, scope }].slice(-IDEMPOTENCY_CAP) });
-    return null;
-  }
-
-  private async settleIdempotentSend(key: string | undefined, sent: SentMessage): Promise<void> {
-    if (!key) {
-      return;
-    }
-    const records = (await this.options.store.getMetadata()).idempotencySends ?? [];
-    await this.options.store.putMetadata({
-      idempotencySends: records.map((record) =>
-        record.key === key
-          ? { ...record, messageId: sent.messageId, conversationId: sent.conversationId, sentAt: sent.sentAt }
-          : record),
+    const entry = await this.options.store.prepareSend({
+      key, scope, kind,
+      // Freeze the MLS conversation before publishing. A competing DM can
+      // change the SDK's canonical choice while an interrupted send retries.
+      conversationId: scope.startsWith('conversation:') ? scope.slice(13) :
+        (await this.options.xmtp.prepareDm?.({ inboxId: scope, source: 'inboxId' }))?.conversationId,
+      encryptedPayload: await encryptJson(this.options.account.coneStorageKey, 'cone.outbox.v1', payload),
     });
-  }
-
-  private async releaseIdempotentSend(key: string | undefined): Promise<void> {
-    if (!key) {
-      return;
+    if (entry.scope !== scope || entry.kind !== kind) {
+      throw new ConeError('IDEMPOTENCY_CONFLICT', `idempotency key ${key} was already used for a different recipient or content type`);
     }
-    const records = (await this.options.store.getMetadata()).idempotencySends ?? [];
-    await this.options.store.putMetadata({
-      idempotencySends: records.filter((record) => !(record.key === key && !record.messageId)),
-    });
+    if (entry.sent) return { ...entry.sent, deduplicated: true };
+    if (!entry.encryptedPayload) throw new Error('pending send has no payload');
+    const original = await decryptJson(this.options.account.coneStorageKey, entry.encryptedPayload);
+    const sent = await publish(original, entry.conversationId);
+    await this.options.store.settleSend(key, sent);
+    return sent;
   }
 
-  // Send into an existing conversation. DMs route through the identity path so
-  // reachability checks and implied peer consent behave exactly like sendText;
-  // groups publish to the group, and sending implies group consent.
-  async sendToConversation(conversationId: string, text: string): Promise<SentMessage> {
-    const conversation = await this.options.store.getConversationById(conversationId);
+  async retryPendingSends(): Promise<SentMessage[]> {
+    const results: SentMessage[] = [];
+    const errors: unknown[] = [];
+    for (const entry of await this.options.store.listPendingSends()) {
+      try { results.push(await this.retrySend(entry)); }
+      catch (error) { errors.push(error); }
+    }
+    if (errors.length) throw new AggregateError(errors, `${errors.length} pending send(s) could not be published`);
+    return results;
+  }
+
+  private async retrySend(entry: OutboxEntry): Promise<SentMessage> {
+    if (!entry.encryptedPayload) throw new Error('pending send has no payload');
+    const payload = await decryptJson<unknown>(this.options.account.coneStorageKey, entry.encryptedPayload);
+    const options = { idempotencyKey: entry.key };
+    if (entry.scope.startsWith('conversation:')) return this.sendToConversation(entry.scope.slice(13), payload as string, options);
+    if (entry.kind === 'text') return this.sendText({ inboxId: entry.scope }, payload as string, options);
+    if (!isAppJsonEnvelope(payload)) throw new Error('invalid pending JSON send');
+    return this.sendJson({ inboxId: entry.scope }, payload.value, { ...options, replyTo: payload.replyTo });
+  }
+
+  // Replies stay in the exact MLS conversation that received the request.
+  async sendToConversation(conversationId: string, text: string, options: SendOptions = {}): Promise<SentMessage> {
+    const conversation = await this.options.store.getConversationById(conversationId)
+      ?? await this.options.xmtp.getConversationInfo?.(conversationId);
     if (!conversation) {
       throw new Error(`conversation not found: ${conversationId}`);
-    }
-    if (conversation.kind !== 'group') {
-      if (!conversation.peerInboxId) {
-        throw new Error(`conversation has no peer: ${conversationId}`);
-      }
-      return this.sendText({ inboxId: conversation.peerInboxId }, text);
     }
     if (conversation.active === false) {
       throw new ConeError('NOT_A_MEMBER', 'you are no longer a member of this group');
@@ -252,8 +247,10 @@ class ConeClientImpl implements ConeClient {
       throw new Error('message text is required');
     }
 
+    return this.performSend(`conversation:${conversationId}`, 'text', text, options, async payload => {
+    const body = payload as string;
     const identity = await this.identity();
-    const sent = await this.options.xmtp.sendToConversation(conversationId, text);
+    const sent = await this.options.xmtp.sendToConversation(conversationId, body, options);
     await this.options.store.putConversation({
       ...conversation,
       updatedAt: sent.sentAt,
@@ -265,13 +262,15 @@ class ConeClientImpl implements ConeClient {
       senderInboxId: identity.inboxId,
       sentAt: sent.sentAt,
       kind: 'text',
-      encryptedPayload: await encryptJson(this.options.account.coneStorageKey, 'cone.message.v1', text),
+      encryptedPayload: await encryptJson(this.options.account.coneStorageKey, 'cone.message.v1', body),
     });
     // Sending implies consent, same as DMs; the mirror is already stamped.
-    await this.setGroupConsentSafe(conversationId, 'allowed');
+    if (conversation.kind === 'group') await this.setGroupConsentSafe(conversationId, 'allowed');
+    else if (conversation.peerInboxId) await this.setConsentSafe(conversation.peerInboxId, 'allowed');
     // Sending into a locally deleted chat brings it back.
     await this.unhideConversation(conversationId, sent.sentAt);
     return sent;
+    });
   }
 
   // Create a group. The creator is added (and made super admin) by XMTP
@@ -429,7 +428,7 @@ class ConeClientImpl implements ConeClient {
       // allowed group still delivers messages from inboxes this account has
       // denied. Drop them before the handler — the block list follows you
       // into groups, and a denied sender must never reach an agent loop.
-      if (message.conversationKind === 'group' && (await this.deniedInboxIds()).has(message.senderInboxId)) {
+      if ((await this.deniedInboxIds()).has(message.senderInboxId)) {
         return;
       }
       const isNew = await this.options.store.markMessageProcessed(message.messageId);
@@ -438,8 +437,14 @@ class ConeClientImpl implements ConeClient {
       }
 
       await this.persistNetworkMessage(message);
-      await handler(message);
-    }, filter);
+      const conversation = await this.options.store.getConversationById(message.conversationId);
+      if (conversation && (filter.consentStates ?? ['allowed']).includes(conversation.consentState ?? 'unknown')) {
+        await handler(message);
+      }
+    // New DM welcomes can initially be unknown even for an accepted inbox.
+    // Apply consent locally before calling the consumer, without waiting for
+    // periodic sync to notice the conversation. Unknown bodies stay in storage.
+    }, { ...filter, consentStates: ['allowed', 'unknown'] });
   }
 
   async sync(): Promise<SyncResult> {
@@ -451,7 +456,14 @@ class ConeClientImpl implements ConeClient {
     try {
       // Sync allowed + unknown (so Requests populate) but never denied —
       // blocked senders stay out of the local read model. Views filter further.
-      const result = await this.options.xmtp.sync({ consentStates: ['allowed', 'unknown'] });
+      const previous = (await this.options.store.getMetadata()).lastXmtpSyncStartedAt;
+      const previousMs = previous ? Date.parse(previous) : NaN;
+      // Native insertion time is local, unlike sender-controlled sentAt. Use
+      // the start of the last completed sync so concurrent arrivals and crash
+      // recovery overlap safely. A local clock rollback triggers a full read.
+      const insertedAfterNs = Number.isFinite(previousMs) && previousMs <= Date.parse(startedAt)
+        ? BigInt(previousMs) * 1_000_000n - 1n : undefined;
+      const result = await this.options.xmtp.sync({ consentStates: ['allowed', 'unknown'], insertedAfterNs });
       for (const conversation of result.conversations) {
         await this.options.store.putConversation(await this.applyGroupAddPolicy(conversation));
         conversationsSynced += 1;
@@ -480,7 +492,7 @@ class ConeClientImpl implements ConeClient {
 
     const completedAt = this.nowIso();
     if (errors.length === 0) {
-      await this.options.store.putMetadata({ lastSyncedAt: completedAt });
+      await this.options.store.putMetadata({ lastSyncedAt: completedAt, lastXmtpSyncStartedAt: startedAt });
     }
 
     return {
@@ -515,7 +527,7 @@ class ConeClientImpl implements ConeClient {
         continue;
       }
       for (const message of await this.options.store.listMessages(row.conversationId)) {
-        await this.options.store.putMessage({ ...message, conversationId: canonical });
+        await this.options.store.putMessage({ ...message, networkConversationId: message.networkConversationId ?? message.conversationId, conversationId: canonical });
       }
       await this.options.store.deleteConversation(row.conversationId);
     }
@@ -592,9 +604,43 @@ class ConeClientImpl implements ConeClient {
   }
 
   async listMessages(conversationId?: string): Promise<ConeMessage[]> {
-    const [identity, messages, conversations, denied] = await Promise.all([
+    return this.decodeMessages(await this.options.store.listMessages(conversationId));
+  }
+
+  async receiveMessages(options: { consumer?: string; limit?: number; excludeConversationIds?: string[] } = {}): Promise<{ messages: ConeMessage[]; more: boolean }> {
+    const consumer = options.consumer ?? 'default';
+    const limit = options.limit ?? 50;
+    if (!consumer.trim() || !Number.isSafeInteger(limit) || limit < 1) throw new Error('receive requires a consumer and a positive integer limit');
+    const [conversations, identity, denied] = await Promise.all([this.listConversations(), this.identity(), this.deniedInboxIds()]);
+    const conversationIds = conversations.filter(c => c.consentState === 'allowed').map(c => c.conversationId);
+    const messages: ConeMessage[] = [];
+    let afterSeq = 0;
+    while (messages.length <= limit) {
+      const rows = await this.options.store.listPendingMessages({
+        consumer, conversationIds, excludeConversationIds: options.excludeConversationIds,
+        excludeSenderInboxIds: [identity.inboxId, ...denied], afterSeq, limit: limit + 1,
+      });
+      if (!rows.length) break;
+      afterSeq = rows[rows.length - 1]!.seq ?? 0;
+      const visible = (await this.decodeMessages(rows, true)).filter(isVisibleChatMessage);
+      messages.push(...visible);
+      // Control records and expired messages never require agent handling.
+      const visibleIds = new Set(visible.map(message => message.messageId));
+      await this.options.store.acknowledgeMessages(consumer, rows.filter(row => !visibleIds.has(row.messageId)).map(row => row.messageId));
+      if (rows.length < limit + 1) break;
+    }
+    return { messages: messages.slice(0, limit), more: messages.length > limit };
+  }
+
+  acknowledgeMessages(messageIds: string[], options: { consumer?: string } = {}): Promise<void> {
+    const consumer = options.consumer ?? 'default';
+    if (!consumer.trim() || messageIds.some(id => typeof id !== 'string' || !id)) throw new Error('invalid acknowledgement');
+    return this.options.store.acknowledgeMessages(consumer, messageIds);
+  }
+
+  private async decodeMessages(messages: StoredMessage[], networkRoutes = false): Promise<ConeMessage[]> {
+    const [identity, conversations, denied] = await Promise.all([
       this.identity(),
-      this.options.store.listMessages(conversationId),
       this.options.store.listConversations(),
       this.deniedInboxIds(),
     ]);
@@ -628,7 +674,7 @@ class ConeClientImpl implements ConeClient {
       const envelopeReplyTo = isAppJsonEnvelope(json) ? (json as unknown as { replyTo?: unknown }).replyTo : undefined;
       const replyTo = typeof envelopeReplyTo === 'string' ? envelopeReplyTo : undefined;
       return {
-        conversationId: message.conversationId,
+        conversationId: networkRoutes ? message.networkConversationId ?? message.conversationId : message.conversationId,
         conversationKind: kindByConversation.get(message.conversationId),
         direction: message.senderInboxId === identity.inboxId ? 'outbound' as const : 'inbound' as const,
         expiresAt: messageExpiresAt(message.sentAt, retentionByConversation.get(message.conversationId)),
@@ -1280,7 +1326,11 @@ class ConeClientImpl implements ConeClient {
       throw new Error('invalid Cone backup');
     }
     const plaintext = await decryptBytes(this.options.account.backupArchiveKey, parsed.encrypted as never);
-    await this.options.store.importSnapshot(JSON.parse(bytesToUtf8(plaintext)));
+    const snapshot = JSON.parse(bytesToUtf8(plaintext));
+    // Insertion timestamps belong to the native database, which is not in this
+    // backup. A new installation must catch up from the beginning.
+    if (snapshot.metadata) delete snapshot.metadata.lastXmtpSyncStartedAt;
+    await this.options.store.importSnapshot(snapshot);
   }
 
   async close(): Promise<void> {
@@ -1338,6 +1388,7 @@ class ConeClientImpl implements ConeClient {
     const payload = storedNetworkPayload(message);
     await this.options.store.putMessage({
       messageId: message.messageId,
+      networkConversationId: message.conversationId,
       conversationId: message.conversationId,
       senderInboxId: message.senderInboxId,
       sentAt: message.sentAt,
@@ -1362,7 +1413,7 @@ class ConeClientImpl implements ConeClient {
     // existing value; otherwise a known contact (paired/manually added) is
     // already allowed, and a truly unknown sender starts as a Request. A sync
     // later reconciles to the authoritative network consent.
-    const consentState = existing?.consentState ?? (contact ? 'allowed' : 'unknown');
+    const consentState = existing?.consentState ?? (contact ? 'allowed' : await this.getConsentSafe(peerInboxId));
     await this.options.store.putConversation({
       conversationId: message.conversationId,
       kind: 'dm',
@@ -1478,9 +1529,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// The idempotency ledger protects crash-retry loops, not forever-uniqueness.
-const IDEMPOTENCY_CAP = 200;
-
 // Poll cursors are opaque to callers: base64url JSON holding the highest
 // ingestion sequence already scanned.
 function decodePollCursor(stored: string | undefined): number {
@@ -1500,4 +1548,3 @@ function decodePollCursor(stored: string | undefined): number {
 function encodePollCursor(seq: number): string {
   return base64UrlEncode(utf8ToBytes(JSON.stringify({ q: seq })));
 }
-

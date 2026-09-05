@@ -258,6 +258,9 @@ export function createMockBootstrap(options: MockOptions = {}) {
       return { conversationId: 'group:crew', groupName: 'crew', memberCount: 3, inviter: { inboxId: ALICE } };
     },
     listPendingGroupJoins: async () => [],
+    receiveMessages: async () => ({ messages: [], more: false }),
+    acknowledgeMessages: async () => {},
+    retryPendingSends: async () => [],
     pollMessages: async () => ({ messages: [], cursor: 'mock-cursor' }),
     cancelGroupJoin: async () => undefined,
     createGroupInviteLink: async (conversationId: string) => ({

@@ -1,11 +1,12 @@
 {
   "name": "@cone/example-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "dependencies": {
     "@cone/core": "workspace:*",
-    "@cone/xmtp-node": "workspace:*"
+    "@cone/xmtp-node": "workspace:*",
+    "@cone/cli": "workspace:*"
   },
   "scripts": {
     "start": "bun run src/index.ts"
