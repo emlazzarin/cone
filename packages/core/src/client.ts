@@ -224,6 +224,14 @@ class ConeClientImpl implements ConeClient {
   }
 
   private async retrySend(entry: OutboxEntry): Promise<SentMessage> {
+    const denied = await this.deniedInboxIds();
+    const conversationId = entry.scope.startsWith('conversation:') ? entry.scope.slice(13) : entry.conversationId;
+    const conversation = conversationId ? await this.options.store.getConversationById(conversationId)
+      ?? await this.options.xmtp.getConversationInfo?.(conversationId) : undefined;
+    if (denied.has(entry.scope) || conversation?.consentState === 'denied' ||
+      (conversation?.peerInboxId && denied.has(conversation.peerInboxId))) {
+      throw new ConeError('NOT_MESSAGEABLE', 'pending send is paused because its recipient or conversation is blocked');
+    }
     if (!entry.encryptedPayload) throw new Error('pending send has no payload');
     const payload = await decryptJson<unknown>(this.options.account.coneStorageKey, entry.encryptedPayload);
     const options = { idempotencyKey: entry.key };
@@ -772,7 +780,6 @@ class ConeClientImpl implements ConeClient {
         await this.options.store.putConversation({ ...conversation, consentState: state });
       }
     }
-    await this.updateDeniedInboxIds(resolved.inboxId, state);
     await this.setConsentSafe(resolved.inboxId, state);
   }
 
@@ -801,6 +808,9 @@ class ConeClientImpl implements ConeClient {
   }
 
   private async setConsentSafe(inboxId: string, state: ConeConsentState): Promise<void> {
+    // Atomic in the store: parallel contact/block operations must not erase
+    // another peer's denial. Sending or reconnecting explicitly grants consent.
+    await this.options.store.updateDeniedInboxId(inboxId, state === 'denied');
     try {
       await this.options.xmtp.setConsent(inboxId, state);
     } catch {
@@ -823,16 +833,6 @@ class ConeClientImpl implements ConeClient {
   // group-add policy, and a future consent stream can tighten this further.
   private async deniedInboxIds(): Promise<Set<string>> {
     return new Set((await this.options.store.getMetadata()).deniedInboxIds ?? []);
-  }
-
-  private async updateDeniedInboxIds(inboxId: string, state: ConeConsentState): Promise<void> {
-    const denied = await this.deniedInboxIds();
-    if (state === 'denied') {
-      denied.add(inboxId);
-    } else {
-      denied.delete(inboxId);
-    }
-    await this.options.store.putMetadata({ deniedInboxIds: [...denied].sort() });
   }
 
   // The "allow contacts to add you to groups" policy, applied to group rows

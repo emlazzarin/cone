@@ -76,6 +76,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          test "$RELEASE_TAG" = "v$(jq -r .version package.json)"
           cat release/*.sha256 > release/SHA256SUMS
           cd release
           sha256sum -c SHA256SUMS

@@ -147,6 +147,13 @@ export class MemoryStore implements ConeStore {
     return Promise.resolve({ ...this.metadata });
   }
 
+  updateDeniedInboxId(inboxId: string, denied: boolean): Promise<void> {
+    const ids = new Set(this.metadata.deniedInboxIds ?? []);
+    if (denied) ids.add(inboxId); else ids.delete(inboxId);
+    this.metadata = { ...this.metadata, deniedInboxIds: [...ids].sort() };
+    return Promise.resolve();
+  }
+
   putMetadata(metadata: ConeStoreMetadata): Promise<void> {
     this.metadata = { ...this.metadata, ...metadata };
     return Promise.resolve();

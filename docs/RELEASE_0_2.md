@@ -16,4 +16,4 @@ The packaged targets are macOS ARM64 and Linux x86-64/ARM64. The native binding 
 
 ## Compatibility
 
-Identity derivation is unchanged. Pending-mail commands require explicit acknowledgement; see [migration notes](MIGRATION_0_2.md). Existing pairing and human chat features remain available. Direct messaging and the agent runtime need only XMTP.
+Identity derivation is unchanged. Pending-mail commands require explicit acknowledgement; see [migration notes](https://github.com/emlazzarin/cone/blob/master/docs/MIGRATION_0_2.md). Existing pairing and human chat features remain available. Direct messaging and the agent runtime need only XMTP.

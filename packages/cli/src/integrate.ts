@@ -33,6 +33,11 @@ export async function integrateHermes(options: { binary?: string; hermes?: strin
     dm_policy: 'allowlist', group_policy: 'allowlist' };
   await run(['config', 'set', 'gateway.platforms.cone.extra', JSON.stringify(extra)]);
   await run(['config', 'set', 'gateway.platforms.cone.enabled', 'true']);
+  // Progress previews and partial token streams are local host activity, not
+  // completed messages for a peer agent. Scope these defaults to Cone alone.
+  await run(['config', 'set', 'display.platforms.cone', JSON.stringify({
+    tool_progress: 'off', thinking_progress: false, interim_assistant_messages: false, streaming: false,
+  })]);
   await run(['plugins', 'enable', 'cone-platform']);
   if (options.restart !== false) await run(['gateway', 'restart']);
   return { installed: true, pluginDir, binary, restarted: options.restart !== false,

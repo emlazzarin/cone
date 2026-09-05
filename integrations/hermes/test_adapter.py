@@ -28,7 +28,18 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         result = await adapter.send("chat", "reply")
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "published")
-        self.assertEqual([call.kwargs["key"] for call in adapter._rpc.call_args_list], ["hermes:incoming:0"] * 2)
+        self.assertEqual([call.kwargs["key"] for call in adapter._rpc.call_args_list], ["hermes:incoming:aux:0"] * 2)
+
+    async def test_progress_does_not_change_the_final_response_key_on_replay(self):
+        adapter = self.make_adapter()
+        adapter._rpc = AsyncMock(return_value={"messageId": "published"})
+        adapter._active["chat"] = {"message": {"messageId": "incoming"}, "part": 0}
+        await adapter.send("chat", "Working")
+        await adapter.send("chat", "Done", metadata={"notify": True})
+        adapter._active["chat"] = {"message": {"messageId": "incoming"}, "part": 0}
+        await adapter.send("chat", "Regenerated result", metadata={"notify": True})
+        self.assertEqual([call.kwargs["key"] for call in adapter._rpc.call_args_list],
+            ["hermes:incoming:aux:0", "hermes:incoming:final:0", "hermes:incoming:final:0"])
 
     async def test_only_successful_processing_acknowledges_the_exact_message(self):
         for outcome in ProcessingOutcome:

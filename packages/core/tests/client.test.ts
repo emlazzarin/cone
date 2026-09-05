@@ -22,6 +22,26 @@ import {
 } from '../src/index';
 
 describe('ConeClient', () => {
+  test('parallel blocks retain both peers and an explicit reconnect clears only its own denial', async () => {
+    const store = new MemoryStore();
+    const client = await makeClient(new FakeAdapter(), store);
+    await Promise.all(['inbox-a', 'inbox-b'].map(inboxId => client.setConsent({ inboxId }, 'denied')));
+    expect((await store.getMetadata()).deniedInboxIds).toEqual(['inbox-a', 'inbox-b']);
+    await client.saveContact({ name: 'A', inboxId: 'inbox-a' });
+    expect((await store.getMetadata()).deniedInboxIds).toEqual(['inbox-b']);
+  });
+
+  test('background outbox retries cannot unblock a peer the operator blocked', async () => {
+    const adapter = new FakeAdapter();
+    const client = await makeClient(adapter);
+    let attempts = 0;
+    adapter.sendText = async () => { attempts++; throw new Error('offline'); };
+    await expect(client.sendText({ inboxId: 'inbox-peer' }, 'pending', { idempotencyKey: 'pending' })).rejects.toThrow('offline');
+    await client.setConsent({ inboxId: 'inbox-peer' }, 'denied');
+    await expect(client.retryPendingSends()).rejects.toThrow('1 pending send');
+    expect(attempts).toBe(1);
+  });
+
   test('saves contacts, deduplicates by inbox ID, and sends by contact name', async () => {
     const adapter = new FakeAdapter();
     const client = await makeClient(adapter);

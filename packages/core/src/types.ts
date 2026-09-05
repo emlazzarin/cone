@@ -482,6 +482,7 @@ export interface ConeStore {
   listPendingSends(): Promise<OutboxEntry[]>;
 
   getMetadata(): Promise<ConeStoreMetadata>;
+  updateDeniedInboxId(inboxId: string, denied: boolean): Promise<void>;
   putMetadata(metadata: ConeStoreMetadata): Promise<void>;
 
   exportSnapshot(): Promise<ConeStoreSnapshot>;

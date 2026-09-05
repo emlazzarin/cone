@@ -19,6 +19,7 @@ class ConeRpcError(Exception):
 
 
 class ConeAdapter(BasePlatformAdapter):
+    SUPPORTS_MESSAGE_EDITING = False
     # XMTP consent is the local allowlist. Both DMs and groups require explicit
     # acceptance in Cone before the child can return a message to this adapter.
     _dm_policy = "allowlist"
@@ -198,12 +199,16 @@ class ConeAdapter(BasePlatformAdapter):
         async with self._send_locks.setdefault(chat_id, asyncio.Lock()):
             current = self._active.get(chat_id)
             outgoing = (chat_id, content, reply_to)
-            key = (f"hermes:{current['message']['messageId']}:{current['part']}" if current else
+            # Hermes marks final responses notify=True. Status/progress output
+            # must not consume a final response's retry key after a restart.
+            phase = "final" if (metadata or {}).get("notify") else "aux"
+            counter = "part" if phase == "final" else "aux_part"
+            key = (f"hermes:{current['message']['messageId']}:{phase}:{current.get(counter, 0)}" if current else
                    (metadata or {}).get("idempotency_key") or self._outgoing_keys.setdefault(outgoing, str(uuid.uuid4())))
             try:
                 result = await self._rpc("reply", conversationId=chat_id, text=content, key=key)
                 if current:
-                    current["part"] += 1
+                    current[counter] = current.get(counter, 0) + 1
                 self._outgoing_keys.pop(outgoing, None)
                 return SendResult(success=True, message_id=result["messageId"], raw_response=result)
             except (ConeRpcError, ConnectionError, OSError, asyncio.TimeoutError) as error:

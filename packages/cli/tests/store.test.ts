@@ -45,10 +45,13 @@ describe('BunSQLiteStore', () => {
     const first = { key: 'reply-one', scope: 'peer', kind: 'text' as const, encryptedPayload };
     const records = await Promise.all([a.prepareSend(first), b.prepareSend({ ...first, scope: 'different-peer' })]);
     expect(records).toEqual([first, first]);
+    await Promise.all([a.updateDeniedInboxId('peer-a', true), b.updateDeniedInboxId('peer-b', true)]);
+    await a.updateDeniedInboxId('peer-a', false);
     a.close(); b.close();
     const reopened = new BunSQLiteStore(path);
     expect((await reopened.listPendingMessages(query)).map(m => m.messageId)).toEqual(['two']);
     expect(await reopened.listPendingSends()).toEqual([first]);
+    expect((await reopened.getMetadata()).deniedInboxIds).toEqual(['peer-b']);
     reopened.close();
   });
 

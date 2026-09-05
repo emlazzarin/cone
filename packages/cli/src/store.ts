@@ -235,6 +235,17 @@ export class BunSQLiteStore implements ConeStore {
     return Promise.resolve(metadata);
   }
 
+  updateDeniedInboxId(inboxId: string, denied: boolean): Promise<void> {
+    this.db.transaction(() => {
+      const row = this.db.query("select value from metadata where key = 'deniedInboxIds'").get() as { value: string } | null;
+      const ids = new Set(row ? parseStringArray(row.value) : []);
+      if (denied) ids.add(inboxId); else ids.delete(inboxId);
+      this.db.query("insert into metadata (key, value) values ('deniedInboxIds', ?) on conflict(key) do update set value = excluded.value")
+        .run(JSON.stringify([...ids].sort()));
+    })();
+    return Promise.resolve();
+  }
+
   async putMetadata(metadata: ConeStoreMetadata): Promise<void> {
     for (const [key, value] of Object.entries(metadata)) {
       if (value === undefined) {

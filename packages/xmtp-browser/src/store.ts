@@ -139,6 +139,12 @@ export class IndexedDbStore implements ConeStore {
     return this.memory.getMetadata();
   }
 
+  async updateDeniedInboxId(inboxId: string, denied: boolean): Promise<void> {
+    await this.load();
+    await this.memory.updateDeniedInboxId(inboxId, denied);
+    await this.save();
+  }
+
   async putMetadata(metadata: ConeStoreMetadata): Promise<void> {
     await this.load();
     await this.memory.putMetadata(metadata);
